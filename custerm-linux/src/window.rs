@@ -47,7 +47,7 @@ impl CustermWindow {
 
         // Register D-Bus and poll for commands on main thread
         let rx = dbus::register();
-        glib::timeout_add_local(Duration::from_millis(50), move || {
+        glib::timeout_add_local(Duration::from_millis(150), move || {
             while let Ok(cmd) = rx.try_recv() {
                 match cmd {
                     DbusCommand::SetBackground(path) => {
@@ -87,11 +87,11 @@ fn watch_config(terminal: &TerminalTab) {
     let tint_opacity = terminal.tint_opacity.clone();
     let tint_color = terminal.tint_color.clone();
     let tint_overlay = terminal.tint_overlay.clone();
+    let tint_css = terminal.tint_css.clone();
     let image_opacity = terminal.image_opacity.clone();
     let term = terminal.terminal.clone();
     let has_bg = terminal.has_background.clone();
-    let bg_texture = terminal.bg_texture.clone();
-    let bg_drawing = terminal.bg_drawing.clone();
+    let bg_picture = terminal.bg_picture.clone();
 
     monitor.connect_changed(move |_, _, _, event| {
         if !matches!(event, gio::FileMonitorEvent::Changed | gio::FileMonitorEvent::Created) {
@@ -117,12 +117,12 @@ fn watch_config(terminal: &TerminalTab) {
         // Tint
         tint_opacity.set(config.background.tint);
         tint_color.set(crate::terminal::parse_color_pub(&config.background.tint_color));
-        tint_overlay.queue_draw();
+        crate::terminal::update_tint_css_pub(&tint_css, &config.background.tint_color, config.background.tint);
 
         // Image opacity
         image_opacity.set(config.background.opacity);
         if has_bg.get() {
-            bg_drawing.queue_draw();
+            bg_picture.set_opacity(config.background.opacity);
         }
 
         // Background image
@@ -132,9 +132,9 @@ fn watch_config(terminal: &TerminalTab) {
                 if path.exists() {
                     let file = gio::File::for_path(path);
                     if let Ok(texture) = gtk4::gdk::Texture::from_file(&file) {
-                        bg_texture.set(Some(texture));
-                        bg_drawing.set_visible(true);
-                        bg_drawing.queue_draw();
+                        bg_picture.set_paintable(Some(&texture));
+                        bg_picture.set_visible(true);
+                        bg_picture.set_opacity(config.background.opacity);
                         tint_overlay.set_visible(true);
                         has_bg.set(true);
                         term.set_clear_background(false);
@@ -145,7 +145,7 @@ fn watch_config(terminal: &TerminalTab) {
             }
             None => {
                 if has_bg.get() {
-                    bg_drawing.set_visible(false);
+                    bg_picture.set_visible(false);
                     tint_overlay.set_visible(false);
                     has_bg.set(false);
                     term.set_clear_background(true);

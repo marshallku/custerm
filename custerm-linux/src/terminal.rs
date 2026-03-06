@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -25,12 +25,11 @@ const MAX_FONT_SCALE: f64 = 3.0;
 pub struct TerminalTab {
     pub overlay: gtk4::Overlay,
     pub terminal: Terminal,
-    pub bg_drawing: gtk4::DrawingArea,
-    pub tint_overlay: gtk4::DrawingArea,
+    pub bg_picture: gtk4::Picture,
+    pub tint_overlay: gtk4::Box,
+    pub tint_css: gtk4::CssProvider,
     pub tint_opacity: Rc<Cell<f64>>,
     pub tint_color: Rc<Cell<gdk::RGBA>>,
-    pub bg_texture: Rc<Cell<Option<gdk::Texture>>>,
-    pub bg_surface_cache: Rc<RefCell<Option<gtk4::cairo::ImageSurface>>>,
     pub image_opacity: Rc<Cell<f64>>,
     pub has_background: Rc<Cell<bool>>,
 }
@@ -109,74 +108,30 @@ impl TerminalTab {
             }
         });
 
-        // Background image layer
+        // Background image layer (GPU-rendered via gtk4::Picture)
         let image_opacity = Rc::new(Cell::new(config.background.opacity));
-        let bg_texture: Rc<Cell<Option<gdk::Texture>>> = Rc::new(Cell::new(None));
-        let bg_drawing = gtk4::DrawingArea::new();
-        bg_drawing.set_hexpand(true);
-        bg_drawing.set_vexpand(true);
-        bg_drawing.set_visible(false);
+        let bg_picture = gtk4::Picture::new();
+        bg_picture.set_content_fit(gtk4::ContentFit::Cover);
+        bg_picture.set_hexpand(true);
+        bg_picture.set_vexpand(true);
+        bg_picture.set_visible(false);
+        bg_picture.set_opacity(config.background.opacity);
 
-        let tex_ref = bg_texture.clone();
-        let opacity_ref = image_opacity.clone();
-        let cached_surface: Rc<RefCell<Option<gtk4::cairo::ImageSurface>>> = Rc::new(RefCell::new(None));
-        let surface_ref = cached_surface.clone();
-        bg_drawing.set_draw_func(move |_widget, cr, width, height| {
-            let texture = tex_ref.take();
-            if let Some(ref tex) = texture {
-                let mut cache = surface_ref.borrow_mut();
-                let surface = cache.get_or_insert_with(|| {
-                    let stride = (tex.width() as usize) * 4;
-                    let mut data = vec![0u8; stride * tex.height() as usize];
-                    tex.download(&mut data, stride);
-                    gtk4::cairo::ImageSurface::create_for_data(
-                        data,
-                        gtk4::cairo::Format::ARgb32,
-                        tex.width(),
-                        tex.height(),
-                        stride as i32,
-                    ).unwrap()
-                });
-
-                let tw = tex.width() as f64;
-                let th = tex.height() as f64;
-                let w = width as f64;
-                let h = height as f64;
-
-                let scale = (w / tw).max(h / th);
-                let ox = (w - tw * scale) / 2.0;
-                let oy = (h - th * scale) / 2.0;
-
-                cr.save().unwrap();
-                cr.translate(ox, oy);
-                cr.scale(scale, scale);
-                cr.set_source_surface(surface, 0.0, 0.0).unwrap();
-                cr.paint_with_alpha(opacity_ref.get()).unwrap();
-                cr.restore().unwrap();
-            }
-            tex_ref.set(texture);
-        });
-
-        // Tint overlay
+        // Tint overlay (CSS-driven, no Cairo)
         let tint_opacity = Rc::new(Cell::new(config.background.tint));
         let tint_color = Rc::new(Cell::new(parse_color(&config.background.tint_color)));
-        let tint_overlay = gtk4::DrawingArea::new();
+        let tint_overlay = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         tint_overlay.set_hexpand(true);
         tint_overlay.set_vexpand(true);
         tint_overlay.set_visible(false);
-        let tint_val = tint_opacity.clone();
-        let tint_col = tint_color.clone();
-        tint_overlay.set_draw_func(move |_, cr, width, height| {
-            let c = tint_col.get();
-            cr.set_source_rgba(
-                c.red() as f64,
-                c.green() as f64,
-                c.blue() as f64,
-                tint_val.get(),
-            );
-            cr.rectangle(0.0, 0.0, width as f64, height as f64);
-            let _ = cr.fill();
-        });
+        let tint_css = gtk4::CssProvider::new();
+        update_tint_css(&tint_css, &config.background.tint_color, config.background.tint);
+        gtk4::style_context_add_provider_for_display(
+            &gdk::Display::default().unwrap(),
+            &tint_css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 2,
+        );
+        tint_overlay.add_css_class("custerm-tint");
 
         // CSS to force VTE background transparent (text stays opaque)
         let css_provider = gtk4::CssProvider::new();
@@ -187,21 +142,20 @@ impl TerminalTab {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
         );
 
-        // Stack: bg_drawing (base) -> tint_overlay -> terminal
+        // Stack: bg_picture (base) -> tint_overlay -> terminal
         let overlay = gtk4::Overlay::new();
-        overlay.set_child(Some(&bg_drawing));
+        overlay.set_child(Some(&bg_picture));
         overlay.add_overlay(&tint_overlay);
         overlay.add_overlay(&terminal);
 
         Self {
             overlay,
             terminal,
-            bg_drawing,
+            bg_picture,
             tint_overlay,
+            tint_css,
             tint_opacity,
             tint_color,
-            bg_texture,
-            bg_surface_cache: cached_surface,
             image_opacity,
             has_background: Rc::new(Cell::new(false)),
         }
@@ -227,8 +181,7 @@ impl TerminalTab {
                     texture.width(),
                     texture.height()
                 );
-                self.bg_texture.set(Some(texture));
-                self.bg_surface_cache.borrow_mut().take();
+                self.bg_picture.set_paintable(Some(&texture));
             }
             Err(e) => {
                 eprintln!("[custerm] FAILED to load image {}: {}", path.display(), e);
@@ -236,12 +189,11 @@ impl TerminalTab {
             }
         }
 
-        self.bg_drawing.set_visible(true);
-        self.bg_drawing.queue_draw();
+        self.bg_picture.set_visible(true);
+        self.bg_picture.set_opacity(self.image_opacity.get());
         self.tint_overlay.set_visible(true);
         self.has_background.set(true);
 
-        // Make VTE background transparent so image shows through, text stays opaque
         self.terminal.set_clear_background(false);
         let fg = parse_color("#cdd6f4");
         let bg = gdk::RGBA::new(0.0, 0.0, 0.0, 0.0);
@@ -253,7 +205,7 @@ impl TerminalTab {
 
     pub fn clear_background(&self) {
         eprintln!("[custerm] clear_background");
-        self.bg_drawing.set_visible(false);
+        self.bg_picture.set_visible(false);
         self.tint_overlay.set_visible(false);
         self.has_background.set(false);
 
@@ -268,8 +220,25 @@ impl TerminalTab {
 
     pub fn set_tint(&self, opacity: f64) {
         self.tint_opacity.set(opacity);
-        self.tint_overlay.queue_draw();
+        let c = self.tint_color.get();
+        update_tint_css(&self.tint_css, &format!("#{:02x}{:02x}{:02x}",
+            (c.red() * 255.0) as u8,
+            (c.green() * 255.0) as u8,
+            (c.blue() * 255.0) as u8,
+        ), opacity);
     }
+}
+
+fn update_tint_css(provider: &gtk4::CssProvider, hex_color: &str, opacity: f64) {
+    let c = parse_color(hex_color);
+    let css = format!(
+        ".custerm-tint {{ background-color: rgba({},{},{},{}); }}",
+        (c.red() * 255.0) as u8,
+        (c.green() * 255.0) as u8,
+        (c.blue() * 255.0) as u8,
+        opacity,
+    );
+    provider.load_from_string(&css);
 }
 
 fn make_palette() -> Vec<gdk::RGBA> {
@@ -278,6 +247,10 @@ fn make_palette() -> Vec<gdk::RGBA> {
 
 pub fn parse_color_pub(hex: &str) -> gdk::RGBA {
     parse_color(hex)
+}
+
+pub fn update_tint_css_pub(provider: &gtk4::CssProvider, hex_color: &str, opacity: f64) {
+    update_tint_css(provider, hex_color, opacity);
 }
 
 fn parse_color(hex: &str) -> gdk::RGBA {
