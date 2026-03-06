@@ -28,8 +28,10 @@ pub struct TerminalTab {
     pub bg_drawing: gtk4::DrawingArea,
     pub tint_overlay: gtk4::DrawingArea,
     pub tint_opacity: Rc<Cell<f64>>,
+    pub tint_color: Rc<Cell<gdk::RGBA>>,
     pub bg_texture: Rc<Cell<Option<gdk::Texture>>>,
-    pub terminal_opacity: f64,
+    pub terminal_opacity: Rc<Cell<f64>>,
+    pub has_background: Rc<Cell<bool>>,
 }
 
 impl TerminalTab {
@@ -106,7 +108,8 @@ impl TerminalTab {
             }
         });
 
-        // Background image layer - DrawingArea with manual texture rendering
+        // Background image layer
+        let terminal_opacity = Rc::new(Cell::new(config.background.opacity));
         let bg_texture: Rc<Cell<Option<gdk::Texture>>> = Rc::new(Cell::new(None));
         let bg_drawing = gtk4::DrawingArea::new();
         bg_drawing.set_hexpand(true);
@@ -114,6 +117,7 @@ impl TerminalTab {
         bg_drawing.set_visible(false);
 
         let tex_ref = bg_texture.clone();
+        let opacity_ref = terminal_opacity.clone();
         bg_drawing.set_draw_func(move |_widget, cr, width, height| {
             let texture = tex_ref.take();
             if let Some(ref tex) = texture {
@@ -122,20 +126,14 @@ impl TerminalTab {
                 let w = width as f64;
                 let h = height as f64;
 
-                // Cover: scale to fill, crop excess
                 let scale = (w / tw).max(h / th);
-                let sw = tw * scale;
-                let sh = th * scale;
-                let ox = (w - sw) / 2.0;
-                let oy = (h - sh) / 2.0;
+                let ox = (w - tw * scale) / 2.0;
+                let oy = (h - th * scale) / 2.0;
 
-                // Download texture pixels to cairo surface
                 let stride = (tex.width() as usize) * 4;
                 let mut data = vec![0u8; stride * tex.height() as usize];
                 tex.download(&mut data, stride);
 
-                // GDK download() uses native byte order (BGRA on little-endian)
-                // which matches Cairo ARgb32 — no conversion needed
                 let surface = gtk4::cairo::ImageSurface::create_for_data(
                     data,
                     gtk4::cairo::Format::ARgb32,
@@ -148,30 +146,42 @@ impl TerminalTab {
                 cr.translate(ox, oy);
                 cr.scale(scale, scale);
                 cr.set_source_surface(&surface, 0.0, 0.0).unwrap();
-                cr.paint().unwrap();
+                // Paint image with configurable opacity (text stays fully opaque)
+                cr.paint_with_alpha(opacity_ref.get()).unwrap();
                 cr.restore().unwrap();
             }
             tex_ref.set(texture);
         });
 
-        // Tint overlay (drawn on top of image, behind terminal)
+        // Tint overlay
         let tint_opacity = Rc::new(Cell::new(config.background.tint));
-        let tint_color = parse_color(&config.background.tint_color);
+        let tint_color = Rc::new(Cell::new(parse_color(&config.background.tint_color)));
         let tint_overlay = gtk4::DrawingArea::new();
         tint_overlay.set_hexpand(true);
         tint_overlay.set_vexpand(true);
         tint_overlay.set_visible(false);
         let tint_val = tint_opacity.clone();
+        let tint_col = tint_color.clone();
         tint_overlay.set_draw_func(move |_, cr, width, height| {
+            let c = tint_col.get();
             cr.set_source_rgba(
-                tint_color.red() as f64,
-                tint_color.green() as f64,
-                tint_color.blue() as f64,
+                c.red() as f64,
+                c.green() as f64,
+                c.blue() as f64,
                 tint_val.get(),
             );
             cr.rectangle(0.0, 0.0, width as f64, height as f64);
             let _ = cr.fill();
         });
+
+        // CSS to force VTE background transparent (text stays opaque)
+        let css_provider = gtk4::CssProvider::new();
+        css_provider.load_from_string("vte-terminal { background-color: transparent; }");
+        gtk4::style_context_add_provider_for_display(
+            &gdk::Display::default().unwrap(),
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
 
         // Stack: bg_drawing (base) -> tint_overlay -> terminal
         let overlay = gtk4::Overlay::new();
@@ -185,8 +195,10 @@ impl TerminalTab {
             bg_drawing,
             tint_overlay,
             tint_opacity,
+            tint_color,
             bg_texture,
-            terminal_opacity: config.background.opacity,
+            terminal_opacity,
+            has_background: Rc::new(Cell::new(false)),
         }
     }
 
@@ -202,7 +214,6 @@ impl TerminalTab {
             return;
         }
 
-        // Load image as texture
         let file = gtk4::gio::File::for_path(path);
         match gdk::Texture::from_file(&file) {
             Ok(texture) => {
@@ -222,29 +233,25 @@ impl TerminalTab {
         self.bg_drawing.set_visible(true);
         self.bg_drawing.queue_draw();
         self.tint_overlay.set_visible(true);
+        self.has_background.set(true);
 
-        // Make VTE transparent — set_clear_background alone doesn't work in VTE4/GTK4,
-        // widget-level opacity is needed to let the background show through
+        // Make VTE background transparent so image shows through, text stays opaque
         self.terminal.set_clear_background(false);
-        self.terminal.set_opacity(self.terminal_opacity);
         let fg = parse_color("#cdd6f4");
         let bg = gdk::RGBA::new(0.0, 0.0, 0.0, 0.0);
         let palette = make_palette();
         let palette_refs: Vec<&gdk::RGBA> = palette.iter().collect();
         self.terminal.set_colors(Some(&fg), Some(&bg), &palette_refs);
-        // Also set background color separately in case set_colors ignores alpha
         self.terminal.set_color_background(&bg);
-
-        eprintln!("[custerm] background applied, tint={}", self.tint_opacity.get());
     }
 
     pub fn clear_background(&self) {
         eprintln!("[custerm] clear_background");
         self.bg_drawing.set_visible(false);
         self.tint_overlay.set_visible(false);
+        self.has_background.set(false);
 
         self.terminal.set_clear_background(true);
-        self.terminal.set_opacity(1.0);
 
         let fg = parse_color("#cdd6f4");
         let bg = parse_color("#1e1e2e");
@@ -254,7 +261,6 @@ impl TerminalTab {
     }
 
     pub fn set_tint(&self, opacity: f64) {
-        eprintln!("[custerm] set_tint: {}", opacity);
         self.tint_opacity.set(opacity);
         self.tint_overlay.queue_draw();
     }
@@ -264,8 +270,15 @@ fn make_palette() -> Vec<gdk::RGBA> {
     PALETTE.iter().map(|c| parse_color(c)).collect()
 }
 
+pub fn parse_color_pub(hex: &str) -> gdk::RGBA {
+    parse_color(hex)
+}
+
 fn parse_color(hex: &str) -> gdk::RGBA {
     let hex = hex.trim_start_matches('#');
+    if hex.len() < 6 {
+        return gdk::RGBA::new(0.0, 0.0, 0.0, 1.0);
+    }
     let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0) as f32 / 255.0;
     let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0) as f32 / 255.0;
     let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0) as f32 / 255.0;
