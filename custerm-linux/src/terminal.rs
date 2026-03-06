@@ -11,6 +11,7 @@ use vte4::Terminal;
 use custerm_core::config::CustermConfig;
 
 use crate::panel::Panel;
+use crate::search::SearchBar;
 
 const PALETTE: &[&str] = &[
     "#45475a", "#f38ba8", "#a6e3a1", "#f9e2af",
@@ -34,6 +35,7 @@ pub struct TerminalPanel {
     pub tint_color: Rc<Cell<gdk::RGBA>>,
     pub image_opacity: Rc<Cell<f64>>,
     pub has_background: Rc<Cell<bool>>,
+    pub search_bar: SearchBar,
 }
 
 impl TerminalPanel {
@@ -140,11 +142,15 @@ impl TerminalPanel {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
         );
 
-        // Stack: bg_picture → tint → terminal
+        // Search bar
+        let search_bar = SearchBar::new(&terminal);
+
+        // Stack: bg_picture → tint → terminal → search bar
         let overlay = gtk4::Overlay::new();
         overlay.set_child(Some(&bg_picture));
         overlay.add_overlay(&tint_overlay);
         overlay.add_overlay(&terminal);
+        overlay.add_overlay(&search_bar.container);
         overlay.set_measure_overlay(&terminal, true);
         overlay.set_hexpand(true);
         overlay.set_vexpand(true);
@@ -159,6 +165,7 @@ impl TerminalPanel {
             tint_color,
             image_opacity,
             has_background: Rc::new(Cell::new(false)),
+            search_bar,
         }
     }
 

@@ -455,6 +455,19 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
 
     controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
     controller.connect_key_pressed(move |_, keyval, _, modifier| {
+        // Ctrl+F: toggle search
+        if keyval == gdk::Key::f
+            && modifier.contains(gdk::ModifierType::CONTROL_MASK)
+            && !modifier.contains(gdk::ModifierType::SHIFT_MASK)
+        {
+            if let Some(mgr) = mgr.upgrade() {
+                if let Some(panel) = mgr.active_panel() {
+                    panel.search_bar.toggle(&panel.terminal);
+                }
+            }
+            return glib::Propagation::Stop;
+        }
+
         let ctrl_shift = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
         if !modifier.contains(ctrl_shift) {
             return glib::Propagation::Proceed;
