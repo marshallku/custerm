@@ -28,6 +28,10 @@ fn default_opacity() -> f64 {
     0.95
 }
 
+fn default_tab_position() -> String {
+    "top".to_string()
+}
+
 fn default_theme() -> String {
     "catppuccin-mocha".to_string()
 }
@@ -94,6 +98,21 @@ impl Default for ThemeConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabsConfig {
+    /// Tab bar position: "top", "bottom", "left", "right"
+    #[serde(default = "default_tab_position")]
+    pub position: String,
+}
+
+impl Default for TabsConfig {
+    fn default() -> Self {
+        Self {
+            position: default_tab_position(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CustermConfig {
     #[serde(default)]
@@ -101,6 +120,9 @@ pub struct CustermConfig {
 
     #[serde(default)]
     pub background: BackgroundConfig,
+
+    #[serde(default)]
+    pub tabs: TabsConfig,
 
     #[serde(default)]
     pub theme: ThemeConfig,
@@ -145,6 +167,8 @@ font_size = 14
 # tint_color = "#1e1e2e"
 # opacity = 0.95
 
+[tabs]
+# position = "top"  # top, bottom, left, right
 
 [theme]
 name = "catppuccin-mocha"

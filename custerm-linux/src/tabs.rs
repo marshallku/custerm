@@ -27,6 +27,14 @@ impl TabManager {
         notebook.set_show_border(false);
         notebook.set_show_tabs(false);
 
+        let tab_pos = match config.tabs.position.as_str() {
+            "left" => gtk4::PositionType::Left,
+            "right" => gtk4::PositionType::Right,
+            "bottom" => gtk4::PositionType::Bottom,
+            _ => gtk4::PositionType::Top,
+        };
+        notebook.set_tab_pos(tab_pos);
+
         let manager = Rc::new(Self {
             notebook,
             tabs: Rc::new(RefCell::new(Vec::new())),
@@ -170,6 +178,15 @@ impl TabManager {
 
     pub fn update_config(&self, config: &CustermConfig) {
         *self.config.borrow_mut() = config.clone();
+
+        let tab_pos = match config.tabs.position.as_str() {
+            "left" => gtk4::PositionType::Left,
+            "right" => gtk4::PositionType::Right,
+            "bottom" => gtk4::PositionType::Bottom,
+            _ => gtk4::PositionType::Top,
+        };
+        self.notebook.set_tab_pos(tab_pos);
+
         for tab in self.tabs.borrow().iter() {
             let mut panels = Vec::new();
             tab.root.borrow().collect_panels(&mut panels);
@@ -337,12 +354,31 @@ impl TabManager {
         }
     }
 
+    fn is_vertical_tabs(&self) -> bool {
+        matches!(
+            self.notebook.tab_pos(),
+            gtk4::PositionType::Left | gtk4::PositionType::Right
+        )
+    }
+
     fn make_tab_label(&self, panel: &Rc<TerminalPanel>) -> gtk4::Box {
-        let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        let vertical = self.is_vertical_tabs();
+        let orientation = if vertical {
+            gtk4::Orientation::Horizontal
+        } else {
+            gtk4::Orientation::Horizontal
+        };
+        let hbox = gtk4::Box::new(orientation, 4);
         let label = gtk4::Label::new(Some("Terminal"));
-        label.set_hexpand(true);
         label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        label.set_max_width_chars(20);
+        if vertical {
+            label.set_hexpand(true);
+            label.set_xalign(0.0);
+            label.set_max_width_chars(16);
+        } else {
+            label.set_hexpand(true);
+            label.set_max_width_chars(20);
+        }
 
         let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
         close_btn.add_css_class("flat");
@@ -528,6 +564,28 @@ notebook header tab:checked {
 notebook header tab:hover:not(:checked) {
     background-color: #262637;
     color: #bac2de;
+}
+
+/* Vertical tabs (left) */
+notebook header.left tab {
+    border-radius: 6px 0 0 6px;
+    margin: 1px 0 1px 2px;
+    padding: 6px 8px;
+    min-width: 120px;
+}
+
+/* Vertical tabs (right) */
+notebook header.right tab {
+    border-radius: 0 6px 6px 0;
+    margin: 1px 2px 1px 0;
+    padding: 6px 8px;
+    min-width: 120px;
+}
+
+/* Bottom tabs */
+notebook header.bottom tab {
+    border-radius: 0 0 6px 6px;
+    margin: 0 1px 2px;
 }
 
 .custerm-tab-close {

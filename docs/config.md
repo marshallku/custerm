@@ -54,6 +54,12 @@ name = "catppuccin-mocha"
 | `tint` | `0.9` | Tint overlay opacity (0.0=transparent, 1.0=fully opaque) |
 | `opacity` | `0.95` | Terminal opacity |
 
+### [tabs]
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `position` | `top` | Tab bar position: `top`, `bottom`, `left`, `right` |
+
 ### [socket]
 
 | Key | Default | Description |
