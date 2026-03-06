@@ -61,15 +61,17 @@ impl SearchBar {
         // Apply search on text change
         let term = terminal.clone();
         let case = case_btn.clone();
+        let label = match_label.clone();
         entry.connect_changed(move |e| {
-            apply_search(&term, &e.text(), case.is_active());
+            apply_search(&term, &e.text(), case.is_active(), &label);
         });
 
         // Toggle case sensitivity
         let term = terminal.clone();
         let entry_ref = entry.clone();
+        let label = match_label.clone();
         case_btn.connect_toggled(move |btn| {
-            apply_search(&term, &entry_ref.text(), btn.is_active());
+            apply_search(&term, &entry_ref.text(), btn.is_active(), &label);
         });
 
         // Enter = next
@@ -134,6 +136,7 @@ impl SearchBar {
     pub fn toggle(&self, terminal: &vte4::Terminal) {
         if self.container.is_visible() {
             self.container.set_visible(false);
+            self.match_label.set_text("");
             terminal.search_set_regex(None::<&vte4::Regex>, 0);
             terminal.grab_focus();
         } else {
@@ -146,15 +149,21 @@ impl SearchBar {
             });
             // Re-apply current search text if any
             if !self.entry.text().is_empty() {
-                apply_search(terminal, &self.entry.text(), false);
+                apply_search(terminal, &self.entry.text(), false, &self.match_label);
             }
         }
     }
 }
 
-fn apply_search(terminal: &vte4::Terminal, text: &str, case_sensitive: bool) {
+fn apply_search(
+    terminal: &vte4::Terminal,
+    text: &str,
+    case_sensitive: bool,
+    label: &gtk4::Label,
+) {
     if text.is_empty() {
         terminal.search_set_regex(None::<&vte4::Regex>, 0);
+        label.set_text("");
         return;
     }
 
@@ -168,10 +177,12 @@ fn apply_search(terminal: &vte4::Terminal, text: &str, case_sensitive: bool) {
         Ok(regex) => {
             terminal.search_set_regex(Some(&regex), 0);
             terminal.search_set_wrap_around(true);
-            terminal.search_find_next();
+            let found = terminal.search_find_next();
+            label.set_text(if found { "" } else { "No matches" });
         }
         Err(e) => {
             eprintln!("[custerm] search regex error: {e}");
+            label.set_text("Invalid");
         }
     }
 }
