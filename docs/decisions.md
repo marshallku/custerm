@@ -1,0 +1,69 @@
+# Technical Decisions
+
+## 1. Tauri v2 Abandoned → Native Platform UIs
+
+**Problem:** Tauri IPC introduced noticeable input latency in the terminal. Every keypress went through JS → Tauri invoke → Rust → PTY, and output went PTY → Rust → Tauri event → JS → xterm.js. The round-trip was perceptible.
+
+**Decision:** Switched to platform-native UIs with a shared Rust core:
+- Linux: GTK4 + VTE4 (VTE handles PTY internally, zero IPC overhead)
+- macOS: Swift/AppKit (SwiftTerm or Ghostty embedding, TBD)
+
+**Tradeoff:** More code per platform, but terminal responsiveness is non-negotiable.
+
+## 2. VTE Handles PTY on Linux
+
+**Rationale:** VTE has its own optimized PTY management. Using `portable-pty` alongside VTE would mean double PTY handling. Let VTE do what it does best.
+
+**Consequence:** `custerm-core/pty.rs` is not used by custerm-linux. It exists for macOS and potential future socket server needs.
+
+## 3. D-Bus for Linux IPC (Not Unix Socket)
+
+**Rationale:** D-Bus is the standard Linux IPC mechanism. Using it means:
+- No custom socket server needed
+- System integration (other tools can control custerm)
+- Session bus handles lifecycle automatically
+
+**GTK thread safety issue:** GTK widgets are not `Send+Sync`. D-Bus callbacks can't directly modify widgets.
+
+**Solution:** `mpsc::channel` + `glib::timeout_add_local(50ms)` polling on the GTK main thread. D-Bus handler sends commands through the channel, GTK main loop polls and applies them.
+
+**Note:** `glib::MainContext::channel` was removed in newer glib versions, so we use `std::sync::mpsc` with manual polling instead.
+
+## 4. GtkOverlay for Background Compositing
+
+**Stack:** `bg_picture` (child) → `tint_overlay` (overlay) → `terminal` (overlay)
+
+**Critical detail:** VTE paints its own opaque background by default. To see the image layers beneath, you must:
+1. Call `terminal.set_clear_background(false)`
+2. Set VTE background color to transparent `RGBA(0,0,0,0)`
+
+Without step 1, VTE covers the entire overlay with its own background color.
+
+## 5. Binary Names: custerm + custermctl
+
+**Problem:** Both custerm-linux and custerm-cli had `[[bin]] name = "custerm"`, causing Cargo output filename collision.
+
+**Decision:** CLI binary renamed to `custermctl` (follows kubectl, sysctl naming convention).
+
+## 6. Catppuccin Mocha Hardcoded
+
+**Current state:** Theme colors are hardcoded in `terminal.rs`. The config `[theme] name = "catppuccin-mocha"` exists but theme switching is not yet implemented.
+
+**Future:** Parse theme files or embed multiple palettes.
+
+## 7. cmux V2 Protocol for Socket Communication
+
+**Format:** Newline-delimited JSON with UUID request IDs.
+**Reference:** ~/dev/cmux/ (Marshall's macOS terminal multiplexer)
+
+This protocol is used by custermctl but the socket server is not yet implemented in custerm-linux (D-Bus is used instead for now).
+
+## 8. Forced Dark Theme
+
+**Problem:** When VTE background is transparent (for bg images) and no image is loaded yet, the system GTK theme shows through. On light themes this makes the terminal white.
+
+**Fix:** Force dark theme in `app.rs` via `set_gtk_application_prefer_dark_theme(true)` + CSS `window { background-color: #1e1e2e; }`.
+
+## 9. Rust Edition 2024
+
+Using the latest Rust edition. No compatibility concerns since the project is new.
