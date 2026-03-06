@@ -11,6 +11,3 @@ path = "src/main.rs"
 custerm-core = { path = "../custerm-core" }
 gtk4 = { version = "0.9", features = ["gnome_46"] }
 vte4 = "0.8"
-libc = "0.2"
-log = "0.4"
-env_logger = "0.11"

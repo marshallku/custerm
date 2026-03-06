@@ -1,4 +1,3 @@
-pub mod background;
 pub mod config;
 pub mod error;
 pub mod protocol;

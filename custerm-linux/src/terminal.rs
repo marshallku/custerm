@@ -25,9 +25,11 @@ const MAX_FONT_SCALE: f64 = 3.0;
 pub struct TerminalTab {
     pub overlay: gtk4::Overlay,
     pub terminal: Terminal,
-    pub bg_picture: gtk4::Picture,
+    pub bg_drawing: gtk4::DrawingArea,
     pub tint_overlay: gtk4::DrawingArea,
     pub tint_opacity: Rc<Cell<f64>>,
+    pub bg_texture: Rc<Cell<Option<gdk::Texture>>>,
+    pub terminal_opacity: f64,
 }
 
 impl TerminalTab {
@@ -41,10 +43,10 @@ impl TerminalTab {
         terminal.set_font(Some(&font_desc));
         terminal.set_font_scale(DEFAULT_FONT_SCALE);
 
-        // Colors - Catppuccin Mocha, opaque by default (made transparent when bg image is set)
+        // Colors - Catppuccin Mocha, opaque by default
         let fg = parse_color("#cdd6f4");
         let bg = parse_color("#1e1e2e");
-        let palette: Vec<gdk::RGBA> = PALETTE.iter().map(|c| parse_color(c)).collect();
+        let palette = make_palette();
         let palette_refs: Vec<&gdk::RGBA> = palette.iter().collect();
         terminal.set_colors(Some(&fg), Some(&bg), &palette_refs);
 
@@ -81,13 +83,14 @@ impl TerminalTab {
         });
         terminal.add_controller(zoom_controller);
 
-        // Spawn shell
+        // Spawn shell with CUSTERM_DBUS env var for per-session control
         let shell = config.terminal.shell.clone();
+        let dbus_env = format!("CUSTERM_DBUS={}", crate::dbus::bus_name());
         terminal.spawn_async(
             vte4::PtyFlags::DEFAULT,
             None::<&str>,
             &[&shell],
-            &[] as &[&str],
+            &[&dbus_env],
             gtk4::glib::SpawnFlags::DEFAULT,
             || {},
             -1,
@@ -103,38 +106,87 @@ impl TerminalTab {
             }
         });
 
-        // Background image layer (hidden by default)
-        let bg_picture = gtk4::Picture::new();
-        bg_picture.set_content_fit(gtk4::ContentFit::Cover);
-        bg_picture.set_hexpand(true);
-        bg_picture.set_vexpand(true);
-        bg_picture.set_visible(false);
+        // Background image layer - DrawingArea with manual texture rendering
+        let bg_texture: Rc<Cell<Option<gdk::Texture>>> = Rc::new(Cell::new(None));
+        let bg_drawing = gtk4::DrawingArea::new();
+        bg_drawing.set_hexpand(true);
+        bg_drawing.set_vexpand(true);
+        bg_drawing.set_visible(false);
+
+        let tex_ref = bg_texture.clone();
+        bg_drawing.set_draw_func(move |_widget, cr, width, height| {
+            let texture = tex_ref.take();
+            if let Some(ref tex) = texture {
+                let tw = tex.width() as f64;
+                let th = tex.height() as f64;
+                let w = width as f64;
+                let h = height as f64;
+
+                // Cover: scale to fill, crop excess
+                let scale = (w / tw).max(h / th);
+                let sw = tw * scale;
+                let sh = th * scale;
+                let ox = (w - sw) / 2.0;
+                let oy = (h - sh) / 2.0;
+
+                // Download texture pixels to cairo surface
+                let stride = (tex.width() as usize) * 4;
+                let mut data = vec![0u8; stride * tex.height() as usize];
+                tex.download(&mut data, stride);
+
+                // GDK download() uses native byte order (BGRA on little-endian)
+                // which matches Cairo ARgb32 — no conversion needed
+                let surface = gtk4::cairo::ImageSurface::create_for_data(
+                    data,
+                    gtk4::cairo::Format::ARgb32,
+                    tex.width(),
+                    tex.height(),
+                    stride as i32,
+                ).unwrap();
+
+                cr.save().unwrap();
+                cr.translate(ox, oy);
+                cr.scale(scale, scale);
+                cr.set_source_surface(&surface, 0.0, 0.0).unwrap();
+                cr.paint().unwrap();
+                cr.restore().unwrap();
+            }
+            tex_ref.set(texture);
+        });
 
         // Tint overlay (drawn on top of image, behind terminal)
         let tint_opacity = Rc::new(Cell::new(config.background.tint));
+        let tint_color = parse_color(&config.background.tint_color);
         let tint_overlay = gtk4::DrawingArea::new();
         tint_overlay.set_hexpand(true);
         tint_overlay.set_vexpand(true);
         tint_overlay.set_visible(false);
         let tint_val = tint_opacity.clone();
         tint_overlay.set_draw_func(move |_, cr, width, height| {
-            cr.set_source_rgba(0.118, 0.118, 0.180, tint_val.get()); // #1e1e2e
+            cr.set_source_rgba(
+                tint_color.red() as f64,
+                tint_color.green() as f64,
+                tint_color.blue() as f64,
+                tint_val.get(),
+            );
             cr.rectangle(0.0, 0.0, width as f64, height as f64);
             let _ = cr.fill();
         });
 
-        // Stack: bg_picture -> tint_overlay -> terminal (via GtkOverlay)
+        // Stack: bg_drawing (base) -> tint_overlay -> terminal
         let overlay = gtk4::Overlay::new();
-        overlay.set_child(Some(&bg_picture));
+        overlay.set_child(Some(&bg_drawing));
         overlay.add_overlay(&tint_overlay);
         overlay.add_overlay(&terminal);
 
         Self {
             overlay,
             terminal,
-            bg_picture,
+            bg_drawing,
             tint_overlay,
             tint_opacity,
+            bg_texture,
+            terminal_opacity: config.background.opacity,
         }
     }
 
@@ -143,39 +195,73 @@ impl TerminalTab {
     }
 
     pub fn set_background(&self, path: &Path) {
+        eprintln!("[custerm] set_background: {}", path.display());
+
+        if !path.exists() {
+            eprintln!("[custerm] file does not exist: {}", path.display());
+            return;
+        }
+
+        // Load image as texture
         let file = gtk4::gio::File::for_path(path);
-        self.bg_picture.set_file(Some(&file));
-        self.bg_picture.set_visible(true);
+        match gdk::Texture::from_file(&file) {
+            Ok(texture) => {
+                eprintln!(
+                    "[custerm] loaded texture: {}x{}",
+                    texture.width(),
+                    texture.height()
+                );
+                self.bg_texture.set(Some(texture));
+            }
+            Err(e) => {
+                eprintln!("[custerm] FAILED to load image {}: {}", path.display(), e);
+                return;
+            }
+        }
+
+        self.bg_drawing.set_visible(true);
+        self.bg_drawing.queue_draw();
         self.tint_overlay.set_visible(true);
 
-        // Stop VTE from painting its own opaque background
+        // Make VTE transparent — set_clear_background alone doesn't work in VTE4/GTK4,
+        // widget-level opacity is needed to let the background show through
         self.terminal.set_clear_background(false);
-
-        // Set transparent background color
+        self.terminal.set_opacity(self.terminal_opacity);
         let fg = parse_color("#cdd6f4");
         let bg = gdk::RGBA::new(0.0, 0.0, 0.0, 0.0);
-        let palette: Vec<gdk::RGBA> = PALETTE.iter().map(|c| parse_color(c)).collect();
+        let palette = make_palette();
         let palette_refs: Vec<&gdk::RGBA> = palette.iter().collect();
         self.terminal.set_colors(Some(&fg), Some(&bg), &palette_refs);
+        // Also set background color separately in case set_colors ignores alpha
+        self.terminal.set_color_background(&bg);
+
+        eprintln!("[custerm] background applied, tint={}", self.tint_opacity.get());
     }
 
     pub fn clear_background(&self) {
-        self.bg_picture.set_visible(false);
+        eprintln!("[custerm] clear_background");
+        self.bg_drawing.set_visible(false);
         self.tint_overlay.set_visible(false);
 
         self.terminal.set_clear_background(true);
+        self.terminal.set_opacity(1.0);
 
         let fg = parse_color("#cdd6f4");
         let bg = parse_color("#1e1e2e");
-        let palette: Vec<gdk::RGBA> = PALETTE.iter().map(|c| parse_color(c)).collect();
+        let palette = make_palette();
         let palette_refs: Vec<&gdk::RGBA> = palette.iter().collect();
         self.terminal.set_colors(Some(&fg), Some(&bg), &palette_refs);
     }
 
     pub fn set_tint(&self, opacity: f64) {
+        eprintln!("[custerm] set_tint: {}", opacity);
         self.tint_opacity.set(opacity);
         self.tint_overlay.queue_draw();
     }
+}
+
+fn make_palette() -> Vec<gdk::RGBA> {
+    PALETTE.iter().map(|c| parse_color(c)).collect()
 }
 
 fn parse_color(hex: &str) -> gdk::RGBA {

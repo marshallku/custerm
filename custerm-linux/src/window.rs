@@ -1,11 +1,10 @@
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow};
 use gtk4::glib;
 
-use custerm_core::background::BackgroundManager;
 use custerm_core::config::CustermConfig;
 
 use crate::dbus::{self, DbusCommand};
@@ -36,20 +35,18 @@ impl CustermWindow {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // Background manager
-        let bg_dir = config.background.directory.as_deref();
-        let mut bg_manager = BackgroundManager::new(bg_dir);
-        let _ = bg_manager.load_cache();
-
-        // Apply initial background
-        if let Some(path) = bg_manager.next().map(|p| p.to_path_buf()) {
-            terminal.set_background(&path);
+        // Apply initial background from config
+        if let Some(path) = config.background.image.as_ref().map(PathBuf::from) {
+            if path.exists() {
+                eprintln!("[custerm] applying background: {}", path.display());
+                terminal.set_background(&path);
+            } else {
+                eprintln!("[custerm] configured image not found: {}", path.display());
+            }
         }
 
-        let bg_manager = Arc::new(Mutex::new(bg_manager));
-
         // Register D-Bus and poll for commands on main thread
-        let rx = dbus::register(bg_manager.clone());
+        let rx = dbus::register();
         glib::timeout_add_local(Duration::from_millis(50), move || {
             while let Ok(cmd) = rx.try_recv() {
                 match cmd {

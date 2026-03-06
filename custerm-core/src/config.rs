@@ -16,12 +16,12 @@ fn default_font_size() -> u32 {
     14
 }
 
-fn default_interval() -> u64 {
-    300
+fn default_tint() -> f64 {
+    0.85
 }
 
-fn default_tint() -> f64 {
-    0.9
+fn default_tint_color() -> String {
+    "#1e1e2e".to_string()
 }
 
 fn default_opacity() -> f64 {
@@ -61,13 +61,13 @@ impl Default for TerminalConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundConfig {
     #[serde(default)]
-    pub directory: Option<String>,
-
-    #[serde(default = "default_interval")]
-    pub interval: u64,
+    pub image: Option<String>,
 
     #[serde(default = "default_tint")]
     pub tint: f64,
+
+    #[serde(default = "default_tint_color")]
+    pub tint_color: String,
 
     #[serde(default = "default_opacity")]
     pub opacity: f64,
@@ -76,9 +76,9 @@ pub struct BackgroundConfig {
 impl Default for BackgroundConfig {
     fn default() -> Self {
         Self {
-            directory: None,
-            interval: default_interval(),
+            image: None,
             tint: default_tint(),
+            tint_color: default_tint_color(),
             opacity: default_opacity(),
         }
     }
@@ -155,15 +155,15 @@ impl CustermConfig {
             std::fs::create_dir_all(parent)?;
         }
 
-        let default_config = r#"[terminal]
+        let default_config = r##"[terminal]
 # shell = "/bin/zsh"
 font_family = "JetBrainsMono Nerd Font Mono"
 font_size = 14
 
 [background]
-# directory = "/path/to/wallpapers"
-# interval = 300
-# tint = 0.9
+# image = "/path/to/wallpaper.jpg"
+# tint = 0.85
+# tint_color = "#1e1e2e"
 # opacity = 0.95
 
 [socket]
@@ -171,7 +171,7 @@ font_size = 14
 
 [theme]
 name = "catppuccin-mocha"
-"#;
+"##;
         std::fs::write(&path, default_config)?;
         Ok(path)
     }

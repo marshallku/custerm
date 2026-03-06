@@ -23,9 +23,9 @@ font_family = "JetBrainsMono Nerd Font Mono"
 font_size = 14
 
 [background]
-directory = "/mnt/disk2/Wallpapers/"
-interval = 300      # Auto-rotation interval in seconds
-tint = 0.9          # Tint overlay opacity (0.0 = no tint, 1.0 = fully opaque)
+# image = "/path/to/wallpaper.jpg"  # Single image (takes priority)
+directory = "/mnt/disk2/Wallpapers/"  # Directory for random picks
+tint = 0.85         # Tint overlay opacity (0.0 = no tint, 1.0 = fully opaque)
 opacity = 0.95      # Terminal opacity
 
 [socket]
@@ -49,9 +49,9 @@ name = "catppuccin-mocha"
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `directory` | — (optional) | Path to wallpaper directory |
-| `interval` | `300` | Auto-rotation interval (seconds) |
-| `tint` | `0.9` | Tint overlay opacity |
+| `image` | — (optional) | Single image file path (takes priority over directory) |
+| `directory` | — (optional) | Path to wallpaper directory (random pick) |
+| `tint` | `0.9` | Tint overlay opacity (0.0=transparent, 1.0=fully opaque) |
 | `opacity` | `0.95` | Terminal opacity |
 
 ### [socket]

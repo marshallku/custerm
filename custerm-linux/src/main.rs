@@ -4,7 +4,6 @@ mod terminal;
 mod window;
 
 fn main() {
-    env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
 

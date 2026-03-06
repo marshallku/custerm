@@ -1,13 +1,8 @@
-use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 
 use gtk4::gio;
 use gtk4::glib;
-use gtk4::prelude::*;
 
-use custerm_core::background::BackgroundManager;
-
-const BUS_NAME: &str = "com.marshall.custerm";
 const OBJECT_PATH: &str = "/com/marshall/custerm";
 const INTERFACE_NAME: &str = "com.marshall.custerm";
 
@@ -17,13 +12,9 @@ const INTROSPECTION_XML: &str = r#"
     <method name="SetBackground">
       <arg name="path" type="s" direction="in"/>
     </method>
-    <method name="NextBackground"/>
     <method name="ClearBackground"/>
     <method name="SetTint">
       <arg name="opacity" type="d" direction="in"/>
-    </method>
-    <method name="GetCurrentBackground">
-      <arg name="path" type="s" direction="out"/>
     </method>
   </interface>
 </node>
@@ -36,18 +27,23 @@ pub enum DbusCommand {
     SetTint(f64),
 }
 
-/// Register D-Bus service. Returns an mpsc::Receiver for commands.
-/// Caller must poll the receiver on the GTK main thread.
-pub fn register(bg_manager: Arc<Mutex<BackgroundManager>>) -> mpsc::Receiver<DbusCommand> {
+/// Per-process D-Bus name: com.marshall.custerm.p{PID}
+pub fn bus_name() -> String {
+    format!("com.marshall.custerm.p{}", std::process::id())
+}
+
+pub fn register() -> mpsc::Receiver<DbusCommand> {
     let (tx, rx) = mpsc::channel::<DbusCommand>();
+    let name = bus_name();
+
+    eprintln!("[custerm] D-Bus name: {}", name);
 
     gio::bus_own_name(
         gio::BusType::Session,
-        BUS_NAME,
+        &name,
         gio::BusNameOwnerFlags::NONE,
         {
             let tx = tx.clone();
-            let bg_manager = bg_manager.clone();
             move |connection, _name| {
                 let node_info = gio::DBusNodeInfo::for_xml(INTROSPECTION_XML)
                     .expect("Failed to parse introspection XML");
@@ -56,12 +52,11 @@ pub fn register(bg_manager: Arc<Mutex<BackgroundManager>>) -> mpsc::Receiver<Dbu
                     .expect("Interface not found");
 
                 let tx = tx.clone();
-                let bg_manager = bg_manager.clone();
                 let _reg_id = connection
                     .register_object(OBJECT_PATH, &interface_info)
                     .method_call(
                         move |_conn, _sender, _path, _interface, method, params, invocation| {
-                            handle_method(&tx, &bg_manager, method, params, invocation);
+                            handle_method(&tx, method, params, invocation);
                         },
                     )
                     .build();
@@ -69,7 +64,7 @@ pub fn register(bg_manager: Arc<Mutex<BackgroundManager>>) -> mpsc::Receiver<Dbu
         },
         |_connection, _name| {},
         |_connection, _name| {
-            log::warn!("Lost D-Bus name ownership");
+            eprintln!("[custerm] lost D-Bus name ownership");
         },
     );
 
@@ -78,7 +73,6 @@ pub fn register(bg_manager: Arc<Mutex<BackgroundManager>>) -> mpsc::Receiver<Dbu
 
 fn handle_method(
     tx: &mpsc::Sender<DbusCommand>,
-    bg_manager: &Arc<Mutex<BackgroundManager>>,
     method: &str,
     params: glib::Variant,
     invocation: gio::DBusMethodInvocation,
@@ -86,22 +80,7 @@ fn handle_method(
     match method {
         "SetBackground" => {
             let path: String = params.child_get(0);
-            if let Ok(mut mgr) = bg_manager.lock() {
-                mgr.current = Some(PathBuf::from(&path));
-            }
             let _ = tx.send(DbusCommand::SetBackground(path));
-            invocation.return_value(None);
-        }
-        "NextBackground" => {
-            let path = {
-                let mut mgr = bg_manager.lock().unwrap();
-                mgr.next().map(|p| p.to_path_buf())
-            };
-            if let Some(path) = path {
-                let _ = tx.send(DbusCommand::SetBackground(
-                    path.to_string_lossy().to_string(),
-                ));
-            }
             invocation.return_value(None);
         }
         "ClearBackground" => {
@@ -112,14 +91,6 @@ fn handle_method(
             let opacity: f64 = params.child_get(0);
             let _ = tx.send(DbusCommand::SetTint(opacity));
             invocation.return_value(None);
-        }
-        "GetCurrentBackground" => {
-            let path = bg_manager
-                .lock()
-                .ok()
-                .and_then(|mgr| mgr.current.as_ref().map(|p| p.to_string_lossy().to_string()))
-                .unwrap_or_default();
-            invocation.return_value(Some(&(path,).to_variant()));
         }
         _ => {
             invocation.return_error(gio::IOErrorEnum::Failed, &format!("Unknown method: {method}"));

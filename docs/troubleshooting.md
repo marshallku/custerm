@@ -43,8 +43,25 @@ Failed to create GBM buffer of size 841x1352: Invalid argument
 2. Set opaque VTE bg by default, only go transparent when bg image is applied
 
 ### Background images not showing (solid color only)
-**Cause:** VTE paints its own opaque background over the GtkOverlay layers.
-**Fix:** Call `terminal.set_clear_background(false)` in `set_background()` method. This stops VTE from painting its own background, allowing the image layer to show through.
+Multiple possible causes:
+
+1. **Config `directory` is commented out**: Check `~/.config/custerm/config.toml`. The `directory` field must be uncommented. A `#` before the key comments it out.
+
+2. **VTE paints opaque background**: Call `terminal.set_clear_background(false)` in `set_background()`. Without this, VTE covers the image layer.
+
+3. **Image loading fails silently**: The original `GtkPicture::set_file()` loads asynchronously and fails silently. Fixed by using `gdk::Texture::from_file()` for synchronous loading with error reporting.
+
+4. **Tint too opaque**: Tint at 0.9 makes images nearly invisible (90% opaque dark overlay). Lower to 0.85 or less.
+
+5. **GTK single-instance**: If an old custerm is running, new launches activate the old instance and exit immediately (exit code 0, no output). Kill all instances first: `killall custerm`.
+
+### App exits immediately with no error
+**Cause:** GTK single-instance behavior. Another custerm instance already owns the D-Bus app ID `com.marshall.custerm`.
+**Fix:** `killall custerm` then relaunch.
+
+### env_logger output not visible
+**Cause:** GTK may capture/redirect stderr. `RUST_LOG=info` has no visible effect.
+**Fix:** Use `eprintln!("[custerm] ...")` instead of `log::info!()` for debug output.
 
 ### D-Bus: GTK widgets not Send+Sync
 **Problem:** D-Bus callbacks need `Send+Sync` closures, but GTK widgets can't be sent across threads.
