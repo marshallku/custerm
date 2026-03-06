@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -30,6 +30,7 @@ pub struct TerminalTab {
     pub tint_opacity: Rc<Cell<f64>>,
     pub tint_color: Rc<Cell<gdk::RGBA>>,
     pub bg_texture: Rc<Cell<Option<gdk::Texture>>>,
+    pub bg_surface_cache: Rc<RefCell<Option<gtk4::cairo::ImageSurface>>>,
     pub image_opacity: Rc<Cell<f64>>,
     pub has_background: Rc<Cell<bool>>,
 }
@@ -118,9 +119,25 @@ impl TerminalTab {
 
         let tex_ref = bg_texture.clone();
         let opacity_ref = image_opacity.clone();
+        let cached_surface: Rc<RefCell<Option<gtk4::cairo::ImageSurface>>> = Rc::new(RefCell::new(None));
+        let surface_ref = cached_surface.clone();
         bg_drawing.set_draw_func(move |_widget, cr, width, height| {
             let texture = tex_ref.take();
             if let Some(ref tex) = texture {
+                let mut cache = surface_ref.borrow_mut();
+                let surface = cache.get_or_insert_with(|| {
+                    let stride = (tex.width() as usize) * 4;
+                    let mut data = vec![0u8; stride * tex.height() as usize];
+                    tex.download(&mut data, stride);
+                    gtk4::cairo::ImageSurface::create_for_data(
+                        data,
+                        gtk4::cairo::Format::ARgb32,
+                        tex.width(),
+                        tex.height(),
+                        stride as i32,
+                    ).unwrap()
+                });
+
                 let tw = tex.width() as f64;
                 let th = tex.height() as f64;
                 let w = width as f64;
@@ -130,23 +147,10 @@ impl TerminalTab {
                 let ox = (w - tw * scale) / 2.0;
                 let oy = (h - th * scale) / 2.0;
 
-                let stride = (tex.width() as usize) * 4;
-                let mut data = vec![0u8; stride * tex.height() as usize];
-                tex.download(&mut data, stride);
-
-                let surface = gtk4::cairo::ImageSurface::create_for_data(
-                    data,
-                    gtk4::cairo::Format::ARgb32,
-                    tex.width(),
-                    tex.height(),
-                    stride as i32,
-                ).unwrap();
-
                 cr.save().unwrap();
                 cr.translate(ox, oy);
                 cr.scale(scale, scale);
-                cr.set_source_surface(&surface, 0.0, 0.0).unwrap();
-                // Paint image with configurable opacity (text stays fully opaque)
+                cr.set_source_surface(surface, 0.0, 0.0).unwrap();
                 cr.paint_with_alpha(opacity_ref.get()).unwrap();
                 cr.restore().unwrap();
             }
@@ -197,6 +201,7 @@ impl TerminalTab {
             tint_opacity,
             tint_color,
             bg_texture,
+            bg_surface_cache: cached_surface,
             image_opacity,
             has_background: Rc::new(Cell::new(false)),
         }
@@ -223,6 +228,7 @@ impl TerminalTab {
                     texture.height()
                 );
                 self.bg_texture.set(Some(texture));
+                self.bg_surface_cache.borrow_mut().take();
             }
             Err(e) => {
                 eprintln!("[custerm] FAILED to load image {}: {}", path.display(), e);
