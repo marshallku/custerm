@@ -21,15 +21,7 @@ pub enum Command {
     /// Ping the running custerm instance
     Ping,
 
-    /// Window management
-    #[command(subcommand)]
-    Window(WindowCommand),
-
-    /// Workspace management
-    #[command(subcommand)]
-    Workspace(WorkspaceCommand),
-
-    /// Session/surface management
+    /// Panel management
     #[command(subcommand)]
     Session(SessionCommand),
 
@@ -55,35 +47,6 @@ pub enum Command {
 }
 
 #[derive(Subcommand)]
-pub enum WindowCommand {
-    /// List all windows
-    List,
-    /// Create a new window
-    New,
-    /// Focus a window
-    Focus { id: String },
-    /// Close a window
-    Close { id: Option<String> },
-}
-
-#[derive(Subcommand)]
-pub enum WorkspaceCommand {
-    /// List workspaces
-    List,
-    /// Create a new workspace
-    New {
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// Select/switch to a workspace
-    Select { id: String },
-    /// Close a workspace
-    Close { id: Option<String> },
-    /// Rename a workspace
-    Rename { id: String, name: String },
-}
-
-#[derive(Subcommand)]
 pub enum SessionCommand {
     /// List all panels
     List,
@@ -92,21 +55,6 @@ pub enum SessionCommand {
         /// Panel ID
         id: String,
     },
-    /// Send text to a session
-    Send {
-        #[arg(long)]
-        id: String,
-        text: String,
-    },
-    /// Read screen content (not yet implemented)
-    Read {
-        #[arg(long)]
-        id: Option<String>,
-        #[arg(long, default_value_t = 50)]
-        lines: u32,
-    },
-    /// Close a session
-    Close { id: String },
 }
 
 #[derive(Subcommand)]
@@ -285,27 +233,9 @@ impl Cli {
     pub fn method(&self) -> String {
         match &self.command {
             Command::Ping => "system.ping".to_string(),
-            Command::Window(cmd) => match cmd {
-                WindowCommand::List => "window.list",
-                WindowCommand::New => "window.create",
-                WindowCommand::Focus { .. } => "window.focus",
-                WindowCommand::Close { .. } => "window.close",
-            }
-            .to_string(),
-            Command::Workspace(cmd) => match cmd {
-                WorkspaceCommand::List => "workspace.list",
-                WorkspaceCommand::New { .. } => "workspace.create",
-                WorkspaceCommand::Select { .. } => "workspace.select",
-                WorkspaceCommand::Close { .. } => "workspace.close",
-                WorkspaceCommand::Rename { .. } => "workspace.rename",
-            }
-            .to_string(),
             Command::Session(cmd) => match cmd {
                 SessionCommand::List => "session.list",
                 SessionCommand::Info { .. } => "session.info",
-                SessionCommand::Send { .. } => "session.send_text",
-                SessionCommand::Read { .. } => "session.read_text",
-                SessionCommand::Close { .. } => "session.close",
             }
             .to_string(),
             Command::Background(cmd) => match cmd {
@@ -356,26 +286,9 @@ impl Cli {
     pub fn params(&self) -> serde_json::Value {
         match &self.command {
             Command::Ping => json!({}),
-            Command::Window(cmd) => match cmd {
-                WindowCommand::List | WindowCommand::New => json!({}),
-                WindowCommand::Focus { id } => json!({ "window_id": id }),
-                WindowCommand::Close { id } => json!({ "window_id": id }),
-            },
-            Command::Workspace(cmd) => match cmd {
-                WorkspaceCommand::List => json!({}),
-                WorkspaceCommand::New { name } => json!({ "name": name }),
-                WorkspaceCommand::Select { id } => json!({ "workspace_id": id }),
-                WorkspaceCommand::Close { id } => json!({ "workspace_id": id }),
-                WorkspaceCommand::Rename { id, name } => {
-                    json!({ "workspace_id": id, "name": name })
-                }
-            },
             Command::Session(cmd) => match cmd {
                 SessionCommand::List => json!({}),
                 SessionCommand::Info { id } => json!({ "id": id }),
-                SessionCommand::Send { id, text } => json!({ "session_id": id, "text": text }),
-                SessionCommand::Read { id, lines } => json!({ "session_id": id, "lines": lines }),
-                SessionCommand::Close { id } => json!({ "session_id": id }),
             },
             Command::Background(cmd) => match cmd {
                 BackgroundCommand::Set { path } => {
