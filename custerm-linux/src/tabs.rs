@@ -1216,34 +1216,57 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
     add_btn.set_tooltip_text(Some("New tab"));
 
     let popover = gtk4::Popover::new();
-    let pop_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    let pop_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     pop_box.add_css_class("custerm-add-menu");
 
-    let term_btn = gtk4::Button::new();
-    let term_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    term_content.append(&gtk4::Image::from_icon_name("utilities-terminal-symbolic"));
-    term_content.append(&gtk4::Label::new(Some("Terminal")));
-    term_btn.set_child(Some(&term_content));
-    term_btn.add_css_class("flat");
-    term_btn.add_css_class("custerm-add-item");
+    // Helper: create a row with [TypeIcon TypeLabel] [Tab] [SplitH] [SplitV]
+    let make_row =
+        |icon: &str, label_text: &str| -> (gtk4::Box, gtk4::Button, gtk4::Button, gtk4::Button) {
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            row.add_css_class("custerm-add-row");
 
-    let browser_btn = gtk4::Button::new();
-    let browser_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    browser_content.append(&gtk4::Image::from_icon_name("web-browser-symbolic"));
-    browser_content.append(&gtk4::Label::new(Some("Browser")));
-    browser_btn.set_child(Some(&browser_content));
-    browser_btn.add_css_class("flat");
-    browser_btn.add_css_class("custerm-add-item");
+            let type_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+            type_box.append(&gtk4::Image::from_icon_name(icon));
+            type_box.append(&gtk4::Label::new(Some(label_text)));
+            type_box.set_hexpand(true);
 
-    pop_box.append(&term_btn);
-    pop_box.append(&browser_btn);
+            let tab_btn = gtk4::Button::from_icon_name("tab-new-symbolic");
+            tab_btn.add_css_class("flat");
+            tab_btn.add_css_class("custerm-placement-btn");
+            tab_btn.set_tooltip_text(Some("New tab"));
+
+            let split_h_btn = gtk4::Button::from_icon_name("view-dual-symbolic");
+            split_h_btn.add_css_class("flat");
+            split_h_btn.add_css_class("custerm-placement-btn");
+            split_h_btn.set_tooltip_text(Some("Split horizontal"));
+
+            let split_v_btn = gtk4::Button::from_icon_name("view-paged-symbolic");
+            split_v_btn.add_css_class("flat");
+            split_v_btn.add_css_class("custerm-placement-btn");
+            split_v_btn.set_tooltip_text(Some("Split vertical"));
+
+            row.append(&type_box);
+            row.append(&tab_btn);
+            row.append(&split_h_btn);
+            row.append(&split_v_btn);
+
+            (row, tab_btn, split_h_btn, split_v_btn)
+        };
+
+    let (term_row, term_tab, term_h, term_v) = make_row("utilities-terminal-symbolic", "Terminal");
+    let (browser_row, browser_tab, browser_h, browser_v) =
+        make_row("web-browser-symbolic", "Browser");
+
+    pop_box.append(&term_row);
+    pop_box.append(&browser_row);
     popover.set_child(Some(&pop_box));
     add_btn.set_popover(Some(&popover));
 
+    // Terminal placements
     let mgr = manager.clone();
     let win = window.clone();
     let pop = popover.clone();
-    term_btn.connect_clicked(move |_| {
+    term_tab.connect_clicked(move |_| {
         pop.popdown();
         mgr.add_tab(&win);
     });
@@ -1251,9 +1274,42 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
     let mgr = manager.clone();
     let win = window.clone();
     let pop = popover.clone();
-    browser_btn.connect_clicked(move |_| {
+    term_h.connect_clicked(move |_| {
+        pop.popdown();
+        mgr.split_focused(gtk4::Orientation::Horizontal, &win);
+    });
+
+    let mgr = manager.clone();
+    let win = window.clone();
+    let pop = popover.clone();
+    term_v.connect_clicked(move |_| {
+        pop.popdown();
+        mgr.split_focused(gtk4::Orientation::Vertical, &win);
+    });
+
+    // Browser placements
+    let mgr = manager.clone();
+    let win = window.clone();
+    let pop = popover.clone();
+    browser_tab.connect_clicked(move |_| {
         pop.popdown();
         mgr.add_webview_tab("about:blank", &win);
+    });
+
+    let mgr = manager.clone();
+    let win = window.clone();
+    let pop = popover.clone();
+    browser_h.connect_clicked(move |_| {
+        pop.popdown();
+        mgr.split_focused_webview("about:blank", gtk4::Orientation::Horizontal, &win);
+    });
+
+    let mgr = manager.clone();
+    let win = window.clone();
+    let pop = popover.clone();
+    browser_v.connect_clicked(move |_| {
+        pop.popdown();
+        mgr.split_focused_webview("about:blank", gtk4::Orientation::Vertical, &win);
     });
 
     // For vertical tabs: hide add button when collapsed (default). For horizontal: always show.
@@ -1390,17 +1446,35 @@ notebook.custerm-collapsed header.bottom tab {{
 }}
 
 .custerm-add-menu {{
-    padding: 4px;
+    padding: 6px;
 }}
 
-.custerm-add-item {{
-    padding: 6px 12px;
+.custerm-add-row {{
+    padding: 4px 6px;
     border-radius: 4px;
     color: #cdd6f4;
 }}
 
-.custerm-add-item:hover {{
+.custerm-add-row:hover {{
+    background-color: #262637;
+}}
+
+.custerm-placement-btn {{
+    min-width: 24px;
+    min-height: 24px;
+    padding: 2px;
+    border-radius: 4px;
+    color: #6c7086;
+    opacity: 0;
+}}
+
+.custerm-add-row:hover .custerm-placement-btn {{
+    opacity: 1;
+}}
+
+.custerm-placement-btn:hover {{
     background-color: #313244;
+    color: #cdd6f4;
 }}
 "#
     )
