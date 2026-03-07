@@ -48,6 +48,10 @@ pub enum Command {
     /// Event stream
     #[command(subcommand)]
     Event(EventCommand),
+
+    /// WebView panel management
+    #[command(subcommand)]
+    Webview(WebviewCommand),
 }
 
 #[derive(Subcommand)]
@@ -145,6 +149,61 @@ pub enum EventCommand {
     Subscribe,
 }
 
+#[derive(Subcommand)]
+pub enum WebviewCommand {
+    /// Open a URL in a new webview panel
+    Open {
+        /// URL to open
+        url: String,
+        /// Panel mode: tab, split_h, split_v
+        #[arg(long, default_value = "tab")]
+        mode: String,
+    },
+    /// Navigate an existing webview to a new URL
+    Navigate {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// URL to navigate to
+        url: String,
+    },
+    /// Go back in webview history
+    Back {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+    },
+    /// Go forward in webview history
+    Forward {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+    },
+    /// Reload webview
+    Reload {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+    },
+    /// Execute JavaScript in a webview
+    ExecJs {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// JavaScript code to execute
+        code: String,
+    },
+    /// Get page content from a webview
+    GetContent {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// Content format: text or html
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+}
+
 impl Cli {
     pub fn method(&self) -> String {
         match &self.command {
@@ -196,6 +255,16 @@ impl Cli {
                 EventCommand::Subscribe => "event.subscribe",
             }
             .to_string(),
+            Command::Webview(cmd) => match cmd {
+                WebviewCommand::Open { .. } => "webview.open",
+                WebviewCommand::Navigate { .. } => "webview.navigate",
+                WebviewCommand::Back { .. } => "webview.back",
+                WebviewCommand::Forward { .. } => "webview.forward",
+                WebviewCommand::Reload { .. } => "webview.reload",
+                WebviewCommand::ExecJs { .. } => "webview.execute_js",
+                WebviewCommand::GetContent { .. } => "webview.get_content",
+            }
+            .to_string(),
         }
     }
 
@@ -235,6 +304,15 @@ impl Cli {
                 BackgroundCommand::Next | BackgroundCommand::Toggle => json!({}),
             },
             Command::Tab(_) | Command::Split(_) | Command::Event(_) => json!({}),
+            Command::Webview(cmd) => match cmd {
+                WebviewCommand::Open { url, mode } => json!({ "url": url, "mode": mode }),
+                WebviewCommand::Navigate { id, url } => json!({ "id": id, "url": url }),
+                WebviewCommand::Back { id } => json!({ "id": id }),
+                WebviewCommand::Forward { id } => json!({ "id": id }),
+                WebviewCommand::Reload { id } => json!({ "id": id }),
+                WebviewCommand::ExecJs { id, code } => json!({ "id": id, "code": code }),
+                WebviewCommand::GetContent { id, format } => json!({ "id": id, "format": format }),
+            },
         }
     }
 }

@@ -54,14 +54,19 @@ Single programmable interface for both human CLI and AI agents.
 - [x] **Event stream**: subscribe to terminal output, focus changes, panel lifecycle via `event.subscribe`
 - [x] **Query API**: `session.list`, `session.info` (panel details + cursor/dimensions), `tab.info` (extended tab info)
 
-### Phase 5: WebView Panel
+### Phase 5: WebView Panel ✅
 Embed browser as a panel type alongside terminals.
 
-- [ ] **WebKitGTK panel**: browser view as a Panel impl
-- [ ] **URL bar / navigation** within panel
-- [ ] **DevTools toggle**
+- [x] **WebKitGTK panel**: `WebViewPanel` as Panel impl via `webkit6` crate (GTK4-native)
+- [x] **PanelVariant enum**: refactored split tree, tab manager, and socket dispatch from `Rc<TerminalPanel>` to `Rc<PanelVariant>`
+- [x] **Socket API**: `webview.open`, `webview.navigate`, `webview.back/forward/reload`, `webview.execute_js`, `webview.get_content`
+- [x] **Async dispatch**: `webview.execute_js` and `webview.get_content` reply asynchronously from WebKit callbacks
+- [x] **Event stream**: `webview.loaded`, `webview.title_changed`, `webview.navigated` events
+- [x] **CLI commands**: `custermctl webview open/navigate/back/forward/reload/exec-js/get-content`
+- [x] **Side-by-side workflow**: terminal + webview split or tabbed
+- [ ] **URL bar / navigation** within panel (UI)
+- [ ] **DevTools toggle** (UI)
 - [ ] **JS ↔ custerm bridge**: page scripts can call custerm API
-- [ ] **Side-by-side workflow**: terminal + docs/PR/CI in one window
 
 ### Phase 6: AI Agent Integration
 Make custerm a first-class environment for AI coding agents.

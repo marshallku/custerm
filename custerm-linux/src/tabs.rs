@@ -10,16 +10,18 @@ use custerm_core::config::CustermConfig;
 use custerm_core::protocol::Event;
 
 use vte4::prelude::*;
+use webkit6::prelude::*;
 
-use crate::panel::Panel;
+use crate::panel::{Panel, PanelVariant};
 use crate::socket::{EventBus, broadcast};
 use crate::split::{CloseResult, TabContent};
 use crate::terminal::TerminalPanel;
+use crate::webview::WebViewPanel;
 
 pub struct TabManager {
     pub notebook: gtk4::Notebook,
     tabs: Rc<RefCell<Vec<TabContent>>>,
-    focused: Rc<RefCell<Option<Rc<TerminalPanel>>>>,
+    focused: Rc<RefCell<Option<Rc<PanelVariant>>>>,
     config: Rc<RefCell<CustermConfig>>,
     event_bus: EventBus,
 }
@@ -99,7 +101,7 @@ impl TabManager {
         let panel = self.create_panel(&config, window);
 
         let tab_content = TabContent::new(panel.clone());
-        let tab_label = self.make_tab_label(&panel);
+        let tab_label = self.make_tab_label(&panel, &tab_content.container);
 
         self.notebook
             .append_page(&tab_content.container, Some(&tab_label));
@@ -114,9 +116,38 @@ impl TabManager {
         panel.grab_focus();
 
         broadcast(&self.event_bus, &Event::new("tab.created", json!({
-            "panel_id": panel.id,
+            "panel_id": panel.id(),
+            "panel_type": panel.panel_type(),
             "tab": page_num,
         })));
+    }
+
+    pub fn add_webview_tab(self: &Rc<Self>, url: &str, _window: &gtk4::ApplicationWindow) -> String {
+        let panel = self.create_webview_panel(url);
+        let panel_id = panel.id().to_string();
+
+        let tab_content = TabContent::new(panel.clone());
+        let tab_label = self.make_tab_label(&panel, &tab_content.container);
+
+        self.notebook
+            .append_page(&tab_content.container, Some(&tab_label));
+        self.notebook
+            .set_tab_reorderable(&tab_content.container, true);
+        self.tabs.borrow_mut().push(tab_content);
+        self.update_tab_visibility();
+
+        let page_num = self.notebook.n_pages() - 1;
+        self.notebook.set_current_page(Some(page_num));
+        *self.focused.borrow_mut() = Some(panel.clone());
+        panel.grab_focus();
+
+        broadcast(&self.event_bus, &Event::new("tab.created", json!({
+            "panel_id": panel_id,
+            "panel_type": "webview",
+            "tab": page_num,
+        })));
+
+        panel_id
     }
 
     pub fn split_focused(
@@ -142,6 +173,30 @@ impl TabManager {
         new_panel.grab_focus();
     }
 
+    pub fn split_focused_webview(
+        self: &Rc<Self>,
+        url: &str,
+        orientation: gtk4::Orientation,
+        _window: &gtk4::ApplicationWindow,
+    ) -> Option<String> {
+        let focused = self.focused.borrow().clone();
+        let focused_panel = focused?;
+        let tab_idx = self.tab_index_of(&focused_panel)?;
+
+        let new_panel = self.create_webview_panel(url);
+        let panel_id = new_panel.id().to_string();
+
+        {
+            let tabs = self.tabs.borrow();
+            tabs[tab_idx].split(&focused_panel, &new_panel, orientation);
+        }
+
+        *self.focused.borrow_mut() = Some(new_panel.clone());
+        new_panel.grab_focus();
+
+        Some(panel_id)
+    }
+
     pub fn close_focused(self: &Rc<Self>, window: &gtk4::ApplicationWindow) {
         let focused = self.focused.borrow().clone();
         let Some(focused_panel) = focused else { return };
@@ -156,7 +211,7 @@ impl TabManager {
 
         match result {
             CloseResult::CloseTab => {
-                let panel_id = focused_panel.id.clone();
+                let panel_id = focused_panel.id().to_string();
                 self.tabs.borrow_mut().remove(tab_idx);
                 self.notebook.remove_page(Some(tab_idx as u32));
                 self.update_tab_visibility();
@@ -190,7 +245,7 @@ impl TabManager {
         }
     }
 
-    pub fn active_panel(&self) -> Option<Rc<TerminalPanel>> {
+    pub fn active_panel(&self) -> Option<Rc<PanelVariant>> {
         self.focused.borrow().clone()
     }
 
@@ -217,7 +272,9 @@ impl TabManager {
             let mut panels = Vec::new();
             tab.root.borrow().collect_panels(&mut panels);
             for panel in panels {
-                panel.apply_config(config);
+                if let Some(term) = panel.as_terminal() {
+                    term.apply_config(config);
+                }
             }
         }
     }
@@ -271,12 +328,17 @@ impl TabManager {
             tab.root.borrow().collect_panels(&mut panels);
             for panel in panels {
                 let is_focused = focused.as_ref().is_some_and(|f| Rc::ptr_eq(f, &panel));
-                result.push(json!({
-                    "id": panel.id,
+                let mut info = json!({
+                    "id": panel.id(),
+                    "type": panel.panel_type(),
                     "title": panel.title(),
                     "tab": tab_idx,
                     "focused": is_focused,
-                }));
+                });
+                if let Some(wv) = panel.as_webview() {
+                    info["url"] = json!(wv.current_url());
+                }
+                result.push(info);
             }
         }
 
@@ -292,22 +354,46 @@ impl TabManager {
             let mut panels = Vec::new();
             tab.root.borrow().collect_panels(&mut panels);
             for panel in panels {
-                if panel.id == id {
+                if panel.id() == id {
                     let is_focused = focused.as_ref().is_some_and(|f| Rc::ptr_eq(f, &panel));
-                    let (cursor_row, cursor_col) = panel.terminal.cursor_position();
-                    return Some(json!({
-                        "id": panel.id,
+                    let mut info = json!({
+                        "id": panel.id(),
+                        "type": panel.panel_type(),
                         "title": panel.title(),
                         "tab": tab_idx,
                         "focused": is_focused,
-                        "cols": panel.terminal.column_count(),
-                        "rows": panel.terminal.row_count(),
-                        "cursor": [cursor_row, cursor_col],
-                    }));
+                    });
+                    match &*panel {
+                        PanelVariant::Terminal(term) => {
+                            let (cursor_row, cursor_col) = term.terminal.cursor_position();
+                            info["cols"] = json!(term.terminal.column_count());
+                            info["rows"] = json!(term.terminal.row_count());
+                            info["cursor"] = json!([cursor_row, cursor_col]);
+                        }
+                        PanelVariant::WebView(wv) => {
+                            info["url"] = json!(wv.current_url());
+                        }
+                    }
+                    return Some(info);
                 }
             }
         }
 
+        None
+    }
+
+    /// Find a panel by ID
+    pub fn find_panel_by_id(&self, id: &str) -> Option<Rc<PanelVariant>> {
+        let tabs = self.tabs.borrow();
+        for tab in tabs.iter() {
+            let mut panels = Vec::new();
+            tab.root.borrow().collect_panels(&mut panels);
+            for panel in panels {
+                if panel.id() == id {
+                    return Some(panel);
+                }
+            }
+        }
         None
     }
 
@@ -341,14 +427,14 @@ impl TabManager {
         self: &Rc<Self>,
         config: &CustermConfig,
         window: &gtk4::ApplicationWindow,
-    ) -> Rc<TerminalPanel> {
+    ) -> Rc<PanelVariant> {
         let mgr = Rc::downgrade(self);
         let win = window.clone();
         let widget_holder: Rc<RefCell<Option<gtk4::Widget>>> = Rc::new(RefCell::new(None));
         let widget_for_exit = widget_holder.clone();
         let event_bus_exit = self.event_bus.clone();
 
-        let panel = Rc::new(TerminalPanel::new(config, move || {
+        let terminal_panel = TerminalPanel::new(config, move || {
             let widget = widget_for_exit.borrow().clone();
             let mgr = mgr.clone();
             let win = win.clone();
@@ -359,58 +445,114 @@ impl TabManager {
                     mgr.handle_panel_exit(w, &win, &bus);
                 }
             });
-        }));
+        });
+
+        let panel = Rc::new(PanelVariant::Terminal(terminal_panel));
 
         *widget_holder.borrow_mut() = Some(panel.widget().clone());
 
         // Apply background
         if let Some(ref path) = config.background.image {
             let p = std::path::Path::new(path);
-            if p.exists() {
-                panel.set_background(p);
+            if p.exists()
+                && let Some(term) = panel.as_terminal()
+            {
+                term.set_background(p);
             }
         }
 
         // Hook terminal output events
-        let bus = self.event_bus.clone();
-        let panel_id = panel.id.clone();
-        panel.terminal.connect_commit(move |_term, text, _size| {
-            broadcast(&bus, &Event::new("terminal.output", json!({
-                "panel_id": panel_id,
-                "text": text,
-            })));
-        });
+        if let Some(term) = panel.as_terminal() {
+            let bus = self.event_bus.clone();
+            let panel_id = term.id.clone();
+            term.terminal.connect_commit(move |_term, text, _size| {
+                broadcast(&bus, &Event::new("terminal.output", json!({
+                    "panel_id": panel_id,
+                    "text": text,
+                })));
+            });
 
-        // Hook title change events
-        let bus = self.event_bus.clone();
-        let panel_id = panel.id.clone();
-        panel.terminal.connect_window_title_changed(move |term| {
-            let title = term.window_title().map(|t| t.to_string()).unwrap_or_default();
-            broadcast(&bus, &Event::new("panel.title_changed", json!({
-                "panel_id": panel_id,
-                "title": title,
-            })));
-        });
+            // Hook title change events
+            let bus = self.event_bus.clone();
+            let panel_id = term.id.clone();
+            term.terminal.connect_window_title_changed(move |term| {
+                let title = term.window_title().map(|t| t.to_string()).unwrap_or_default();
+                broadcast(&bus, &Event::new("panel.title_changed", json!({
+                    "panel_id": panel_id,
+                    "title": title,
+                })));
+            });
+        }
 
         self.track_focus(&panel);
         panel
     }
 
-    fn track_focus(&self, panel: &Rc<TerminalPanel>) {
+    fn create_webview_panel(self: &Rc<Self>, url: &str) -> Rc<PanelVariant> {
+        let webview_panel = WebViewPanel::new(url);
+        let panel = Rc::new(PanelVariant::WebView(webview_panel));
+
+        // Hook webview events
+        if let Some(wv) = panel.as_webview() {
+            let bus = self.event_bus.clone();
+            let panel_id = wv.id.clone();
+            wv.webview.connect_load_changed(move |_wv, event| {
+                if event == webkit6::LoadEvent::Finished {
+                    broadcast(&bus, &Event::new("webview.loaded", json!({
+                        "panel_id": panel_id,
+                    })));
+                }
+            });
+
+            let bus = self.event_bus.clone();
+            let panel_id = wv.id.clone();
+            wv.webview.connect_notify_local(Some("title"), move |webview, _| {
+                let title = webview.title().map(|t| t.to_string()).unwrap_or_default();
+                broadcast(&bus, &Event::new("webview.title_changed", json!({
+                    "panel_id": panel_id,
+                    "title": title,
+                })));
+            });
+
+            let bus = self.event_bus.clone();
+            let panel_id = wv.id.clone();
+            wv.webview.connect_notify_local(Some("uri"), move |webview, _| {
+                let url = webview.uri().map(|u| u.to_string()).unwrap_or_default();
+                broadcast(&bus, &Event::new("webview.navigated", json!({
+                    "panel_id": panel_id,
+                    "url": url,
+                })));
+            });
+        }
+
+        self.track_focus(&panel);
+        panel
+    }
+
+    fn track_focus(&self, panel: &Rc<PanelVariant>) {
         let focused = self.focused.clone();
         let panel_weak = Rc::downgrade(panel);
         let bus = self.event_bus.clone();
         let controller = gtk4::EventControllerFocus::new();
         controller.connect_enter(move |_| {
             if let Some(panel) = panel_weak.upgrade() {
-                let panel_id = panel.id.clone();
+                let panel_id = panel.id().to_string();
                 *focused.borrow_mut() = Some(panel);
                 broadcast(&bus, &Event::new("panel.focused", json!({
                     "panel_id": panel_id,
                 })));
             }
         });
-        panel.terminal.add_controller(controller);
+
+        // Attach focus controller to the inner focusable widget
+        match &**panel {
+            PanelVariant::Terminal(term) => {
+                term.terminal.add_controller(controller);
+            }
+            PanelVariant::WebView(wv) => {
+                wv.webview.add_controller(controller);
+            }
+        }
     }
 
     fn handle_panel_exit(&self, panel_widget: &gtk4::Widget, window: &gtk4::ApplicationWindow, bus: &EventBus) {
@@ -419,7 +561,7 @@ impl TabManager {
             let mut panels = Vec::new();
             tab.root.borrow().collect_panels(&mut panels);
             if let Some(panel) = panels.iter().find(|p| p.widget() == panel_widget) {
-                let panel_id = panel.id.clone();
+                let panel_id = panel.id().to_string();
                 let result = tab.close_panel(panel);
 
                 broadcast(bus, &Event::new("panel.exited", json!({
@@ -464,7 +606,7 @@ impl TabManager {
         }
     }
 
-    fn tab_index_of(&self, panel: &Rc<TerminalPanel>) -> Option<usize> {
+    fn tab_index_of(&self, panel: &Rc<PanelVariant>) -> Option<usize> {
         let tabs = self.tabs.borrow();
         for (i, tab) in tabs.iter().enumerate() {
             let mut panels = Vec::new();
@@ -502,15 +644,14 @@ impl TabManager {
         )
     }
 
-    fn make_tab_label(&self, panel: &Rc<TerminalPanel>) -> gtk4::Box {
+    fn make_tab_label(&self, panel: &Rc<PanelVariant>, page_container: &gtk4::Box) -> gtk4::Box {
+        let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         let vertical = self.is_vertical_tabs();
-        let orientation = if vertical {
-            gtk4::Orientation::Horizontal
-        } else {
-            gtk4::Orientation::Horizontal
+        let default_title = match &**panel {
+            PanelVariant::Terminal(_) => "Terminal",
+            PanelVariant::WebView(_) => "WebView",
         };
-        let hbox = gtk4::Box::new(orientation, 4);
-        let label = gtk4::Label::new(Some("Terminal"));
+        let label = gtk4::Label::new(Some(default_title));
         label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         if vertical {
             label.set_hexpand(true);
@@ -529,49 +670,49 @@ impl TabManager {
         hbox.append(&label);
         hbox.append(&close_btn);
 
-        let label_clone = label.clone();
-        panel
-            .terminal
-            .connect_window_title_changed(move |term: &vte4::Terminal| {
-                if let Some(title) = term.window_title() {
-                    label_clone.set_text(&title);
-                }
-            });
+        // Hook title updates based on panel type
+        match &**panel {
+            PanelVariant::Terminal(term) => {
+                let label_clone = label.clone();
+                term.terminal
+                    .connect_window_title_changed(move |term: &vte4::Terminal| {
+                        if let Some(title) = term.window_title() {
+                            label_clone.set_text(&title);
+                        }
+                    });
+            }
+            PanelVariant::WebView(wv) => {
+                let label_clone = label.clone();
+                wv.webview.connect_notify_local(Some("title"), move |webview, _| {
+                    if let Some(title) = webview.title() {
+                        label_clone.set_text(&title);
+                    }
+                });
+            }
+        }
 
         let nb = self.notebook.clone();
         let tabs = self.tabs.clone();
         let focused = self.focused.clone();
-        close_btn.connect_clicked(move |btn| {
-            // Find the tab page this button belongs to
-            let Some(page_widget) = btn
-                .ancestor(gtk4::Box::static_type())
-                .and_then(|w| w.parent())
-                .and_then(|w| w.parent())
-            else {
-                return;
-            };
-            // Alternative: find by notebook
-            let tab_count = tabs.borrow().len();
-            for i in 0..tab_count {
-                if let Some(page) = nb.nth_page(Some(i as u32)) {
-                    if page == page_widget {
-                        tabs.borrow_mut().remove(i);
-                        nb.remove_page(Some(i as u32));
-                        nb.set_show_tabs(tabs.borrow().len() > 1);
+        let container = page_container.clone();
+        close_btn.connect_clicked(move |_| {
+            let page_idx = nb.page_num(&container);
+            let Some(idx) = page_idx else { return };
+            let idx = idx as usize;
 
-                        // Update focus
-                        if let Some(new_page) = nb.current_page() {
-                            let tabs_ref = tabs.borrow();
-                            if let Some(tab) = tabs_ref.get(new_page as usize) {
-                                let mut panels = Vec::new();
-                                tab.root.borrow().collect_panels(&mut panels);
-                                if let Some(p) = panels.first() {
-                                    *focused.borrow_mut() = Some(p.clone());
-                                    p.grab_focus();
-                                }
-                            }
-                        }
-                        return;
+            tabs.borrow_mut().remove(idx);
+            nb.remove_page(Some(idx as u32));
+            nb.set_show_tabs(tabs.borrow().len() > 1);
+
+            // Update focus
+            if let Some(new_page) = nb.current_page() {
+                let tabs_ref = tabs.borrow();
+                if let Some(tab) = tabs_ref.get(new_page as usize) {
+                    let mut panels = Vec::new();
+                    tab.root.borrow().collect_panels(&mut panels);
+                    if let Some(p) = panels.first() {
+                        *focused.borrow_mut() = Some(p.clone());
+                        p.grab_focus();
                     }
                 }
             }
@@ -594,15 +735,16 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
 
     controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
     controller.connect_key_pressed(move |_, keyval, _, modifier| {
-        // Ctrl+F: toggle search
+        // Ctrl+F: toggle search (terminal panels only)
         if keyval == gdk::Key::f
             && modifier.contains(gdk::ModifierType::CONTROL_MASK)
             && !modifier.contains(gdk::ModifierType::SHIFT_MASK)
         {
-            if let Some(mgr) = mgr.upgrade() {
-                if let Some(panel) = mgr.active_panel() {
-                    panel.search_bar.toggle(&panel.terminal);
-                }
+            if let Some(mgr) = mgr.upgrade()
+                && let Some(panel) = mgr.active_panel()
+                && let Some(term) = panel.as_terminal()
+            {
+                term.search_bar.toggle(&term.terminal);
             }
             return glib::Propagation::Stop;
         }

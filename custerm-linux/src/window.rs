@@ -39,21 +39,23 @@ impl CustermWindow {
         // Config hot-reload
         watch_config(&tab_manager);
 
-        // D-Bus: apply to active terminal panel
+        // D-Bus: apply to active terminal panel (only if it's a terminal)
         let rx = dbus::register();
         let mgr = tab_manager.clone();
         glib::timeout_add_local(Duration::from_millis(150), move || {
             while let Ok(cmd) = rx.try_recv() {
-                if let Some(panel) = mgr.active_panel() {
+                if let Some(panel) = mgr.active_panel()
+                    && let Some(term) = panel.as_terminal()
+                {
                     match cmd {
                         DbusCommand::SetBackground(path) => {
-                            panel.set_background(std::path::Path::new(&path));
+                            term.set_background(std::path::Path::new(&path));
                         }
                         DbusCommand::ClearBackground => {
-                            panel.clear_background();
+                            term.clear_background();
                         }
                         DbusCommand::SetTint(opacity) => {
-                            panel.set_tint(opacity);
+                            term.set_tint(opacity);
                         }
                     }
                 }
@@ -68,8 +70,7 @@ impl CustermWindow {
         let win = window.clone();
         glib::timeout_add_local(Duration::from_millis(50), move || {
             while let Ok(cmd) = socket_rx.try_recv() {
-                let response = socket::dispatch(&cmd.request, &mgr, &win);
-                let _ = cmd.reply.send(response);
+                socket::dispatch(cmd, &mgr, &win);
             }
             glib::ControlFlow::Continue
         });

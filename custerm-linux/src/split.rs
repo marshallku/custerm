@@ -5,12 +5,11 @@ use std::time::Duration;
 use gtk4::prelude::*;
 use gtk4::glib;
 
-use crate::panel::Panel;
-use crate::terminal::TerminalPanel;
+use crate::panel::{Panel, PanelVariant};
 
 pub enum SplitNode {
     Leaf {
-        panel: Rc<TerminalPanel>,
+        panel: Rc<PanelVariant>,
     },
     Branch {
         paned: gtk4::Paned,
@@ -27,7 +26,7 @@ impl SplitNode {
         }
     }
 
-    pub fn collect_panels(&self, out: &mut Vec<Rc<TerminalPanel>>) {
+    pub fn collect_panels(&self, out: &mut Vec<Rc<PanelVariant>>) {
         match self {
             SplitNode::Leaf { panel } => out.push(panel.clone()),
             SplitNode::Branch { first, second, .. } => {
@@ -38,7 +37,7 @@ impl SplitNode {
     }
 
     /// Find the sibling panels of target (panels in the other side of the same split)
-    pub fn find_sibling_panels(&self, target: &Rc<TerminalPanel>) -> Vec<Rc<TerminalPanel>> {
+    pub fn find_sibling_panels(&self, target: &Rc<PanelVariant>) -> Vec<Rc<PanelVariant>> {
         if let Some((parent_node, side)) = Self::find_parent_of_root(self, target) {
             let borrowed = parent_node.borrow();
             if let SplitNode::Branch { first, second, .. } = &*borrowed {
@@ -56,7 +55,7 @@ impl SplitNode {
 
     fn find_parent(
         node: &Rc<RefCell<SplitNode>>,
-        target: &Rc<TerminalPanel>,
+        target: &Rc<PanelVariant>,
     ) -> Option<(Rc<RefCell<SplitNode>>, ChildSide)> {
         let borrowed = node.borrow();
         if let SplitNode::Branch { first, second, .. } = &*borrowed {
@@ -83,7 +82,7 @@ impl SplitNode {
     /// Same as find_parent but works on a non-Rc root (for sibling search)
     fn find_parent_of_root(
         node: &SplitNode,
-        target: &Rc<TerminalPanel>,
+        target: &Rc<PanelVariant>,
     ) -> Option<(Rc<RefCell<SplitNode>>, ChildSide)> {
         if let SplitNode::Branch { first, second, .. } = node {
             if let SplitNode::Leaf { panel } = &*first.borrow() {
@@ -184,7 +183,7 @@ pub struct TabContent {
 }
 
 impl TabContent {
-    pub fn new(panel: Rc<TerminalPanel>) -> Self {
+    pub fn new(panel: Rc<PanelVariant>) -> Self {
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         container.set_hexpand(true);
         container.set_vexpand(true);
@@ -197,8 +196,8 @@ impl TabContent {
     /// Split the focused panel. Returns the sibling panels for focus fallback.
     pub fn split(
         &self,
-        focused: &Rc<TerminalPanel>,
-        new_panel: &Rc<TerminalPanel>,
+        focused: &Rc<PanelVariant>,
+        new_panel: &Rc<PanelVariant>,
         orientation: gtk4::Orientation,
     ) {
         let paned = make_paned(orientation);
@@ -275,7 +274,7 @@ impl TabContent {
     }
 
     /// Close a panel. Returns the sibling panel to focus, or None if the tab should close.
-    pub fn close_panel(&self, target: &Rc<TerminalPanel>) -> CloseResult {
+    pub fn close_panel(&self, target: &Rc<PanelVariant>) -> CloseResult {
         // Root is a single leaf → close the tab
         {
             let root = self.root.borrow();
@@ -372,6 +371,6 @@ impl TabContent {
 pub enum CloseResult {
     CloseTab,
     Closed {
-        focus_target: Option<Rc<TerminalPanel>>,
+        focus_target: Option<Rc<PanelVariant>>,
     },
 }

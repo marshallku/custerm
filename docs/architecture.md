@@ -27,7 +27,8 @@ custerm/
 │   │   ├── tabs.rs          # Tab manager (Notebook, tab bar, keyboard shortcuts)
 │   │   ├── split.rs         # Split pane tree (SplitNode, TabContent)
 │   │   ├── search.rs        # In-terminal search bar (Ctrl+F, VTE regex search)
-│   │   ├── panel.rs         # Panel trait
+│   │   ├── panel.rs         # Panel trait + PanelVariant enum
+│   │   ├── webview.rs       # WebView panel (WebKitGTK 6.0)
 │   │   ├── socket.rs        # Unix socket server + command dispatcher
 │   │   └── dbus.rs          # D-Bus service (com.marshall.custerm)
 │   ├── custerm.desktop      # Desktop entry for system integration
@@ -70,6 +71,7 @@ custerm/
 ### custerm-linux
 - `gtk4 0.9` (features: `gnome_46`) - UI framework
 - `vte4 0.8` - Terminal widget (libvte-2.91-gtk4)
+- `webkit6 0.4` - WebView panel (WebKitGTK 6.0)
 - `env_logger 0.11` - Logging
 
 ### custerm-cli
@@ -97,7 +99,7 @@ custermctl ──Unix socket──► socket server (per-client thread)
                           oneshot response ──► socket thread ──► client
 ```
 
-**Supported commands**: `system.ping`, `background.set`, `background.clear`, `background.set_tint`, `background.next`, `background.toggle`, `tab.new`, `tab.close`, `tab.list`, `tab.info`, `split.horizontal`, `split.vertical`, `session.list`, `session.info`, `event.subscribe`
+**Supported commands**: `system.ping`, `background.set`, `background.clear`, `background.set_tint`, `background.next`, `background.toggle`, `tab.new`, `tab.close`, `tab.list`, `tab.info`, `split.horizontal`, `split.vertical`, `session.list`, `session.info`, `event.subscribe`, `webview.open`, `webview.navigate`, `webview.back`, `webview.forward`, `webview.reload`, `webview.execute_js`, `webview.get_content`
 
 **Cleanup**: Socket file removed on window destroy.
 
@@ -118,22 +120,48 @@ Clients can subscribe to real-time events via `event.subscribe`. The socket stay
 | `tab.created` | `{panel_id, tab}` | New tab opened |
 | `tab.closed` | `{panel_id, tab}` | Tab closed |
 | `terminal.output` | `{panel_id, text}` | Terminal receives output (high frequency) |
+| `webview.loaded` | `{panel_id}` | WebView finishes loading |
+| `webview.title_changed` | `{panel_id, title}` | WebView title changes |
+| `webview.navigated` | `{panel_id, url}` | WebView URI changes |
 
 **Usage**: `custermctl event subscribe` — prints events as JSON lines to stdout.
 
 ## Query API
 
-**`session.list`**: Returns all panels across all tabs with `[{id, title, tab, focused}]`.
+**`session.list`**: Returns all panels across all tabs with `[{id, type, title, tab, focused, url?}]`. WebView panels include `url`.
 
-**`session.info`** (`{id}`): Returns detailed panel info: `{id, title, tab, focused, cols, rows, cursor: [row, col]}`.
+**`session.info`** (`{id}`): Returns detailed panel info. Terminal: `{id, type, title, tab, focused, cols, rows, cursor: [row, col]}`. WebView: `{id, type, title, tab, focused, url}`.
 
 **`tab.info`**: Returns extended tab info: `{count, current, tabs: [{index, panel_count, title}]}`.
+
+## Panel System
+
+custerm supports multiple panel types via the `PanelVariant` enum:
+
+- **Terminal** (`TerminalPanel`): VTE4 terminal with shell, background images, search
+- **WebView** (`WebViewPanel`): WebKitGTK 6.0 browser panel with JS execution
+
+The `Panel` trait provides a common interface (`widget()`, `title()`, `panel_type()`, `grab_focus()`, `id()`). `PanelVariant` delegates to the inner type and provides `as_terminal()` / `as_webview()` accessors.
+
+### WebView API
+
+| Command | Params | Behavior |
+|---------|--------|----------|
+| `webview.open` | `url`, `mode?` (tab/split_h/split_v) | Create webview panel, return panel_id |
+| `webview.navigate` | `id`, `url` | Navigate existing webview |
+| `webview.back` | `id` | Go back in history |
+| `webview.forward` | `id` | Go forward in history |
+| `webview.reload` | `id` | Reload page |
+| `webview.execute_js` | `id`, `code` | Run JS, return result (async) |
+| `webview.get_content` | `id`, `format?` (text/html) | Get page content via JS (async) |
+
+`webview.execute_js` and `webview.get_content` use async dispatch — the reply sender is captured by the WebKit callback and sent when the JS execution completes.
 
 ## System Prerequisites
 
 ### Arch Linux
 ```bash
-sudo pacman -S gtk4 vte4
+sudo pacman -S gtk4 vte4 webkitgtk-6.0
 ```
 
 ### macOS

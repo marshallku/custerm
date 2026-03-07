@@ -284,6 +284,10 @@ impl Panel for TerminalPanel {
     fn grab_focus(&self) {
         self.terminal.grab_focus();
     }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 fn update_tint_css(provider: &gtk4::CssProvider, hex_color: &str, opacity: f64) {

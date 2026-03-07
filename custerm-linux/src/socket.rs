@@ -145,139 +145,83 @@ pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<So
     rx
 }
 
+/// Dispatch consumes the SocketCommand so async handlers (webview.execute_js) can
+/// capture the reply sender and respond from a callback.
 pub fn dispatch(
-    req: &Request,
+    cmd: SocketCommand,
     mgr: &Rc<TabManager>,
     window: &ApplicationWindow,
-) -> Response {
+) {
+    let req = &cmd.request;
     match req.method.as_str() {
-        "system.ping" => Response::success(req.id.clone(), json!({ "status": "ok" })),
+        "system.ping" => {
+            let _ = cmd.reply.send(Response::success(req.id.clone(), json!({ "status": "ok" })));
+        }
 
         "background.set" => {
-            let path = req.params.get("path").and_then(|v| v.as_str());
-            match path {
-                Some(p) => {
-                    let path = Path::new(p);
-                    if !path.exists() {
-                        return Response::error(
-                            req.id.clone(),
-                            "not_found",
-                            &format!("File not found: {p}"),
-                        );
-                    }
-                    if let Some(panel) = mgr.active_panel() {
-                        panel.set_background(path);
-                        Response::success(req.id.clone(), json!({ "status": "ok" }))
-                    } else {
-                        Response::error(req.id.clone(), "no_panel", "No active panel")
-                    }
-                }
-                None => Response::error(req.id.clone(), "invalid_params", "Missing 'path' param"),
-            }
+            let resp = handle_bg_set(req, mgr);
+            let _ = cmd.reply.send(resp);
         }
 
         "background.clear" => {
-            if let Some(panel) = mgr.active_panel() {
-                panel.clear_background();
-                Response::success(req.id.clone(), json!({ "status": "ok" }))
-            } else {
-                Response::error(req.id.clone(), "no_panel", "No active panel")
-            }
+            let resp = handle_bg_clear(req, mgr);
+            let _ = cmd.reply.send(resp);
         }
 
         "background.next" => {
-            if !is_bg_active() {
-                return Response::success(req.id.clone(), json!({ "status": "ok", "mode": "deactive" }));
-            }
-            match select_random_image() {
-                Some(img) => {
-                    let path = Path::new(&img);
-                    if !path.exists() {
-                        return Response::error(req.id.clone(), "not_found", &format!("File not found: {img}"));
-                    }
-                    if let Some(panel) = mgr.active_panel() {
-                        panel.set_background(path);
-                        Response::success(req.id.clone(), json!({ "status": "ok", "path": img }))
-                    } else {
-                        Response::error(req.id.clone(), "no_panel", "No active panel")
-                    }
-                }
-                None => Response::error(req.id.clone(), "no_images", "No images in wallpaper cache"),
-            }
+            let resp = handle_bg_next(req, mgr);
+            let _ = cmd.reply.send(resp);
         }
 
         "background.toggle" => {
-            let now_active = toggle_bg_mode();
-            if let Some(panel) = mgr.active_panel() {
-                if now_active {
-                    if let Some(img) = select_random_image() {
-                        panel.set_background(Path::new(&img));
-                    }
-                } else {
-                    panel.clear_background();
-                }
-            }
-            let mode = if now_active { "active" } else { "deactive" };
-            Response::success(req.id.clone(), json!({ "status": "ok", "mode": mode }))
+            let resp = handle_bg_toggle(req, mgr);
+            let _ = cmd.reply.send(resp);
         }
 
         "background.set_tint" => {
-            let opacity = req.params.get("opacity").and_then(|v| v.as_f64());
-            match opacity {
-                Some(o) => {
-                    if let Some(panel) = mgr.active_panel() {
-                        panel.set_tint(o);
-                        Response::success(req.id.clone(), json!({ "status": "ok" }))
-                    } else {
-                        Response::error(req.id.clone(), "no_panel", "No active panel")
-                    }
-                }
-                None => {
-                    Response::error(req.id.clone(), "invalid_params", "Missing 'opacity' param")
-                }
-            }
+            let resp = handle_bg_set_tint(req, mgr);
+            let _ = cmd.reply.send(resp);
         }
 
         "tab.new" => {
             mgr.add_tab(window);
-            Response::success(req.id.clone(), json!({ "status": "ok" }))
+            let _ = cmd.reply.send(Response::success(req.id.clone(), json!({ "status": "ok" })));
         }
 
         "tab.close" => {
             mgr.close_focused(window);
-            Response::success(req.id.clone(), json!({ "status": "ok" }))
+            let _ = cmd.reply.send(Response::success(req.id.clone(), json!({ "status": "ok" })));
         }
 
         "tab.list" => {
             let count = mgr.tab_count();
             let current = mgr.current_tab();
-            Response::success(
+            let _ = cmd.reply.send(Response::success(
                 req.id.clone(),
                 json!({ "count": count, "current": current }),
-            )
+            ));
         }
 
         "tab.info" => {
-            Response::success(req.id.clone(), mgr.tab_info())
+            let _ = cmd.reply.send(Response::success(req.id.clone(), mgr.tab_info()));
         }
 
         "split.horizontal" => {
             mgr.split_focused(gtk4::Orientation::Horizontal, window);
-            Response::success(req.id.clone(), json!({ "status": "ok" }))
+            let _ = cmd.reply.send(Response::success(req.id.clone(), json!({ "status": "ok" })));
         }
 
         "split.vertical" => {
             mgr.split_focused(gtk4::Orientation::Vertical, window);
-            Response::success(req.id.clone(), json!({ "status": "ok" }))
+            let _ = cmd.reply.send(Response::success(req.id.clone(), json!({ "status": "ok" })));
         }
 
         "session.list" => {
-            Response::success(req.id.clone(), json!(mgr.all_panels_info()))
+            let _ = cmd.reply.send(Response::success(req.id.clone(), json!(mgr.all_panels_info())));
         }
 
         "session.info" => {
-            let id = req.params.get("id").and_then(|v| v.as_str());
-            match id {
+            let resp = match req.params.get("id").and_then(|v| v.as_str()) {
                 Some(id) => {
                     match mgr.panel_info_by_id(id) {
                         Some(info) => Response::success(req.id.clone(), info),
@@ -285,16 +229,325 @@ pub fn dispatch(
                     }
                 }
                 None => Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"),
-            }
+            };
+            let _ = cmd.reply.send(resp);
         }
 
-        _ => Response::error(
-            req.id.clone(),
-            "unknown_method",
-            &format!("Unknown method: {}", req.method),
-        ),
+        // -- WebView commands --
+
+        "webview.open" => {
+            let resp = handle_webview_open(req, mgr, window);
+            let _ = cmd.reply.send(resp);
+        }
+
+        "webview.navigate" => {
+            let resp = handle_webview_navigate(req, mgr);
+            let _ = cmd.reply.send(resp);
+        }
+
+        "webview.back" => {
+            let resp = with_webview_panel(req, mgr, |wv| {
+                wv.go_back();
+                Response::success(req.id.clone(), json!({ "status": "ok" }))
+            });
+            let _ = cmd.reply.send(resp);
+        }
+
+        "webview.forward" => {
+            let resp = with_webview_panel(req, mgr, |wv| {
+                wv.go_forward();
+                Response::success(req.id.clone(), json!({ "status": "ok" }))
+            });
+            let _ = cmd.reply.send(resp);
+        }
+
+        "webview.reload" => {
+            let resp = with_webview_panel(req, mgr, |wv| {
+                wv.reload();
+                Response::success(req.id.clone(), json!({ "status": "ok" }))
+            });
+            let _ = cmd.reply.send(resp);
+        }
+
+        "webview.execute_js" => {
+            handle_webview_execute_js(cmd, mgr);
+            // Response sent from callback
+        }
+
+        "webview.get_content" => {
+            handle_webview_get_content(cmd, mgr);
+            // Response sent from callback
+        }
+
+        _ => {
+            let _ = cmd.reply.send(Response::error(
+                req.id.clone(),
+                "unknown_method",
+                &format!("Unknown method: {}", req.method),
+            ));
+        }
     }
 }
+
+// -- Background helpers (with terminal panel type check) --
+
+fn active_terminal_panel(req: &Request, mgr: &Rc<TabManager>) -> Result<Rc<crate::panel::PanelVariant>, Response> {
+    match mgr.active_panel() {
+        Some(panel) => {
+            if panel.as_terminal().is_some() {
+                Ok(panel)
+            } else {
+                Err(Response::error(req.id.clone(), "wrong_panel_type", "Active panel is not a terminal"))
+            }
+        }
+        None => Err(Response::error(req.id.clone(), "no_panel", "No active panel")),
+    }
+}
+
+fn handle_bg_set(req: &Request, mgr: &Rc<TabManager>) -> Response {
+    let path = req.params.get("path").and_then(|v| v.as_str());
+    match path {
+        Some(p) => {
+            let path = Path::new(p);
+            if !path.exists() {
+                return Response::error(
+                    req.id.clone(),
+                    "not_found",
+                    &format!("File not found: {p}"),
+                );
+            }
+            match active_terminal_panel(req, mgr) {
+                Ok(panel) => {
+                    panel.as_terminal().unwrap().set_background(path);
+                    Response::success(req.id.clone(), json!({ "status": "ok" }))
+                }
+                Err(e) => e,
+            }
+        }
+        None => Response::error(req.id.clone(), "invalid_params", "Missing 'path' param"),
+    }
+}
+
+fn handle_bg_clear(req: &Request, mgr: &Rc<TabManager>) -> Response {
+    match active_terminal_panel(req, mgr) {
+        Ok(panel) => {
+            panel.as_terminal().unwrap().clear_background();
+            Response::success(req.id.clone(), json!({ "status": "ok" }))
+        }
+        Err(e) => e,
+    }
+}
+
+fn handle_bg_next(req: &Request, mgr: &Rc<TabManager>) -> Response {
+    if !is_bg_active() {
+        return Response::success(req.id.clone(), json!({ "status": "ok", "mode": "deactive" }));
+    }
+    match select_random_image() {
+        Some(img) => {
+            let path = Path::new(&img);
+            if !path.exists() {
+                return Response::error(req.id.clone(), "not_found", &format!("File not found: {img}"));
+            }
+            match active_terminal_panel(req, mgr) {
+                Ok(panel) => {
+                    panel.as_terminal().unwrap().set_background(path);
+                    Response::success(req.id.clone(), json!({ "status": "ok", "path": img }))
+                }
+                Err(e) => e,
+            }
+        }
+        None => Response::error(req.id.clone(), "no_images", "No images in wallpaper cache"),
+    }
+}
+
+fn handle_bg_toggle(req: &Request, mgr: &Rc<TabManager>) -> Response {
+    let now_active = toggle_bg_mode();
+    if let Some(panel) = mgr.active_panel()
+        && let Some(term) = panel.as_terminal()
+    {
+        if now_active {
+            if let Some(img) = select_random_image() {
+                term.set_background(Path::new(&img));
+            }
+        } else {
+            term.clear_background();
+        }
+    }
+    let mode = if now_active { "active" } else { "deactive" };
+    Response::success(req.id.clone(), json!({ "status": "ok", "mode": mode }))
+}
+
+fn handle_bg_set_tint(req: &Request, mgr: &Rc<TabManager>) -> Response {
+    let opacity = req.params.get("opacity").and_then(|v| v.as_f64());
+    match opacity {
+        Some(o) => {
+            match active_terminal_panel(req, mgr) {
+                Ok(panel) => {
+                    panel.as_terminal().unwrap().set_tint(o);
+                    Response::success(req.id.clone(), json!({ "status": "ok" }))
+                }
+                Err(e) => e,
+            }
+        }
+        None => {
+            Response::error(req.id.clone(), "invalid_params", "Missing 'opacity' param")
+        }
+    }
+}
+
+// -- WebView command helpers --
+
+fn handle_webview_open(req: &Request, mgr: &Rc<TabManager>, window: &ApplicationWindow) -> Response {
+    let url = match req.params.get("url").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return Response::error(req.id.clone(), "invalid_params", "Missing 'url' param"),
+    };
+    let mode = req.params.get("mode").and_then(|v| v.as_str()).unwrap_or("tab");
+
+    let panel_id = match mode {
+        "split_h" => {
+            match mgr.split_focused_webview(url, gtk4::Orientation::Horizontal, window) {
+                Some(id) => id,
+                None => return Response::error(req.id.clone(), "no_panel", "No focused panel to split"),
+            }
+        }
+        "split_v" => {
+            match mgr.split_focused_webview(url, gtk4::Orientation::Vertical, window) {
+                Some(id) => id,
+                None => return Response::error(req.id.clone(), "no_panel", "No focused panel to split"),
+            }
+        }
+        _ => mgr.add_webview_tab(url, window),
+    };
+
+    Response::success(req.id.clone(), json!({ "panel_id": panel_id }))
+}
+
+fn handle_webview_navigate(req: &Request, mgr: &Rc<TabManager>) -> Response {
+    let id = match req.params.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"),
+    };
+    let url = match req.params.get("url").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return Response::error(req.id.clone(), "invalid_params", "Missing 'url' param"),
+    };
+
+    match mgr.find_panel_by_id(id) {
+        Some(panel) => match panel.as_webview() {
+            Some(wv) => {
+                wv.navigate(url);
+                Response::success(req.id.clone(), json!({ "status": "ok" }))
+            }
+            None => Response::error(req.id.clone(), "wrong_panel_type", "Panel is not a webview"),
+        },
+        None => Response::error(req.id.clone(), "not_found", &format!("Panel not found: {id}")),
+    }
+}
+
+fn with_webview_panel(
+    req: &Request,
+    mgr: &Rc<TabManager>,
+    f: impl FnOnce(&crate::webview::WebViewPanel) -> Response,
+) -> Response {
+    let id = match req.params.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"),
+    };
+    match mgr.find_panel_by_id(id) {
+        Some(panel) => match panel.as_webview() {
+            Some(wv) => f(wv),
+            None => Response::error(req.id.clone(), "wrong_panel_type", "Panel is not a webview"),
+        },
+        None => Response::error(req.id.clone(), "not_found", &format!("Panel not found: {id}")),
+    }
+}
+
+fn handle_webview_execute_js(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+    let req = &cmd.request;
+    let id = match req.params.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"));
+            return;
+        }
+    };
+    let code = match req.params.get("code").and_then(|v| v.as_str()) {
+        Some(c) => c.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "invalid_params", "Missing 'code' param"));
+            return;
+        }
+    };
+
+    let panel = match mgr.find_panel_by_id(&id) {
+        Some(p) => p,
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "not_found", &format!("Panel not found: {id}")));
+            return;
+        }
+    };
+    let wv = match panel.as_webview() {
+        Some(wv) => wv,
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "wrong_panel_type", "Panel is not a webview"));
+            return;
+        }
+    };
+
+    let req_id = req.id.clone();
+    let reply = cmd.reply;
+    wv.execute_js(&code, move |result| {
+        let resp = match result {
+            Ok(value) => Response::success(req_id, json!({ "result": value })),
+            Err(e) => Response::error(req_id, "js_error", &e),
+        };
+        let _ = reply.send(resp);
+    });
+}
+
+fn handle_webview_get_content(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+    let req = &cmd.request;
+    let id = match req.params.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"));
+            return;
+        }
+    };
+    let format = req.params.get("format").and_then(|v| v.as_str()).unwrap_or("text");
+    let js_code = match format {
+        "html" => "document.documentElement.outerHTML".to_string(),
+        _ => "document.body.innerText".to_string(),
+    };
+
+    let panel = match mgr.find_panel_by_id(&id) {
+        Some(p) => p,
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "not_found", &format!("Panel not found: {id}")));
+            return;
+        }
+    };
+    let wv = match panel.as_webview() {
+        Some(wv) => wv,
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "wrong_panel_type", "Panel is not a webview"));
+            return;
+        }
+    };
+
+    let req_id = req.id.clone();
+    let reply = cmd.reply;
+    wv.execute_js(&js_code, move |result| {
+        let resp = match result {
+            Ok(content) => Response::success(req_id, json!({ "content": content })),
+            Err(e) => Response::error(req_id, "js_error", &e),
+        };
+        let _ = reply.send(resp);
+    });
+}
+
+// -- Utility functions --
 
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))

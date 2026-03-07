@@ -6,6 +6,7 @@ mod socket;
 mod split;
 mod tabs;
 mod terminal;
+mod webview;
 mod window;
 
 fn main() {
