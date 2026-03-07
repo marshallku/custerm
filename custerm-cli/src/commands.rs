@@ -97,6 +97,16 @@ pub enum TabCommand {
     List,
     /// Extended tab info with panel counts
     Info,
+    /// Toggle tab bar visibility
+    ToggleBar,
+    /// Rename a tab
+    Rename {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// New title
+        title: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -276,6 +286,8 @@ impl Cli {
                 TabCommand::Close => "tab.close",
                 TabCommand::List => "tab.list",
                 TabCommand::Info => "tab.info",
+                TabCommand::ToggleBar => "tabs.toggle_bar",
+                TabCommand::Rename { .. } => "tab.rename",
             }
             .to_string(),
             Command::Split(cmd) => match cmd {
@@ -328,7 +340,11 @@ impl Cli {
                 BackgroundCommand::SetTint { opacity } => json!({ "opacity": opacity }),
                 BackgroundCommand::Next | BackgroundCommand::Toggle => json!({}),
             },
-            Command::Tab(_) | Command::Split(_) | Command::Event(_) | Command::Update(_) => {
+            Command::Tab(cmd) => match cmd {
+                TabCommand::Rename { id, title } => json!({ "id": id, "title": title }),
+                _ => json!({}),
+            },
+            Command::Split(_) | Command::Event(_) | Command::Update(_) => {
                 json!({})
             }
             Command::Webview(cmd) => match cmd {

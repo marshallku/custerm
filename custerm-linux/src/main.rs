@@ -2,6 +2,7 @@ mod app;
 mod dbus;
 mod panel;
 mod search;
+
 mod socket;
 mod split;
 mod tabs;

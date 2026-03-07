@@ -336,6 +336,40 @@ pub fn dispatch(cmd: SocketCommand, mgr: &Rc<TabManager>, window: &ApplicationWi
             let _ = cmd.reply.send(resp);
         }
 
+        // -- Tab bar commands --
+        "tabs.toggle_bar" => {
+            let visible = mgr.toggle_tab_bar();
+            let _ = cmd.reply.send(Response::success(
+                req.id.clone(),
+                json!({ "visible": visible }),
+            ));
+        }
+
+        "tab.rename" => {
+            let resp = match (
+                req.params.get("id").and_then(|v| v.as_str()),
+                req.params.get("title").and_then(|v| v.as_str()),
+            ) {
+                (Some(id), Some(title)) => {
+                    if mgr.rename_tab(id, title) {
+                        Response::success(req.id.clone(), json!({ "status": "ok" }))
+                    } else {
+                        Response::error(
+                            req.id.clone(),
+                            "not_found",
+                            &format!("Panel not found: {id}"),
+                        )
+                    }
+                }
+                _ => Response::error(
+                    req.id.clone(),
+                    "invalid_params",
+                    "Missing 'id' and/or 'title' param",
+                ),
+            };
+            let _ = cmd.reply.send(resp);
+        }
+
         _ => {
             let _ = cmd.reply.send(Response::error(
                 req.id.clone(),

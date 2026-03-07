@@ -99,7 +99,7 @@ custermctl ──Unix socket──► socket server (per-client thread)
                           oneshot response ──► socket thread ──► client
 ```
 
-**Supported commands**: `system.ping`, `background.set`, `background.clear`, `background.set_tint`, `background.next`, `background.toggle`, `tab.new`, `tab.close`, `tab.list`, `tab.info`, `split.horizontal`, `split.vertical`, `session.list`, `session.info`, `event.subscribe`, `webview.open`, `webview.navigate`, `webview.back`, `webview.forward`, `webview.reload`, `webview.execute_js`, `webview.get_content`, `webview.screenshot`, `webview.query`, `webview.query_all`, `webview.get_styles`, `webview.click`, `webview.fill`, `webview.scroll`, `webview.page_info`, `webview.devtools`
+**Supported commands**: `system.ping`, `background.set`, `background.clear`, `background.set_tint`, `background.next`, `background.toggle`, `tab.new`, `tab.close`, `tab.list`, `tab.info`, `tab.rename`, `tabs.toggle_bar`, `split.horizontal`, `split.vertical`, `session.list`, `session.info`, `event.subscribe`, `webview.open`, `webview.navigate`, `webview.back`, `webview.forward`, `webview.reload`, `webview.execute_js`, `webview.get_content`, `webview.screenshot`, `webview.query`, `webview.query_all`, `webview.get_styles`, `webview.click`, `webview.fill`, `webview.scroll`, `webview.page_info`, `webview.devtools`
 
 **Cleanup**: Socket file removed on window destroy.
 
@@ -123,6 +123,7 @@ Clients can subscribe to real-time events via `event.subscribe`. The socket stay
 | `webview.loaded` | `{panel_id}` | WebView finishes loading |
 | `webview.title_changed` | `{panel_id, title}` | WebView title changes |
 | `webview.navigated` | `{panel_id, url}` | WebView URI changes |
+| `tab.renamed` | `{panel_id, title}` | Tab renamed |
 
 **Usage**: `custermctl event subscribe` — prints events as JSON lines to stdout.
 
@@ -142,6 +143,15 @@ custerm supports multiple panel types via the `PanelVariant` enum:
 - **WebView** (`WebViewPanel`): WebKitGTK 6.0 browser panel with JS execution, URL toolbar (back/forward/reload/URL entry/DevTools toggle)
 
 The `Panel` trait provides a common interface (`widget()`, `title()`, `panel_type()`, `grab_focus()`, `id()`). `PanelVariant` delegates to the inner type and provides `as_terminal()` / `as_webview()` accessors.
+
+### Tab Bar Controls
+
+The tab bar can be toggled (collapsed/expanded) with `Ctrl+B` or via socket API. Tabs can be renamed by double-clicking the tab label or via socket API. Custom titles suppress auto-title updates from terminal/webview.
+
+| Command | Params | Behavior |
+|---------|--------|----------|
+| `tabs.toggle_bar` | — | Toggle tab bar visibility, returns `{visible}` |
+| `tab.rename` | `id`, `title` | Rename a tab by panel ID |
 
 ### WebView API
 

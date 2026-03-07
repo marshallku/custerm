@@ -37,7 +37,7 @@ Terminal tabs first, then generalize to support different panel types.
 - [x] **Split panes**: horizontal / vertical split within a tab
 - [x] **Pane resize**: drag dividers
 - [x] **Focus tracking**: active pane focus via `EventControllerFocus`
-- [x] **Keyboard shortcuts**: Ctrl+Shift+T/W/Tab, Ctrl+Shift+E/O (split), Ctrl+Shift+[1-9], Ctrl+Shift+C/V (copy/paste)
+- [x] **Keyboard shortcuts**: Ctrl+Shift+T/W/Tab, Ctrl+Shift+E/O (split), Ctrl+Shift+[1-9], Ctrl+Shift+C/V (copy/paste), Ctrl+B (sidebar toggle)
 - [x] **Configurable tab position**: top, bottom, left, right (`[tabs] position` in config)
 - [x] **In-terminal search**: Ctrl+F search bar with VTE regex (next/prev/case toggle)
 - [ ] **Panel type registry**: extensible system for registering new panel types
@@ -88,6 +88,16 @@ Make custerm a first-class environment for AI coding agents.
 - [x] Curl-pipeable install script (`install.sh`)
 - [x] Self-update via `custermctl update check/apply`
 - [x] cargo-release + git-cliff config for versioning and changelogs
+
+### Phase 5.5: Tab Bar Controls
+Collapsible tab bar and renamable tabs.
+
+- [x] **Tab bar toggle**: Ctrl+B collapses/expands the tab bar
+- [x] **Socket API**: `tabs.toggle_bar`, `tab.rename`
+- [x] **CLI commands**: `custermctl tab toggle-bar`, `custermctl tab rename --id <id> <title>`
+- [x] **Double-click rename**: Double-click tab label for inline rename
+- [x] **Custom titles**: Renamed tabs suppress auto-title updates from terminal/webview
+- [x] **Event stream**: `tab.renamed` event
 
 ### Phase 7: Polish + Ecosystem
 - [ ] Theme system (parse theme files, multiple palettes)

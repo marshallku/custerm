@@ -25,6 +25,10 @@ pub struct TabManager {
     config: Rc<RefCell<CustermConfig>>,
     event_bus: EventBus,
     tab_css: gtk4::CssProvider,
+    /// Custom tab titles set via rename (overrides auto-titles)
+    custom_titles: Rc<RefCell<std::collections::HashMap<String, String>>>,
+    /// Whether the tab bar is collapsed (hidden regardless of tab count)
+    tab_bar_collapsed: Rc<RefCell<bool>>,
 }
 
 impl TabManager {
@@ -64,14 +68,19 @@ impl TabManager {
             config: Rc::new(RefCell::new(config.clone())),
             event_bus,
             tab_css,
+            custom_titles: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            tab_bar_collapsed: Rc::new(RefCell::new(false)),
         });
 
         // Update tab bar visibility on page remove
         let tabs_ref = manager.tabs.clone();
+        let collapsed = manager.tab_bar_collapsed.clone();
         manager
             .notebook
             .connect_page_removed(move |notebook, _, _| {
-                notebook.set_show_tabs(tabs_ref.borrow().len() > 1);
+                if !*collapsed.borrow() {
+                    notebook.set_show_tabs(tabs_ref.borrow().len() > 1);
+                }
             });
 
         // Focus the right panel when switching tabs
@@ -277,6 +286,60 @@ impl TabManager {
 
     pub fn active_panel(&self) -> Option<Rc<PanelVariant>> {
         self.focused.borrow().clone()
+    }
+
+    // -- Tab bar toggle --
+
+    /// Toggle tab bar visibility (collapse/expand). Returns new visible state.
+    pub fn toggle_tab_bar(&self) -> bool {
+        let collapsed = {
+            let mut c = self.tab_bar_collapsed.borrow_mut();
+            *c = !*c;
+            *c
+        };
+        if collapsed {
+            self.notebook.set_show_tabs(false);
+        } else {
+            // Restore: show tabs if more than 1
+            self.notebook
+                .set_show_tabs(self.tabs.borrow().len() > 1);
+        }
+        !collapsed
+    }
+
+    // -- Tab rename --
+
+    /// Rename a tab by panel ID. Returns true if found.
+    pub fn rename_tab(&self, panel_id: &str, title: &str) -> bool {
+        // Find the tab containing this panel
+        let tabs = self.tabs.borrow();
+        for (idx, tab) in tabs.iter().enumerate() {
+            let mut panels = Vec::new();
+            tab.root.borrow().collect_panels(&mut panels);
+            if panels.iter().any(|p| p.id() == panel_id) {
+                // Update the notebook tab label text
+                if let Some(tab_label) = self.notebook.tab_label(&tab.container)
+                    && let Some(label_widget) = tab_label.first_child()
+                    && let Some(label) = label_widget.downcast_ref::<gtk4::Label>()
+                {
+                    label.set_text(title);
+                }
+                // Store custom title
+                self.custom_titles
+                    .borrow_mut()
+                    .insert(panel_id.to_string(), title.to_string());
+
+                broadcast(
+                    &self.event_bus,
+                    &Event::new(
+                        "tab.renamed",
+                        json!({ "panel_id": panel_id, "title": title, "tab": idx }),
+                    ),
+                );
+                return true;
+            }
+        }
+        false
     }
 
     pub fn tab_count(&self) -> usize {
@@ -709,7 +772,14 @@ impl TabManager {
     }
 
     fn update_tab_visibility(&self) {
-        self.notebook.set_show_tabs(self.tabs.borrow().len() > 1);
+        let multiple = self.tabs.borrow().len() > 1;
+        if multiple {
+            // Auto-expand tab bar when multiple tabs exist
+            *self.tab_bar_collapsed.borrow_mut() = false;
+            self.notebook.set_show_tabs(true);
+        } else {
+            self.notebook.set_show_tabs(false);
+        }
     }
 
     fn focus_active_tab_panel(&self) {
@@ -759,12 +829,18 @@ impl TabManager {
         hbox.append(&label);
         hbox.append(&close_btn);
 
-        // Hook title updates based on panel type
+        // Hook title updates based on panel type (suppressed when custom title is set)
+        let panel_id_for_title = panel.id().to_string();
         match &**panel {
             PanelVariant::Terminal(term) => {
                 let label_clone = label.clone();
+                let custom = self.custom_titles.clone();
+                let pid = panel_id_for_title.clone();
                 term.terminal
                     .connect_window_title_changed(move |term: &vte4::Terminal| {
+                        if custom.borrow().contains_key(&pid) {
+                            return;
+                        }
                         if let Some(title) = term.window_title() {
                             label_clone.set_text(&title);
                         }
@@ -772,8 +848,13 @@ impl TabManager {
             }
             PanelVariant::WebView(wv) => {
                 let label_clone = label.clone();
+                let custom = self.custom_titles.clone();
+                let pid = panel_id_for_title.clone();
                 wv.webview
                     .connect_notify_local(Some("title"), move |webview, _| {
+                        if custom.borrow().contains_key(&pid) {
+                            return;
+                        }
                         if let Some(title) = webview.title() {
                             label_clone.set_text(&title);
                         }
@@ -781,11 +862,85 @@ impl TabManager {
             }
         }
 
+        // Double-click to rename tab
+        {
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            let label_clone = label.clone();
+            let custom = self.custom_titles.clone();
+            let bus = self.event_bus.clone();
+            let pid = panel_id_for_title;
+            gesture.connect_released(move |gesture, n_press, _x, _y| {
+                if n_press != 2 {
+                    return;
+                }
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+
+                // Replace label with an entry for inline editing
+                let parent = label_clone.parent().unwrap();
+                let hbox = parent.downcast_ref::<gtk4::Box>().unwrap();
+                let current_text = label_clone.text().to_string();
+
+                let entry = gtk4::Entry::new();
+                entry.set_text(&current_text);
+                entry.set_hexpand(true);
+
+                label_clone.set_visible(false);
+                hbox.prepend(&entry);
+                entry.grab_focus();
+                entry.select_region(0, -1);
+
+                let label_for_activate = label_clone.clone();
+                let custom_for_activate = custom.clone();
+                let bus_for_activate = bus.clone();
+                let pid_for_activate = pid.clone();
+                let entry_clone = entry.clone();
+                entry.connect_activate(move |entry| {
+                    let new_title = entry.text().to_string();
+                    if !new_title.is_empty() {
+                        label_for_activate.set_text(&new_title);
+                        custom_for_activate
+                            .borrow_mut()
+                            .insert(pid_for_activate.clone(), new_title.clone());
+                        broadcast(
+                            &bus_for_activate,
+                            &Event::new(
+                                "tab.renamed",
+                                json!({ "panel_id": pid_for_activate, "title": new_title }),
+                            ),
+                        );
+                    }
+                    label_for_activate.set_visible(true);
+                    if let Some(parent) = entry_clone.parent()
+                        && let Some(hbox) = parent.downcast_ref::<gtk4::Box>()
+                    {
+                        hbox.remove(&entry_clone);
+                    }
+                });
+
+                // Also handle focus-out (cancel/accept)
+                let label_for_focus = label_clone.clone();
+                let focus_ctrl = gtk4::EventControllerFocus::new();
+                let entry_for_focus = entry.clone();
+                focus_ctrl.connect_leave(move |_| {
+                    label_for_focus.set_visible(true);
+                    if let Some(parent) = entry_for_focus.parent()
+                        && let Some(hbox) = parent.downcast_ref::<gtk4::Box>()
+                    {
+                        hbox.remove(&entry_for_focus);
+                    }
+                });
+                entry.add_controller(focus_ctrl);
+            });
+            hbox.add_controller(gesture);
+        }
+
         let nb = self.notebook.clone();
         let tabs = self.tabs.clone();
         let focused = self.focused.clone();
         let container = page_container.clone();
         let bus = self.event_bus.clone();
+        let collapsed = self.tab_bar_collapsed.clone();
         close_btn.connect_clicked(move |_| {
             let Some(idx) = nb.page_num(&container) else {
                 eprintln!("[custerm] close: page not found");
@@ -808,7 +963,9 @@ impl TabManager {
 
             tabs.borrow_mut().remove(idx);
             nb.remove_page(Some(idx as u32));
-            nb.set_show_tabs(tabs.borrow().len() > 1);
+            if !*collapsed.borrow() {
+                nb.set_show_tabs(tabs.borrow().len() > 1);
+            }
 
             broadcast(
                 &bus,
@@ -879,6 +1036,11 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
         // -- Ctrl-only shortcuts --
         if ctrl_only {
             match keyval {
+                // Ctrl+B: toggle tab bar visibility
+                gdk::Key::b => {
+                    mgr.toggle_tab_bar();
+                    return glib::Propagation::Stop;
+                }
                 // Ctrl+F: toggle search (terminal only)
                 gdk::Key::f if is_terminal => {
                     if let Some(term) = panel.as_ref().and_then(|p| p.as_terminal()) {
