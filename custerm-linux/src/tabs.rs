@@ -71,12 +71,14 @@ impl TabManager {
             event_bus,
             tab_css,
             custom_titles: Rc::new(RefCell::new(std::collections::HashMap::new())),
-            tab_bar_collapsed: Rc::new(RefCell::new(true)),
+            tab_bar_collapsed: Rc::new(RefCell::new(config.tabs.collapsed)),
             user_toggled: Rc::new(RefCell::new(false)),
         });
 
         // Apply initial collapsed state
-        manager.notebook.add_css_class("custerm-collapsed");
+        if config.tabs.collapsed {
+            manager.notebook.add_css_class("custerm-collapsed");
+        }
 
         // Update tab bar visibility on page remove
         let tabs_ref = manager.tabs.clone();
@@ -407,6 +409,12 @@ impl TabManager {
         self.notebook.set_tab_pos(tab_pos);
         self.tab_css
             .load_from_string(&build_tab_css(config.tabs.width));
+
+        // Apply collapsed config if user hasn't manually toggled
+        if !*self.user_toggled.borrow() {
+            *self.tab_bar_collapsed.borrow_mut() = config.tabs.collapsed;
+            self.apply_collapsed_state(config.tabs.collapsed);
+        }
 
         for tab in self.tabs.borrow().iter() {
             let mut panels = Vec::new();
@@ -1312,8 +1320,9 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
         mgr.split_focused_webview("about:blank", gtk4::Orientation::Vertical, &win);
     });
 
-    // For vertical tabs: hide add button when collapsed (default). For horizontal: always show.
-    if vertical {
+    // For vertical tabs: hide add button when collapsed. For horizontal: always show.
+    let initially_collapsed = *manager.tab_bar_collapsed.borrow();
+    if vertical && initially_collapsed {
         add_btn.set_visible(false);
     }
 

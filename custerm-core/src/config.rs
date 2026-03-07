@@ -110,6 +110,13 @@ pub struct TabsConfig {
     /// Width of vertical tabs in pixels (left/right position)
     #[serde(default = "default_tab_width")]
     pub width: u32,
+    /// Whether the tab bar starts collapsed (icon-only). Default: true
+    #[serde(default = "default_true")]
+    pub collapsed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for TabsConfig {
@@ -117,6 +124,7 @@ impl Default for TabsConfig {
         Self {
             position: default_tab_position(),
             width: default_tab_width(),
+            collapsed: true,
         }
     }
 }
@@ -178,6 +186,7 @@ font_size = 14
 [tabs]
 # position = "top"  # top, bottom, left, right
 # width = 120       # vertical tab width in pixels (left/right)
+# collapsed = true  # start with tab bar collapsed (icon-only)
 
 [theme]
 name = "catppuccin-mocha"
