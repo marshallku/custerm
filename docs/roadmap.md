@@ -64,6 +64,9 @@ Embed browser as a panel type alongside terminals.
 - [x] **Event stream**: `webview.loaded`, `webview.title_changed`, `webview.navigated` events
 - [x] **CLI commands**: `custermctl webview open/navigate/back/forward/reload/exec-js/get-content`
 - [x] **Side-by-side workflow**: terminal + webview split or tabbed
+- [x] **AI agent DOM inspection**: screenshot, query/query-all, get-styles, click, fill, scroll, page-info
+- [x] **Pre-built JS snippets**: `webview::js` module with structured JSON-returning DOM helpers
+- [x] **Configurable vertical tab width**: `[tabs] width` in config with dynamic CSS hot-reload
 - [ ] **URL bar / navigation** within panel (UI)
 - [ ] **DevTools toggle** (UI)
 - [ ] **JS ↔ custerm bridge**: page scripts can call custerm API

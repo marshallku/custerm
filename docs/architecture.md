@@ -36,7 +36,7 @@ custerm/
 ├── custerm-cli/             # CLI control tool (binary: custermctl)
 │   └── src/
 │       ├── main.rs          # Entry point, output formatting
-│       ├── commands.rs      # clap subcommands (window, workspace, session, background)
+│       ├── commands.rs      # clap subcommands (session, background, tab, split, event, webview)
 │       └── client.rs        # Unix socket client
 └── custerm-macos/           # Swift/AppKit app (stub)
     ├── Package.swift        # Swift Package Manager config (Swift 6, macOS 14+)
@@ -99,7 +99,7 @@ custermctl ──Unix socket──► socket server (per-client thread)
                           oneshot response ──► socket thread ──► client
 ```
 
-**Supported commands**: `system.ping`, `background.set`, `background.clear`, `background.set_tint`, `background.next`, `background.toggle`, `tab.new`, `tab.close`, `tab.list`, `tab.info`, `split.horizontal`, `split.vertical`, `session.list`, `session.info`, `event.subscribe`, `webview.open`, `webview.navigate`, `webview.back`, `webview.forward`, `webview.reload`, `webview.execute_js`, `webview.get_content`
+**Supported commands**: `system.ping`, `background.set`, `background.clear`, `background.set_tint`, `background.next`, `background.toggle`, `tab.new`, `tab.close`, `tab.list`, `tab.info`, `split.horizontal`, `split.vertical`, `session.list`, `session.info`, `event.subscribe`, `webview.open`, `webview.navigate`, `webview.back`, `webview.forward`, `webview.reload`, `webview.execute_js`, `webview.get_content`, `webview.screenshot`, `webview.query`, `webview.query_all`, `webview.get_styles`, `webview.click`, `webview.fill`, `webview.scroll`, `webview.page_info`
 
 **Cleanup**: Socket file removed on window destroy.
 
@@ -154,8 +154,16 @@ The `Panel` trait provides a common interface (`widget()`, `title()`, `panel_typ
 | `webview.reload` | `id` | Reload page |
 | `webview.execute_js` | `id`, `code` | Run JS, return result (async) |
 | `webview.get_content` | `id`, `format?` (text/html) | Get page content via JS (async) |
+| `webview.screenshot` | `id`, `path?` | Take screenshot (base64 PNG or save to file) |
+| `webview.query` | `id`, `selector` | Query single DOM element (tag, text, rect, attrs) |
+| `webview.query_all` | `id`, `selector`, `limit?` | Query all matching elements |
+| `webview.get_styles` | `id`, `selector`, `properties` | Get computed CSS styles for element |
+| `webview.click` | `id`, `selector` | Click a DOM element |
+| `webview.fill` | `id`, `selector`, `value` | Type text into an input element |
+| `webview.scroll` | `id`, `selector?`, `x?`, `y?` | Scroll to position or element |
+| `webview.page_info` | `id` | Page metadata (title, dimensions, element counts) |
 
-`webview.execute_js` and `webview.get_content` use async dispatch — the reply sender is captured by the WebKit callback and sent when the JS execution completes.
+`webview.execute_js`, `webview.get_content`, `webview.screenshot`, and all DOM query/interaction commands use async dispatch — the reply sender is captured by the WebKit callback and sent when execution completes. DOM commands use pre-built JS snippets from `webview::js` module.
 
 ## System Prerequisites
 
