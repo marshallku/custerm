@@ -7,11 +7,13 @@ use gtk4::{Application, ApplicationWindow, gio, glib};
 use custerm_core::config::CustermConfig;
 
 use crate::dbus::{self, DbusCommand};
+use crate::panel::Panel;
 use crate::socket;
 use crate::tabs::TabManager;
 
 pub struct CustermWindow {
     pub window: ApplicationWindow,
+    pub tab_manager: Rc<TabManager>,
 }
 
 impl CustermWindow {
@@ -81,11 +83,21 @@ impl CustermWindow {
             socket::cleanup(&socket_path_cleanup);
         });
 
-        Self { window }
+        Self {
+            window,
+            tab_manager,
+        }
     }
 
     pub fn present(&self) {
         self.window.present();
+        // Focus the terminal after the window is mapped
+        let mgr = self.tab_manager.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(panel) = mgr.active_panel() {
+                panel.grab_focus();
+            }
+        });
     }
 }
 
