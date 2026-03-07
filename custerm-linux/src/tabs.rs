@@ -1028,30 +1028,12 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
 
         let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
-        let ctrl_only = ctrl && !shift;
         let ctrl_shift = ctrl && shift;
 
         let panel = mgr.active_panel();
         let is_terminal = panel.as_ref().is_some_and(|p| p.as_terminal().is_some());
-        let is_webview = panel.as_ref().is_some_and(|p| p.as_webview().is_some());
 
-        // -- Ctrl-only shortcuts --
-        if ctrl_only {
-            match keyval {
-                // Ctrl+F: toggle search (terminal only)
-                gdk::Key::f if is_terminal => {
-                    if let Some(term) = panel.as_ref().and_then(|p| p.as_terminal()) {
-                        term.search_bar.toggle(&term.terminal);
-                    }
-                    return glib::Propagation::Stop;
-                }
-                // Let webview handle its own Ctrl shortcuts (Ctrl+R, Ctrl+L, Ctrl+F, etc.)
-                _ if is_webview => return glib::Propagation::Proceed,
-                _ => return glib::Propagation::Proceed,
-            }
-        }
-
-        // -- Ctrl+Shift shortcuts --
+        // Only intercept Ctrl+Shift — all Ctrl-only keys pass through to terminal/webview
         if !ctrl_shift {
             return glib::Propagation::Proceed;
         }
@@ -1060,6 +1042,13 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
             // Ctrl+Shift+B: toggle tab bar visibility
             gdk::Key::B => {
                 mgr.toggle_tab_bar();
+                glib::Propagation::Stop
+            }
+            // Ctrl+Shift+F: toggle search (terminal only)
+            gdk::Key::F if is_terminal => {
+                if let Some(term) = panel.as_ref().and_then(|p| p.as_terminal()) {
+                    term.search_bar.toggle(&term.terminal);
+                }
                 glib::Propagation::Stop
             }
             // Ctrl+Shift+C: copy (terminal)
