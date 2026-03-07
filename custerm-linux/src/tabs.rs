@@ -338,8 +338,9 @@ impl TabManager {
             }
         }
 
-        // Show/hide add button in action widget
-        if let Some(action) = self.notebook.action_widget(gtk4::PackType::End)
+        // Show/hide add button in action widget (only for vertical tabs)
+        if self.is_vertical_tabs()
+            && let Some(action) = self.notebook.action_widget(gtk4::PackType::End)
             && let Some(hbox) = action.downcast_ref::<gtk4::Box>()
             && let Some(toggle_btn) = hbox.first_child()
             && let Some(add_btn) = toggle_btn.next_sibling()
@@ -1191,8 +1192,10 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
 }
 
 fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
+    let vertical = manager.is_vertical_tabs();
     let action_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
     action_box.add_css_class("custerm-tab-actions");
+    action_box.set_halign(gtk4::Align::Start);
 
     // Toggle button (collapse/expand tab bar)
     let toggle_btn = gtk4::Button::from_icon_name("sidebar-show-symbolic");
@@ -1253,8 +1256,10 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
         mgr.add_webview_tab("about:blank", &win);
     });
 
-    // Hide add button initially (starts collapsed)
-    add_btn.set_visible(false);
+    // For vertical tabs: hide add button when collapsed (default). For horizontal: always show.
+    if vertical {
+        add_btn.set_visible(false);
+    }
 
     action_box.append(&toggle_btn);
     action_box.append(&add_btn);
@@ -1287,10 +1292,10 @@ notebook header tabs {{
 notebook header tab {{
     background-color: #1e1e2e;
     color: #6c7086;
-    padding: 4px 8px;
+    padding: 6px 8px;
     margin: 2px 1px 0;
     border-radius: 6px 6px 0 0;
-    min-height: 24px;
+    min-height: 28px;
 }}
 
 notebook header tab:checked {{
@@ -1309,6 +1314,7 @@ notebook header.left tab {{
     margin: 1px 0 1px 2px;
     padding: 6px 8px;
     min-width: {tab_width}px;
+    min-height: 28px;
 }}
 
 /* Vertical tabs (right) */
@@ -1317,24 +1323,28 @@ notebook header.right tab {{
     margin: 1px 2px 1px 0;
     padding: 6px 8px;
     min-width: {tab_width}px;
+    min-height: 28px;
 }}
 
 /* Bottom tabs */
 notebook header.bottom tab {{
     border-radius: 0 0 6px 6px;
     margin: 0 1px 2px;
+    min-height: 28px;
 }}
 
-/* Collapsed mode */
+/* Collapsed mode — keep tab height, shrink width */
 notebook.custerm-collapsed header.left tab,
 notebook.custerm-collapsed header.right tab {{
     min-width: 0;
-    padding: 8px;
+    padding: 6px 8px;
+    min-height: 28px;
 }}
 
 notebook.custerm-collapsed header.top tab,
 notebook.custerm-collapsed header.bottom tab {{
-    padding: 4px 8px;
+    padding: 6px 8px;
+    min-height: 28px;
 }}
 
 .custerm-tab-icon {{
@@ -1357,18 +1367,24 @@ notebook.custerm-collapsed header.bottom tab {{
 }}
 
 .custerm-tab-actions {{
-    padding: 4px;
+    padding: 4px 6px;
+    margin: 0;
 }}
 
-.custerm-action-btn {{
-    min-width: 24px;
-    min-height: 24px;
-    padding: 2px;
-    border-radius: 6px;
+.custerm-action-btn,
+.custerm-action-btn > button {{
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    padding: 0;
+    margin: 0;
+    border-radius: 4px;
     color: #6c7086;
 }}
 
-.custerm-action-btn:hover {{
+.custerm-action-btn:hover,
+.custerm-action-btn > button:hover {{
     background-color: #313244;
     color: #cdd6f4;
 }}
