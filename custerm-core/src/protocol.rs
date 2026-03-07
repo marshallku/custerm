@@ -24,6 +24,16 @@ pub struct ResponseError {
     pub message: String,
 }
 
+impl Request {
+    pub fn new(id: impl Into<String>, method: impl Into<String>, params: serde_json::Value) -> Self {
+        Self {
+            id: id.into(),
+            method: method.into(),
+            params,
+        }
+    }
+}
+
 impl Response {
     pub fn success(id: String, result: serde_json::Value) -> Self {
         Self {

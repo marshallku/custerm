@@ -36,6 +36,14 @@ pub enum Command {
     /// Background image management
     #[command(subcommand)]
     Background(BackgroundCommand),
+
+    /// Tab management
+    #[command(subcommand)]
+    Tab(TabCommand),
+
+    /// Split pane management
+    #[command(subcommand)]
+    Split(SplitCommand),
 }
 
 #[derive(Subcommand)]
@@ -92,10 +100,32 @@ pub enum SessionCommand {
 pub enum BackgroundCommand {
     /// Set background image
     Set { path: String },
+    /// Clear background image
+    Clear,
+    /// Set tint opacity (0.0 - 1.0)
+    SetTint { opacity: f64 },
     /// Switch to next random background
     Next,
     /// Toggle background visibility
     Toggle,
+}
+
+#[derive(Subcommand)]
+pub enum TabCommand {
+    /// Create a new tab
+    New,
+    /// Close the focused tab/panel
+    Close,
+    /// List tabs
+    List,
+}
+
+#[derive(Subcommand)]
+pub enum SplitCommand {
+    /// Split horizontally
+    Horizontal,
+    /// Split vertically
+    Vertical,
 }
 
 impl Cli {
@@ -126,8 +156,21 @@ impl Cli {
             .to_string(),
             Command::Background(cmd) => match cmd {
                 BackgroundCommand::Set { .. } => "background.set",
+                BackgroundCommand::Clear => "background.clear",
+                BackgroundCommand::SetTint { .. } => "background.set_tint",
                 BackgroundCommand::Next => "background.next",
                 BackgroundCommand::Toggle => "background.toggle",
+            }
+            .to_string(),
+            Command::Tab(cmd) => match cmd {
+                TabCommand::New => "tab.new",
+                TabCommand::Close => "tab.close",
+                TabCommand::List => "tab.list",
+            }
+            .to_string(),
+            Command::Split(cmd) => match cmd {
+                SplitCommand::Horizontal => "split.horizontal",
+                SplitCommand::Vertical => "split.vertical",
             }
             .to_string(),
         }
@@ -157,9 +200,17 @@ impl Cli {
                 SessionCommand::Close { id } => json!({ "session_id": id }),
             },
             Command::Background(cmd) => match cmd {
-                BackgroundCommand::Set { path } => json!({ "path": path }),
+                BackgroundCommand::Set { path } => {
+                    let abs = std::path::Path::new(path)
+                        .canonicalize()
+                        .unwrap_or_else(|_| std::path::PathBuf::from(path));
+                    json!({ "path": abs.to_string_lossy() })
+                }
+                BackgroundCommand::Clear => json!({}),
+                BackgroundCommand::SetTint { opacity } => json!({ "opacity": opacity }),
                 BackgroundCommand::Next | BackgroundCommand::Toggle => json!({}),
             },
+            Command::Tab(_) | Command::Split(_) => json!({}),
         }
     }
 }

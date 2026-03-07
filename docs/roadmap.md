@@ -48,9 +48,9 @@ Single programmable interface for both human CLI and AI agents.
 - [x] CLI tool (custermctl) with clap subcommands
 - [x] cmux V2 JSON protocol types
 - [x] Unix socket client
-- [ ] **Socket server** in custerm-linux (replace/supplement D-Bus for richer control)
-- [ ] **Command dispatch**: wire all commands to actual panel/tab/split actions
-- [ ] **Env var injection**: CUSTERM_SOCKET, CUSTERM_SESSION_ID per terminal session
+- [x] **Socket server** in custerm-linux (Unix socket, per-PID path)
+- [x] **Command dispatch**: system.ping, background.set/clear/set_tint, tab.new/close/list, split.horizontal/vertical
+- [x] **Env var injection**: CUSTERM_SOCKET per terminal session
 - [ ] **Event stream**: subscribe to terminal output, focus changes, panel lifecycle
 - [ ] **Query API**: read terminal screen content, list panels/tabs, get state
 

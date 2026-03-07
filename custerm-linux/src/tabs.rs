@@ -178,6 +178,14 @@ impl TabManager {
         self.focused.borrow().clone()
     }
 
+    pub fn tab_count(&self) -> usize {
+        self.tabs.borrow().len()
+    }
+
+    pub fn current_tab(&self) -> Option<u32> {
+        self.notebook.current_page()
+    }
+
     pub fn update_config(&self, config: &CustermConfig) {
         *self.config.borrow_mut() = config.clone();
 

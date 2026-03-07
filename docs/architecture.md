@@ -28,6 +28,7 @@ custerm/
 │   │   ├── split.rs         # Split pane tree (SplitNode, TabContent)
 │   │   ├── search.rs        # In-terminal search bar (Ctrl+F, VTE regex search)
 │   │   ├── panel.rs         # Panel trait
+│   │   ├── socket.rs        # Unix socket server + command dispatcher
 │   │   └── dbus.rs          # D-Bus service (com.marshall.custerm)
 │   ├── custerm.desktop      # Desktop entry for system integration
 │   └── install.sh           # Build + install script
@@ -74,6 +75,31 @@ custerm/
 ### custerm-cli
 - `clap 4` (features: `derive`) - Argument parsing
 - `uuid 1` - Request IDs
+
+## Socket Server (IPC)
+
+custerm runs a Unix domain socket server for programmatic control alongside D-Bus.
+
+**Path**: `/tmp/custerm-{PID}.sock` (per-process, discovered via `CUSTERM_SOCKET` env var)
+
+**Protocol**: Newline-delimited JSON (`Request` → `Response`, defined in `custerm-core/protocol.rs`)
+
+**Architecture**:
+```
+custermctl ──Unix socket──► socket server (per-client thread)
+                                │
+                          mpsc::channel
+                                │
+                          glib::timeout_add_local (50ms poll on GTK thread)
+                                │
+                          dispatch() ──► TabManager / TerminalPanel
+                                │
+                          oneshot response ──► socket thread ──► client
+```
+
+**Supported commands**: `system.ping`, `background.set`, `background.clear`, `background.set_tint`, `tab.new`, `tab.close`, `tab.list`, `split.horizontal`, `split.vertical`
+
+**Cleanup**: Socket file removed on window destroy.
 
 ## System Prerequisites
 

@@ -197,6 +197,7 @@ version = "0.1.0"
 dependencies = [
  "custerm-core",
  "gtk4",
+ "serde_json",
  "vte4",
 ]
 

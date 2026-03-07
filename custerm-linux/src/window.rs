@@ -7,6 +7,7 @@ use gtk4::{Application, ApplicationWindow, gio, glib};
 use custerm_core::config::CustermConfig;
 
 use crate::dbus::{self, DbusCommand};
+use crate::socket;
 use crate::tabs::TabManager;
 
 pub struct CustermWindow {
@@ -57,6 +58,25 @@ impl CustermWindow {
                 }
             }
             glib::ControlFlow::Continue
+        });
+
+        // Socket server
+        let socket_path = "/tmp/custerm.sock".to_string();
+        let socket_rx = socket::start_server(&socket_path);
+        let mgr = tab_manager.clone();
+        let win = window.clone();
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            while let Ok(cmd) = socket_rx.try_recv() {
+                let response = socket::dispatch(&cmd.request, &mgr, &win);
+                let _ = cmd.reply.send(response);
+            }
+            glib::ControlFlow::Continue
+        });
+
+        // Cleanup socket on shutdown
+        let socket_path_cleanup = socket_path.clone();
+        window.connect_destroy(move |_| {
+            socket::cleanup(&socket_path_cleanup);
         });
 
         Self { window }

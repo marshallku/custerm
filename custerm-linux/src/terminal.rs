@@ -92,11 +92,12 @@ impl TerminalPanel {
         // Spawn shell
         let shell = config.terminal.shell.clone();
         let dbus_env = format!("CUSTERM_DBUS={}", crate::dbus::bus_name());
+        let socket_env = "CUSTERM_SOCKET=/tmp/custerm.sock".to_string();
         terminal.spawn_async(
             vte4::PtyFlags::DEFAULT,
             None::<&str>,
             &[&shell],
-            &[&dbus_env],
+            &[&dbus_env, &socket_env],
             gtk4::glib::SpawnFlags::DEFAULT,
             || {},
             -1,
