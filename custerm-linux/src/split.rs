@@ -59,15 +59,15 @@ impl SplitNode {
     ) -> Option<(Rc<RefCell<SplitNode>>, ChildSide)> {
         let borrowed = node.borrow();
         if let SplitNode::Branch { first, second, .. } = &*borrowed {
-            if let SplitNode::Leaf { panel } = &*first.borrow() {
-                if Rc::ptr_eq(panel, target) {
-                    return Some((node.clone(), ChildSide::First));
-                }
+            if let SplitNode::Leaf { panel } = &*first.borrow()
+                && Rc::ptr_eq(panel, target)
+            {
+                return Some((node.clone(), ChildSide::First));
             }
-            if let SplitNode::Leaf { panel } = &*second.borrow() {
-                if Rc::ptr_eq(panel, target) {
-                    return Some((node.clone(), ChildSide::Second));
-                }
+            if let SplitNode::Leaf { panel } = &*second.borrow()
+                && Rc::ptr_eq(panel, target)
+            {
+                return Some((node.clone(), ChildSide::Second));
             }
             if let Some(found) = Self::find_parent(first, target) {
                 return Some(found);
@@ -85,10 +85,10 @@ impl SplitNode {
         target: &Rc<PanelVariant>,
     ) -> Option<(Rc<RefCell<SplitNode>>, ChildSide)> {
         if let SplitNode::Branch { first, second, .. } = node {
-            if let SplitNode::Leaf { panel } = &*first.borrow() {
-                if Rc::ptr_eq(panel, target) {
-                    // Can't return a ref to ourselves without Rc, search children instead
-                }
+            if let SplitNode::Leaf { panel } = &*first.borrow()
+                && Rc::ptr_eq(panel, target)
+            {
+                // Can't return a ref to ourselves without Rc, search children instead
             }
             // Delegate to Rc-based search
             if let Some(found) = Self::find_parent(first, target) {
@@ -98,10 +98,10 @@ impl SplitNode {
                 return Some(found);
             }
             // Check if target is direct child of this node
-            if let SplitNode::Leaf { panel } = &*first.borrow() {
-                if Rc::ptr_eq(panel, target) {
-                    // We need the Rc wrapper - use root-level find
-                }
+            if let SplitNode::Leaf { panel } = &*first.borrow()
+                && Rc::ptr_eq(panel, target)
+            {
+                // We need the Rc wrapper - use root-level find
             }
         }
         None
@@ -278,10 +278,10 @@ impl TabContent {
         // Root is a single leaf → close the tab
         {
             let root = self.root.borrow();
-            if let SplitNode::Leaf { panel } = &*root {
-                if Rc::ptr_eq(panel, target) {
-                    return CloseResult::CloseTab;
-                }
+            if let SplitNode::Leaf { panel } = &*root
+                && Rc::ptr_eq(panel, target)
+            {
+                return CloseResult::CloseTab;
             }
         }
 
