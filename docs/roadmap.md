@@ -37,7 +37,7 @@ Terminal tabs first, then generalize to support different panel types.
 - [x] **Split panes**: horizontal / vertical split within a tab
 - [x] **Pane resize**: drag dividers
 - [x] **Focus tracking**: active pane focus via `EventControllerFocus`
-- [x] **Keyboard shortcuts**: Ctrl+Shift+T/W/Tab, Ctrl+Shift+E/O (split), Ctrl+Shift+[1-9]
+- [x] **Keyboard shortcuts**: Ctrl+Shift+T/W/Tab, Ctrl+Shift+E/O (split), Ctrl+Shift+[1-9], Ctrl+Shift+C/V (copy/paste)
 - [x] **Configurable tab position**: top, bottom, left, right (`[tabs] position` in config)
 - [x] **In-terminal search**: Ctrl+F search bar with VTE regex (next/prev/case toggle)
 - [ ] **Panel type registry**: extensible system for registering new panel types
