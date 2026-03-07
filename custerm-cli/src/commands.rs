@@ -202,6 +202,83 @@ pub enum WebviewCommand {
         #[arg(long, default_value = "text")]
         format: String,
     },
+    /// Take a screenshot of a webview (returns base64 PNG or saves to file)
+    Screenshot {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// Save to file path (omit for base64 in response)
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Query a single DOM element by CSS selector
+    Query {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// CSS selector
+        selector: String,
+    },
+    /// Query all matching DOM elements by CSS selector
+    QueryAll {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// CSS selector
+        selector: String,
+        /// Max results
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Get computed CSS styles for an element
+    GetStyles {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// CSS selector
+        selector: String,
+        /// CSS property names (comma-separated)
+        properties: String,
+    },
+    /// Click a DOM element by CSS selector
+    Click {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// CSS selector
+        selector: String,
+    },
+    /// Type text into an input element
+    Fill {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// CSS selector for the input element
+        selector: String,
+        /// Value to type
+        value: String,
+    },
+    /// Scroll to position or element
+    Scroll {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+        /// CSS selector to scroll to (overrides x/y)
+        #[arg(long)]
+        selector: Option<String>,
+        /// X scroll position
+        #[arg(long, default_value_t = 0)]
+        x: i32,
+        /// Y scroll position
+        #[arg(long, default_value_t = 0)]
+        y: i32,
+    },
+    /// Get page metadata (title, dimensions, element counts)
+    PageInfo {
+        /// Panel ID
+        #[arg(long)]
+        id: String,
+    },
 }
 
 impl Cli {
@@ -263,6 +340,14 @@ impl Cli {
                 WebviewCommand::Reload { .. } => "webview.reload",
                 WebviewCommand::ExecJs { .. } => "webview.execute_js",
                 WebviewCommand::GetContent { .. } => "webview.get_content",
+                WebviewCommand::Screenshot { .. } => "webview.screenshot",
+                WebviewCommand::Query { .. } => "webview.query",
+                WebviewCommand::QueryAll { .. } => "webview.query_all",
+                WebviewCommand::GetStyles { .. } => "webview.get_styles",
+                WebviewCommand::Click { .. } => "webview.click",
+                WebviewCommand::Fill { .. } => "webview.fill",
+                WebviewCommand::Scroll { .. } => "webview.scroll",
+                WebviewCommand::PageInfo { .. } => "webview.page_info",
             }
             .to_string(),
         }
@@ -312,6 +397,17 @@ impl Cli {
                 WebviewCommand::Reload { id } => json!({ "id": id }),
                 WebviewCommand::ExecJs { id, code } => json!({ "id": id, "code": code }),
                 WebviewCommand::GetContent { id, format } => json!({ "id": id, "format": format }),
+                WebviewCommand::Screenshot { id, path } => json!({ "id": id, "path": path }),
+                WebviewCommand::Query { id, selector } => json!({ "id": id, "selector": selector }),
+                WebviewCommand::QueryAll { id, selector, limit } => json!({ "id": id, "selector": selector, "limit": limit }),
+                WebviewCommand::GetStyles { id, selector, properties } => {
+                    let props: Vec<&str> = properties.split(',').map(|s| s.trim()).collect();
+                    json!({ "id": id, "selector": selector, "properties": props })
+                }
+                WebviewCommand::Click { id, selector } => json!({ "id": id, "selector": selector }),
+                WebviewCommand::Fill { id, selector, value } => json!({ "id": id, "selector": selector, "value": value }),
+                WebviewCommand::Scroll { id, selector, x, y } => json!({ "id": id, "selector": selector, "x": x, "y": y }),
+                WebviewCommand::PageInfo { id } => json!({ "id": id }),
             },
         }
     }

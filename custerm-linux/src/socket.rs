@@ -279,6 +279,46 @@ pub fn dispatch(
             // Response sent from callback
         }
 
+        "webview.screenshot" => {
+            handle_webview_screenshot(cmd, mgr);
+            // Response sent from callback
+        }
+
+        "webview.query" => {
+            handle_webview_query(cmd, mgr);
+            // Response sent from callback
+        }
+
+        "webview.query_all" => {
+            handle_webview_query_all(cmd, mgr);
+            // Response sent from callback
+        }
+
+        "webview.get_styles" => {
+            handle_webview_get_styles(cmd, mgr);
+            // Response sent from callback
+        }
+
+        "webview.click" => {
+            handle_webview_click(cmd, mgr);
+            // Response sent from callback
+        }
+
+        "webview.fill" => {
+            handle_webview_fill(cmd, mgr);
+            // Response sent from callback
+        }
+
+        "webview.scroll" => {
+            handle_webview_scroll(cmd, mgr);
+            // Response sent from callback
+        }
+
+        "webview.page_info" => {
+            handle_webview_page_info(cmd, mgr);
+            // Response sent from callback
+        }
+
         _ => {
             let _ = cmd.reply.send(Response::error(
                 req.id.clone(),
@@ -545,6 +585,187 @@ fn handle_webview_get_content(cmd: SocketCommand, mgr: &Rc<TabManager>) {
         };
         let _ = reply.send(resp);
     });
+}
+
+fn handle_webview_screenshot(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+    let req = &cmd.request;
+    let id = match req.params.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"));
+            return;
+        }
+    };
+
+    let panel = match mgr.find_panel_by_id(&id) {
+        Some(p) => p,
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "not_found", &format!("Panel not found: {id}")));
+            return;
+        }
+    };
+    let wv = match panel.as_webview() {
+        Some(wv) => wv,
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "wrong_panel_type", "Panel is not a webview"));
+            return;
+        }
+    };
+
+    let req_id = req.id.clone();
+    let reply = cmd.reply;
+    let path = req.params.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    wv.snapshot(move |result| {
+        let resp = match result {
+            Ok(base64_png) => {
+                if let Some(path) = path {
+                    // Decode and save to file
+                    match gtk4::glib::base64_decode(&base64_png) {
+                        data if !data.is_empty() => {
+                            match std::fs::write(&path, &data) {
+                                Ok(_) => Response::success(req_id, json!({ "path": path })),
+                                Err(e) => Response::error(req_id, "io_error", &e.to_string()),
+                            }
+                        }
+                        _ => Response::error(req_id, "decode_error", "Failed to decode PNG"),
+                    }
+                } else {
+                    Response::success(req_id, json!({ "image": base64_png }))
+                }
+            }
+            Err(e) => Response::error(req_id, "snapshot_error", &e),
+        };
+        let _ = reply.send(resp);
+    });
+}
+
+/// Helper: run a JS snippet from webview::js module on a webview panel, send result via reply
+fn run_js_command(cmd: SocketCommand, mgr: &Rc<TabManager>, js_code: String) {
+    let req = &cmd.request;
+    let id = match req.params.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"));
+            return;
+        }
+    };
+
+    let panel = match mgr.find_panel_by_id(&id) {
+        Some(p) => p,
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "not_found", &format!("Panel not found: {id}")));
+            return;
+        }
+    };
+    let wv = match panel.as_webview() {
+        Some(wv) => wv,
+        None => {
+            let _ = cmd.reply.send(Response::error(req.id.clone(), "wrong_panel_type", "Panel is not a webview"));
+            return;
+        }
+    };
+
+    let req_id = req.id.clone();
+    let reply = cmd.reply;
+    wv.execute_js(&js_code, move |result| {
+        let resp = match result {
+            Ok(json_str) => {
+                // Parse the JSON string returned by JS to embed as structured data
+                match serde_json::from_str::<serde_json::Value>(&json_str) {
+                    Ok(val) => Response::success(req_id, json!({ "result": val })),
+                    Err(_) => Response::success(req_id, json!({ "result": json_str })),
+                }
+            }
+            Err(e) => Response::error(req_id, "js_error", &e),
+        };
+        let _ = reply.send(resp);
+    });
+}
+
+fn handle_webview_query(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+    let selector = match cmd.request.params.get("selector").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(cmd.request.id.clone(), "invalid_params", "Missing 'selector' param"));
+            return;
+        }
+    };
+    let js = crate::webview::js::query_selector(&selector);
+    run_js_command(cmd, mgr, js);
+}
+
+fn handle_webview_query_all(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+    let selector = match cmd.request.params.get("selector").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(cmd.request.id.clone(), "invalid_params", "Missing 'selector' param"));
+            return;
+        }
+    };
+    let limit = cmd.request.params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+    let js = crate::webview::js::query_selector_all(&selector, limit);
+    run_js_command(cmd, mgr, js);
+}
+
+fn handle_webview_get_styles(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+    let selector = match cmd.request.params.get("selector").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(cmd.request.id.clone(), "invalid_params", "Missing 'selector' param"));
+            return;
+        }
+    };
+    let properties: Vec<&str> = cmd.request.params.get("properties")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let js = crate::webview::js::get_styles(&selector, &properties);
+    run_js_command(cmd, mgr, js);
+}
+
+fn handle_webview_click(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+    let selector = match cmd.request.params.get("selector").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(cmd.request.id.clone(), "invalid_params", "Missing 'selector' param"));
+            return;
+        }
+    };
+    let js = crate::webview::js::click(&selector);
+    run_js_command(cmd, mgr, js);
+}
+
+fn handle_webview_fill(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+    let selector = match cmd.request.params.get("selector").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(cmd.request.id.clone(), "invalid_params", "Missing 'selector' param"));
+            return;
+        }
+    };
+    let value = match cmd.request.params.get("value").and_then(|v| v.as_str()) {
+        Some(v) => v.to_string(),
+        None => {
+            let _ = cmd.reply.send(Response::error(cmd.request.id.clone(), "invalid_params", "Missing 'value' param"));
+            return;
+        }
+    };
+    let js = crate::webview::js::fill(&selector, &value);
+    run_js_command(cmd, mgr, js);
+}
+
+fn handle_webview_scroll(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+    let selector = cmd.request.params.get("selector").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let x = cmd.request.params.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let y = cmd.request.params.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let js = crate::webview::js::scroll(selector.as_deref(), x, y);
+    run_js_command(cmd, mgr, js);
+}
+
+fn handle_webview_page_info(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+    let js = crate::webview::js::page_info();
+    run_js_command(cmd, mgr, js);
 }
 
 // -- Utility functions --
