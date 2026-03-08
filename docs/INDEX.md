@@ -11,6 +11,7 @@
 | [config.md](./config.md)                   | Configuration format and defaults           | Adding config options                     |
 | [decisions.md](./decisions.md)             | Key technical decisions and rationale       | Understanding "why" behind choices        |
 | [troubleshooting.md](./troubleshooting.md) | Known issues, fixes, gotchas                | Debugging problems                        |
+| [plugins.md](./plugins.md)                 | Plugin development guide + JS bridge API    | Creating plugins                          |
 | [roadmap.md](./roadmap.md)                 | Implementation phases, pending work         | Planning next steps                       |
 
 ## Quick Reference

@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Hello Plugin</title>
+    <style>
+        * { box-sizing: border-box; }
+
+        .container {
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 0 20px;
+        }
+
+        h1 {
+            color: var(--turm-accent);
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            color: var(--turm-subtext0);
+            margin-bottom: 32px;
+        }
+
+        .card {
+            background: var(--turm-surface0);
+            border: 1px solid var(--turm-overlay0);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+
+        .card h2 {
+            margin: 0 0 12px 0;
+            font-size: 14px;
+            color: var(--turm-subtext1);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 8px 16px;
+        }
+
+        .info-label {
+            color: var(--turm-subtext0);
+            font-size: 13px;
+        }
+
+        .info-value {
+            font-family: monospace;
+            font-size: 13px;
+        }
+
+        button {
+            background: var(--turm-accent);
+            color: var(--turm-bg);
+            border: none;
+            border-radius: 6px;
+            padding: 10px 20px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-right: 8px;
+            margin-bottom: 8px;
+        }
+
+        button:hover { opacity: 0.85; }
+        button:active { opacity: 0.7; }
+
+        button.secondary {
+            background: var(--turm-surface2);
+            color: var(--turm-text);
+        }
+
+        .event-log {
+            background: var(--turm-surface0);
+            border: 1px solid var(--turm-overlay0);
+            border-radius: 8px;
+            padding: 12px 16px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+
+        .event-log .event-type {
+            color: var(--turm-accent);
+        }
+
+        .event-log .event-time {
+            color: var(--turm-subtext0);
+        }
+
+        #screen-output {
+            white-space: pre;
+            font-family: monospace;
+            font-size: 12px;
+            line-height: 1.4;
+            max-height: 300px;
+            overflow: auto;
+            background: var(--turm-bg);
+            border: 1px solid var(--turm-overlay0);
+            border-radius: 6px;
+            padding: 12px;
+        }
+
+        .status {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--turm-accent);
+            margin-right: 6px;
+        }
+
+        .error { color: var(--turm-red); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hello Plugin</h1>
+        <p class="subtitle">Example plugin for turm</p>
+
+        <!-- Panel Info -->
+        <div class="card">
+            <h2>Panel Info</h2>
+            <div class="info-grid">
+                <span class="info-label">Plugin</span>
+                <span class="info-value" id="plugin-name">-</span>
+                <span class="info-label">Panel</span>
+                <span class="info-value" id="panel-name">-</span>
+                <span class="info-label">Panel ID</span>
+                <span class="info-value" id="panel-id">-</span>
+            </div>
+        </div>
+
+        <!-- Terminal State -->
+        <div class="card">
+            <h2><span class="status"></span>Terminal State</h2>
+            <div class="info-grid" id="term-state">
+                <span class="info-label">Loading...</span>
+                <span class="info-value"></span>
+            </div>
+            <div style="margin-top: 16px;">
+                <button onclick="refreshState()">Refresh State</button>
+                <button class="secondary" onclick="readScreen()">Read Screen</button>
+                <button class="secondary" onclick="runGreet()">Run Greet Command</button>
+            </div>
+        </div>
+
+        <!-- Screen Output -->
+        <div class="card" id="screen-card" style="display: none;">
+            <h2>Terminal Screen</h2>
+            <div id="screen-output"></div>
+        </div>
+
+        <!-- Command Result -->
+        <div class="card" id="cmd-card" style="display: none;">
+            <h2>Command Result</h2>
+            <div id="cmd-output" class="info-value"></div>
+        </div>
+
+        <!-- Event Log -->
+        <div class="card">
+            <h2>Event Log</h2>
+            <div class="event-log" id="events">
+                <div class="event-time">Waiting for events...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Display panel info
+        document.getElementById("plugin-name").textContent = turm.panel.plugin;
+        document.getElementById("panel-name").textContent = turm.panel.name;
+        document.getElementById("panel-id").textContent = turm.panel.id;
+
+        // Fetch and display terminal state
+        async function refreshState() {
+            try {
+                const state = await turm.call("terminal.state");
+                document.getElementById("term-state").innerHTML = `
+                    <span class="info-label">CWD</span>
+                    <span class="info-value">${state.cwd || "N/A"}</span>
+                    <span class="info-label">Size</span>
+                    <span class="info-value">${state.cols}x${state.rows}</span>
+                    <span class="info-label">Cursor</span>
+                    <span class="info-value">[${state.cursor[0]}, ${state.cursor[1]}]</span>
+                    <span class="info-label">Title</span>
+                    <span class="info-value">${state.title || "N/A"}</span>
+                `;
+            } catch (e) {
+                document.getElementById("term-state").innerHTML = `
+                    <span class="error">Error: ${e.message}</span>
+                `;
+            }
+        }
+
+        // Read terminal screen
+        async function readScreen() {
+            try {
+                const result = await turm.call("terminal.read");
+                document.getElementById("screen-output").textContent = result.text;
+                document.getElementById("screen-card").style.display = "";
+            } catch (e) {
+                document.getElementById("screen-output").textContent = `Error: ${e.message}`;
+                document.getElementById("screen-card").style.display = "";
+            }
+        }
+
+        // Run the greet command
+        async function runGreet() {
+            try {
+                const result = await turm.call("plugin.hello.greet", { name: "turm user" });
+                document.getElementById("cmd-output").textContent = JSON.stringify(result, null, 2);
+                document.getElementById("cmd-card").style.display = "";
+            } catch (e) {
+                document.getElementById("cmd-output").innerHTML = `<span class="error">Error: ${e.message}</span>`;
+                document.getElementById("cmd-card").style.display = "";
+            }
+        }
+
+        // Event log
+        const eventsDiv = document.getElementById("events");
+        let eventCount = 0;
+
+        turm.on("*", (type, data) => {
+            if (eventCount === 0) eventsDiv.innerHTML = "";
+            eventCount++;
+
+            const time = new Date().toLocaleTimeString();
+            const line = document.createElement("div");
+            line.innerHTML = `<span class="event-time">${time}</span> <span class="event-type">${type}</span>`;
+            eventsDiv.insertBefore(line, eventsDiv.firstChild);
+
+            // Keep only last 50 events
+            while (eventsDiv.children.length > 50) {
+                eventsDiv.removeChild(eventsDiv.lastChild);
+            }
+        });
+
+        // Load initial state
+        refreshState();
+    </script>
+</body>
+</html>

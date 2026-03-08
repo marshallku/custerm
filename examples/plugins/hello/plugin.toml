@@ -1,0 +1,16 @@
+[plugin]
+name = "hello"
+title = "Hello Plugin"
+version = "0.1.0"
+description = "Example plugin demonstrating panels and commands"
+
+[[panels]]
+name = "main"
+title = "Hello"
+file = "index.html"
+icon = "dialog-information-symbolic"
+
+[[commands]]
+name = "greet"
+exec = "bash scripts/greet.sh"
+description = "Returns a greeting message"
