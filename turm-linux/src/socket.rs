@@ -654,7 +654,7 @@ fn handle_webview_navigate(req: &Request, mgr: &Rc<TabManager>) -> Response {
 fn with_webview_panel(
     req: &Request,
     mgr: &Rc<TabManager>,
-    f: impl FnOnce(&crate::webview::WebViewPanel) -> Response,
+    f: impl FnOnce(&crate::cef_panel::CefBrowserPanel) -> Response,
 ) -> Response {
     let id = match req.params.get("id").and_then(|v| v.as_str()) {
         Some(id) => id,
@@ -923,7 +923,7 @@ fn handle_webview_query(cmd: SocketCommand, mgr: &Rc<TabManager>) {
             return;
         }
     };
-    let js = crate::webview::js::query_selector(&selector);
+    let js = crate::cef_panel::js::query_selector(&selector);
     run_js_command(cmd, mgr, js);
 }
 
@@ -945,7 +945,7 @@ fn handle_webview_query_all(cmd: SocketCommand, mgr: &Rc<TabManager>) {
         .get("limit")
         .and_then(|v| v.as_u64())
         .unwrap_or(50) as u32;
-    let js = crate::webview::js::query_selector_all(&selector, limit);
+    let js = crate::cef_panel::js::query_selector_all(&selector, limit);
     run_js_command(cmd, mgr, js);
 }
 
@@ -968,7 +968,7 @@ fn handle_webview_get_styles(cmd: SocketCommand, mgr: &Rc<TabManager>) {
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
-    let js = crate::webview::js::get_styles(&selector, &properties);
+    let js = crate::cef_panel::js::get_styles(&selector, &properties);
     run_js_command(cmd, mgr, js);
 }
 
@@ -984,7 +984,7 @@ fn handle_webview_click(cmd: SocketCommand, mgr: &Rc<TabManager>) {
             return;
         }
     };
-    let js = crate::webview::js::click(&selector);
+    let js = crate::cef_panel::js::click(&selector);
     run_js_command(cmd, mgr, js);
 }
 
@@ -1011,7 +1011,7 @@ fn handle_webview_fill(cmd: SocketCommand, mgr: &Rc<TabManager>) {
             return;
         }
     };
-    let js = crate::webview::js::fill(&selector, &value);
+    let js = crate::cef_panel::js::fill(&selector, &value);
     run_js_command(cmd, mgr, js);
 }
 
@@ -1034,42 +1034,23 @@ fn handle_webview_scroll(cmd: SocketCommand, mgr: &Rc<TabManager>) {
         .get("y")
         .and_then(|v| v.as_i64())
         .unwrap_or(0) as i32;
-    let js = crate::webview::js::scroll(selector.as_deref(), x, y);
+    let js = crate::cef_panel::js::scroll(selector.as_deref(), x, y);
     run_js_command(cmd, mgr, js);
 }
 
 fn handle_webview_page_info(cmd: SocketCommand, mgr: &Rc<TabManager>) {
-    let js = crate::webview::js::page_info();
+    let js = crate::cef_panel::js::page_info();
     run_js_command(cmd, mgr, js);
 }
 
-fn handle_webview_devtools(req: &Request, mgr: &Rc<TabManager>) -> Response {
-    use webkit6::prelude::WebViewExt;
-    let action = req
-        .params
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("show");
-    with_webview_panel(req, mgr, |wv| {
-        if let Some(inspector) = wv.webview.inspector() {
-            match action {
-                "show" => inspector.show(),
-                "close" => inspector.close(),
-                "attach" => inspector.attach(),
-                "detach" => inspector.detach(),
-                other => {
-                    return Response::error(
-                        req.id.clone(),
-                        "invalid_params",
-                        &format!("Unknown action: {other}. Use show/close/attach/detach"),
-                    );
-                }
-            }
-            Response::success(req.id.clone(), json!({ "status": "ok" }))
-        } else {
-            Response::error(req.id.clone(), "no_inspector", "Inspector not available")
-        }
-    })
+fn handle_webview_devtools(req: &Request, _mgr: &Rc<TabManager>) -> Response {
+    // CEF DevTools are accessed via remote debugging port, not an embedded inspector.
+    // For now, return a note about how to access DevTools.
+    Response::error(
+        req.id.clone(),
+        "not_supported",
+        "DevTools are available via CEF remote debugging port. Use --remote-debugging-port flag.",
+    )
 }
 
 // -- Utility functions --

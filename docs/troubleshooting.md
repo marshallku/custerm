@@ -97,3 +97,37 @@ Multiple possible causes:
 
 **Cause:** gio 0.20 uses builder pattern, not positional args.
 **Fix:** Use `connection.register_object(path, &interface_info).method_call(closure).build()`.
+
+### VTE 0.82: `shell-precmd` / `shell-preexec` / `notification-received` signal panic
+
+```
+signal 'shell-precmd' is invalid for instance '...' of type 'VteTerminal'
+```
+
+**Cause:** VTE 0.82 removed `shell-precmd`, `shell-preexec`, and `notification-received` signals. The Rust `vte4` crate still exposes `connect_shell_precmd()` etc., but the underlying GObject signal doesn't exist.
+
+**Fix:** Guard signal connections with `SignalId::lookup()` before connecting:
+
+```rust
+use gtk4::glib::object::ObjectExt;
+use gtk4::glib::subclass::signal::SignalId;
+if SignalId::lookup("shell-precmd", term_obj.type_()).is_some() {
+    term.terminal.connect_shell_precmd(move |_term| { ... });
+}
+```
+
+### CEF: Browser panel shows blank / no rendering
+
+**Possible causes:**
+1. **CEF binaries not found:** CEF shared libraries (libcef.so etc.) must be in `LD_LIBRARY_PATH`. They're auto-downloaded to the build output dir during `cargo build`. Set `LD_LIBRARY_PATH` to include the CEF directory.
+2. **GPU issues on Wayland:** CEF is configured with `--disable-gpu` and `--disable-gpu-compositing` flags. If rendering issues occur, check CEF subprocess logs.
+3. **Size not detected:** CEF OSR uses polling (every 200ms) to detect size changes. The Picture widget must have a non-zero allocation.
+
+### CEF: Input not working in browser panel
+
+**Cause:** GTK4 EventControllers forward input to CEF via `send_key_event`, `send_mouse_click_event`, etc. If the Picture widget doesn't have focus, events won't be captured.
+**Fix:** Ensure the Picture widget has `set_focusable(true)` and `set_can_focus(true)`.
+
+### Historical: WebKitGTK crashes (reason for CEF migration)
+
+WebKitGTK 2.50.x had an upstream bug where complex Vite/React dev server pages crash the WebKitWebProcess (SIGABRT in JSC). Confirmed reproducible in MiniBrowser. This was the primary motivation for migrating to CEF/Chromium. See decisions.md #12.

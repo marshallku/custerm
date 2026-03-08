@@ -29,8 +29,9 @@ turm/
 │   │   ├── split.rs         # Split pane tree (SplitNode, TabContent)
 │   │   ├── search.rs        # In-terminal search bar (Ctrl+Shift+F, VTE regex search)
 │   │   ├── panel.rs         # Panel trait + PanelVariant enum
-│   │   ├── webview.rs       # WebView panel (WebKitGTK 6.0)
-│   │   ├── plugin_panel.rs  # Plugin panel (WebView + JS bridge)
+│   │   ├── cef_init.rs       # CEF initialization + message pump
+│   │   ├── cef_panel.rs     # Browser panel (CEF/Chromium OSR)
+│   │   ├── cef_plugin_panel.rs # Plugin panel (CEF + JS bridge)
 │   │   ├── socket.rs        # Unix socket server + command dispatcher
 │   │   └── dbus.rs          # D-Bus service (com.marshall.turm)
 │   ├── turm.desktop      # Desktop entry for system integration
@@ -75,7 +76,7 @@ turm/
 
 - `gtk4 0.9` (features: `gnome_46`) - UI framework
 - `vte4 0.8` - Terminal widget (libvte-2.91-gtk4)
-- `webkit6 0.4` - WebView panel (WebKitGTK 6.0)
+- `cef 143` - Browser panel (Chromium Embedded Framework via cef-rs, OSR mode)
 - `env_logger 0.11` - Logging
 
 ### turm-cli
@@ -193,9 +194,8 @@ turmctl agent approve "Deploy to production?" --title "Deploy" --actions "Deploy
 turm supports multiple panel types via the `PanelVariant` enum:
 
 - **Terminal** (`TerminalPanel`): VTE4 terminal with shell, background images, search
-- **WebView** (`WebViewPanel`): WebKitGTK 6.0 browser panel with JS execution, URL toolbar (back/forward/reload/URL entry/DevTools toggle)
-
-- **Plugin** (`PluginPanel`): WebView-based custom panel loaded from plugin HTML with injected `turm` JS bridge
+- **WebView** (`CefBrowserPanel`): Chromium (CEF) browser panel with off-screen rendering, URL toolbar (back/forward/reload/URL entry), JS execution via DevTools protocol
+- **Plugin** (`CefPluginPanel`): CEF-based custom panel loaded from plugin HTML with injected `turm` JS bridge via cefQuery
 
 The `Panel` trait provides a common interface (`widget()`, `title()`, `panel_type()`, `grab_focus()`, `id()`). `PanelVariant` delegates to the inner type and provides `as_terminal()` / `as_webview()` / `as_plugin()` accessors.
 
@@ -229,9 +229,9 @@ The tab bar has two modes: **collapsed** (icon-only, default) and **expanded** (
 | `webview.fill`        | `id`, `selector`, `value`                  | Type text into an input element                   |
 | `webview.scroll`      | `id`, `selector?`, `x?`, `y?`              | Scroll to position or element                     |
 | `webview.page_info`   | `id`                                       | Page metadata (title, dimensions, element counts) |
-| `webview.devtools`    | `id`, `action?` (show/close/attach/detach) | Control WebKit DevTools inspector                 |
+| `webview.devtools`    | `id`                                       | CEF remote debugging (port-based)                 |
 
-`webview.execute_js`, `webview.get_content`, `webview.screenshot`, and all DOM query/interaction commands use async dispatch — the reply sender is captured by the WebKit callback and sent when execution completes. DOM commands use pre-built JS snippets from `webview::js` module.
+`webview.execute_js`, `webview.get_content`, `webview.screenshot`, and all DOM query/interaction commands use async dispatch — the reply sender is captured by the CEF DevTools protocol callback and sent when execution completes. DOM commands use pre-built JS snippets from `cef_panel::js` module.
 
 ## Plugin System
 
@@ -259,7 +259,7 @@ exec = "bash scripts/do-thing.sh"
 description = "Does a thing"
 ```
 
-**Architecture**: Plugin panels are WebViews (`PluginPanel`) loading local HTML files with an injected `turm` JS bridge. The bridge uses WebKitGTK's `register_script_message_handler_with_reply` so `turm.call()` returns a Promise that resolves with the dispatch result. Events are forwarded to the webview via `evaluate_javascript`.
+**Architecture**: Plugin panels are CEF browsers (`CefPluginPanel`) loading local HTML files with an injected `turm` JS bridge. The bridge uses CEF's `cefQuery` mechanism (via MessageRouter) so `turm.call()` returns a Promise that resolves with the dispatch result. Events are forwarded to the webview via `Frame::execute_java_script`.
 
 **JS Bridge API** (injected into plugin webviews):
 ```javascript
@@ -271,7 +271,7 @@ window.turm = {
 };
 ```
 
-**Theme CSS variables** are injected via `UserStyleSheet`: `--turm-bg`, `--turm-fg`, `--turm-surface0/1/2`, `--turm-overlay0`, `--turm-text`, `--turm-subtext0/1`, `--turm-accent`, `--turm-red`.
+**Theme CSS variables** are injected via JS on page load: `--turm-bg`, `--turm-fg`, `--turm-surface0/1/2`, `--turm-overlay0`, `--turm-text`, `--turm-subtext0/1`, `--turm-accent`, `--turm-red`.
 
 **Plugin commands** run shell scripts in a thread with `TURM_SOCKET` and `TURM_PLUGIN_DIR` env vars. Params are piped as JSON to stdin, stdout is parsed as JSON for the response.
 
@@ -294,7 +294,8 @@ turmctl plugin run my-plugin.do-thing --params '{"key": "value"}'
 ### Arch Linux
 
 ```bash
-sudo pacman -S gtk4 vte4 webkitgtk-6.0
+sudo pacman -S gtk4 vte4
+# CEF binaries are auto-downloaded during cargo build via cef-rs
 ```
 
 ### macOS

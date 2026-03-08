@@ -62,7 +62,7 @@ Single programmable interface for both human CLI and AI agents.
 
 Embed browser as a panel type alongside terminals.
 
-- [x] **WebKitGTK panel**: `WebViewPanel` as Panel impl via `webkit6` crate (GTK4-native)
+- [x] **Browser panel**: `CefBrowserPanel` via CEF/Chromium (migrated from WebKitGTK due to upstream crash bugs)
 - [x] **PanelVariant enum**: refactored split tree, tab manager, and socket dispatch from `Rc<TerminalPanel>` to `Rc<PanelVariant>`
 - [x] **Socket API**: `webview.open`, `webview.navigate`, `webview.back/forward/reload`, `webview.execute_js`, `webview.get_content`
 - [x] **Async dispatch**: `webview.execute_js` and `webview.get_content` reply asynchronously from WebKit callbacks

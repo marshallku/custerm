@@ -1,6 +1,6 @@
-use crate::plugin_panel::PluginPanel;
+use crate::cef_panel::CefBrowserPanel;
+use crate::cef_plugin_panel::CefPluginPanel;
 use crate::terminal::TerminalPanel;
-use crate::webview::WebViewPanel;
 
 pub trait Panel {
     fn widget(&self) -> &gtk4::Widget;
@@ -12,8 +12,8 @@ pub trait Panel {
 
 pub enum PanelVariant {
     Terminal(TerminalPanel),
-    WebView(WebViewPanel),
-    Plugin(PluginPanel),
+    WebView(CefBrowserPanel),
+    Plugin(CefPluginPanel),
 }
 
 impl Panel for PanelVariant {
@@ -66,7 +66,7 @@ impl PanelVariant {
         }
     }
 
-    pub fn as_webview(&self) -> Option<&WebViewPanel> {
+    pub fn as_webview(&self) -> Option<&CefBrowserPanel> {
         match self {
             PanelVariant::WebView(p) => Some(p),
             _ => None,

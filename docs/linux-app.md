@@ -177,6 +177,39 @@ gdbus call --session -d com.marshall.turm -o /com/marshall/turm -m com.marshall.
 gdbus call --session -d com.marshall.turm -o /com/marshall/turm -m com.marshall.turm.ClearBackground
 ```
 
+## WebView (`webview.rs`)
+
+Embedded browser panels using WebKitGTK 6.0.
+
+### WebViewPanel
+
+- URL toolbar with back/forward/reload/URL entry/DevTools buttons
+- `HardwareAccelerationPolicy::Never` — avoids GPU-related crashes
+- `NetworkProxyMode::NoProxy` on default session — fixes localhost connectivity
+- DevTools via WebKit Inspector (`inspector.show()`)
+- Crash recovery: `connect_web_process_terminated` auto-reloads after 500ms delay
+
+### Known Issues
+
+WebKitGTK 2.50.x crashes (SIGABRT) on complex Vite/React dev server pages. This is an upstream bug — see `docs/troubleshooting.md` for details and workarounds.
+
+### AI Agent DOM Commands
+
+Pre-built JS snippets in `webview::js` module for structured DOM inspection:
+- `query_selector` / `query_selector_all` — element info + bounding rect
+- `get_styles` — computed CSS properties
+- `click` / `fill` / `scroll` — DOM interactions
+- `page_info` — title, URL, dimensions, form/link/image counts
+
+## Plugin Panel (`plugin_panel.rs`)
+
+WebView-based panels for plugins. Key differences from WebViewPanel:
+- No URL toolbar (full-bleed webview)
+- `allow_file_access_from_file_urls(true)` for local asset loading
+- JS bridge via `UserContentManager.register_script_message_handler_with_reply("turm")`
+- Theme CSS injected as `UserStyleSheet` with CSS variables (`--turm-bg`, etc.)
+- Events forwarded from EventBus to webview via `evaluate_javascript`
+
 ## Installation
 
 ```bash

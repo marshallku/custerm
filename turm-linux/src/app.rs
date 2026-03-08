@@ -18,6 +18,9 @@ pub fn run() {
     });
 
     app.connect_activate(|app| {
+        // Start CEF message pump integration with GTK main loop
+        crate::cef_init::start_message_pump();
+
         let config = turm_core::config::TurmConfig::load().unwrap_or_default();
         let window = TurmWindow::new(app, &config);
         window.present();

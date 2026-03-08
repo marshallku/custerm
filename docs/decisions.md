@@ -89,3 +89,31 @@ Using the latest Rust edition. No compatibility concerns since the project is ne
 **Decision:** Tab bar position (`top`, `bottom`, `left`, `right`) is configurable via `[tabs] position` in config. Uses `gtk4::Notebook::set_tab_pos()`. Hot-reloads on config change.
 
 **Rationale:** Vertical tabs (left/right) make better use of widescreen displays and are preferred by some users.
+
+## 12. CEF (Chromium) for WebView Panels
+
+**Decision:** Use CEF (Chromium Embedded Framework) via `cef-rs` crate for embedded browser panels.
+
+**Previous approach:** WebKitGTK 6.0 — abandoned due to an upstream WebKitGTK 2.50.x bug where complex Vite/React dev server pages crash the WebKitWebProcess (SIGABRT in JSC). Confirmed reproducible in MiniBrowser.
+
+**Architecture:**
+- **Off-Screen Rendering (OSR):** CEF renders to BGRA pixel buffer → `gdk4::MemoryTexture` → `gtk4::Picture`. Required on Wayland (no X11 window reparenting available).
+- **External message pump:** `cef::do_message_loop_work()` called every 10ms from GTK4's main loop via `glib::timeout_add_local`.
+- **Multi-process:** CEF spawns renderer/GPU sub-processes by re-launching the same binary with `--type=renderer`. Detected and handled at the top of `main()`.
+- **JS execution:** DevTools protocol (`Runtime.evaluate` via `BrowserHost::send_dev_tools_message`) for results, `Frame::execute_java_script` for fire-and-forget.
+- **Input forwarding:** GTK4 EventControllers → CEF's `send_key_event`, `send_mouse_click_event`, `send_mouse_move_event`, `send_mouse_wheel_event`.
+- **Plugin JS bridge:** Uses CEF's `cefQuery` mechanism instead of WebKit's `register_script_message_handler_with_reply`.
+
+**Tradeoff:** More complex embedding code (OSR, input forwarding, size polling) but far more robust rendering — no crashes on complex web pages.
+
+## 13. Socket Auto-Discovery in turmctl
+
+**Problem:** `TURM_SOCKET` env var often points to a dead turm process socket, making turmctl fail.
+
+**Decision:** turmctl auto-discovers sockets by scanning `/tmp/turm-*.sock`, sorting by modification time (newest first), and trying to connect. Falls back to `/tmp/turm.sock` if none found.
+
+**Priority order:**
+1. `--socket` CLI flag (explicit)
+2. `TURM_SOCKET` env var (if connectable)
+3. Auto-discovered newest live socket from `/tmp/turm-*.sock`
+4. `/tmp/turm.sock` (fallback)

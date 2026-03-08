@@ -1,17 +1,25 @@
 mod app;
+mod cef_init;
+mod cef_panel;
+mod cef_plugin_panel;
 mod dbus;
 mod panel;
-mod plugin_panel;
 mod search;
 
 mod socket;
 mod split;
 mod tabs;
 mod terminal;
-mod webview;
 mod window;
 
 fn main() {
+    // CEF sub-process check — must happen before anything else.
+    // When CEF spawns renderer/GPU processes, it re-launches this binary
+    // with --type=renderer etc. We detect that and handle it immediately.
+    if cef_init::handle_subprocess() {
+        return;
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -37,5 +45,11 @@ fn main() {
         return;
     }
 
+    // Initialize CEF for the main browser process
+    let _cef = cef_init::initialize();
+
     app::run();
+
+    // Shutdown CEF after GTK exits
+    cef_init::shutdown();
 }

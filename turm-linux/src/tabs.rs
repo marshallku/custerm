@@ -10,16 +10,15 @@ use turm_core::config::TurmConfig;
 use turm_core::protocol::Event;
 
 use vte4::prelude::*;
-use webkit6::prelude::*;
 
 use turm_core::plugin::LoadedPlugin;
 
+use crate::cef_panel::CefBrowserPanel;
+use crate::cef_plugin_panel::CefPluginPanel;
 use crate::panel::{Panel, PanelVariant};
-use crate::plugin_panel::PluginPanel;
 use crate::socket::{EventBus, SocketCommand, broadcast};
 use crate::split::{CloseResult, TabContent};
 use crate::terminal::TerminalPanel;
-use crate::webview::WebViewPanel;
 
 pub struct TabManager {
     pub notebook: gtk4::Notebook,
@@ -767,42 +766,75 @@ impl TabManager {
                 });
 
             // Shell integration: precmd (prompt ready)
-            let bus = self.event_bus.clone();
-            let panel_id = term.id.clone();
-            term.terminal.connect_shell_precmd(move |_term| {
-                broadcast(
-                    &bus,
-                    &Event::new("terminal.shell_precmd", json!({ "panel_id": panel_id })),
-                );
-            });
+            // These signals may not exist in all VTE versions — connect safely
+            {
+                use gtk4::glib::object::ObjectExt;
+                let bus = self.event_bus.clone();
+                let panel_id = term.id.clone();
+                let term_obj = term.terminal.clone();
+                if gtk4::glib::subclass::signal::SignalId::lookup("shell-precmd", term_obj.type_()).is_some()
+                {
+                    term.terminal.connect_shell_precmd(move |_term| {
+                        broadcast(
+                            &bus,
+                            &Event::new(
+                                "terminal.shell_precmd",
+                                json!({ "panel_id": panel_id }),
+                            ),
+                        );
+                    });
+                }
+            }
 
             // Shell integration: preexec (command about to run)
-            let bus = self.event_bus.clone();
-            let panel_id = term.id.clone();
-            term.terminal.connect_shell_preexec(move |_term| {
-                broadcast(
-                    &bus,
-                    &Event::new("terminal.shell_preexec", json!({ "panel_id": panel_id })),
-                );
-            });
+            {
+                use gtk4::glib::object::ObjectExt;
+                let bus = self.event_bus.clone();
+                let panel_id = term.id.clone();
+                let term_obj = term.terminal.clone();
+                if gtk4::glib::subclass::signal::SignalId::lookup("shell-preexec", term_obj.type_()).is_some()
+                {
+                    term.terminal.connect_shell_preexec(move |_term| {
+                        broadcast(
+                            &bus,
+                            &Event::new(
+                                "terminal.shell_preexec",
+                                json!({ "panel_id": panel_id }),
+                            ),
+                        );
+                    });
+                }
+            }
 
             // OSC notifications (OSC 9/777)
-            let bus = self.event_bus.clone();
-            let panel_id = term.id.clone();
-            term.terminal
-                .connect_notification_received(move |_term, summary, body| {
-                    broadcast(
-                        &bus,
-                        &Event::new(
-                            "terminal.notification",
-                            json!({
-                                "panel_id": panel_id,
-                                "summary": summary,
-                                "body": body,
-                            }),
-                        ),
+            {
+                use gtk4::glib::object::ObjectExt;
+                let term_obj = term.terminal.clone();
+                if gtk4::glib::subclass::signal::SignalId::lookup(
+                    "notification-received",
+                    term_obj.type_(),
+                )
+                .is_some()
+                {
+                    let bus = self.event_bus.clone();
+                    let panel_id = term.id.clone();
+                    term.terminal.connect_notification_received(
+                        move |_term, summary, body| {
+                            broadcast(
+                                &bus,
+                                &Event::new(
+                                    "terminal.notification",
+                                    json!({
+                                        "panel_id": panel_id,
+                                        "summary": summary,
+                                        "body": body,
+                                    }),
+                                ),
+                            );
+                        },
                     );
-                });
+                }
+            }
         }
 
         self.track_focus(&panel);
@@ -813,61 +845,8 @@ impl TabManager {
         let config = self.config.borrow();
         let theme = turm_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
         drop(config);
-        let webview_panel = WebViewPanel::new(url, &theme);
-        let panel = Rc::new(PanelVariant::WebView(webview_panel));
-
-        // Hook webview events
-        if let Some(wv) = panel.as_webview() {
-            let bus = self.event_bus.clone();
-            let panel_id = wv.id.clone();
-            wv.webview.connect_load_changed(move |_wv, event| {
-                if event == webkit6::LoadEvent::Finished {
-                    broadcast(
-                        &bus,
-                        &Event::new(
-                            "webview.loaded",
-                            json!({
-                                "panel_id": panel_id,
-                            }),
-                        ),
-                    );
-                }
-            });
-
-            let bus = self.event_bus.clone();
-            let panel_id = wv.id.clone();
-            wv.webview
-                .connect_notify_local(Some("title"), move |webview, _| {
-                    let title = webview.title().map(|t| t.to_string()).unwrap_or_default();
-                    broadcast(
-                        &bus,
-                        &Event::new(
-                            "webview.title_changed",
-                            json!({
-                                "panel_id": panel_id,
-                                "title": title,
-                            }),
-                        ),
-                    );
-                });
-
-            let bus = self.event_bus.clone();
-            let panel_id = wv.id.clone();
-            wv.webview
-                .connect_notify_local(Some("uri"), move |webview, _| {
-                    let url = webview.uri().map(|u| u.to_string()).unwrap_or_default();
-                    broadcast(
-                        &bus,
-                        &Event::new(
-                            "webview.navigated",
-                            json!({
-                                "panel_id": panel_id,
-                                "url": url,
-                            }),
-                        ),
-                    );
-                });
-        }
+        let cef_panel = CefBrowserPanel::new(url, &theme);
+        let panel = Rc::new(PanelVariant::WebView(cef_panel));
 
         self.track_focus(&panel);
         panel
@@ -888,7 +867,7 @@ impl TabManager {
         let theme = turm_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
         drop(config);
 
-        let plugin_panel = PluginPanel::new(
+        let plugin_panel = CefPluginPanel::new(
             plugin,
             panel_def,
             &theme,
@@ -927,10 +906,10 @@ impl TabManager {
                 term.terminal.add_controller(controller);
             }
             PanelVariant::WebView(wv) => {
-                wv.webview.add_controller(controller);
+                wv.container.add_controller(controller);
             }
             PanelVariant::Plugin(pp) => {
-                pp.webview.add_controller(controller);
+                pp.container.add_controller(controller);
             }
         }
     }
@@ -1104,19 +1083,26 @@ impl TabManager {
                         }
                     });
             }
-            PanelVariant::WebView(wv) => {
+            PanelVariant::WebView(_) => {
+                // CEF browser panels track title changes internally via the display handler.
+                // Poll periodically to update the tab label.
                 let label_clone = label.clone();
                 let custom = self.custom_titles.clone();
                 let pid = panel_id_for_title.clone();
-                wv.webview
-                    .connect_notify_local(Some("title"), move |webview, _| {
-                        if custom.borrow().contains_key(&pid) {
-                            return;
-                        }
-                        if let Some(title) = webview.title() {
-                            label_clone.set_text(&title);
-                        }
-                    });
+                let panel_weak = Rc::downgrade(panel);
+                glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                    let Some(panel) = panel_weak.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    if custom.borrow().contains_key(&pid) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let title = panel.title();
+                    if !title.is_empty() && title != label_clone.text().as_str() {
+                        label_clone.set_text(&title);
+                    }
+                    glib::ControlFlow::Continue
+                });
             }
             PanelVariant::Plugin(_) => {
                 // Plugin panels have a static title set at creation
