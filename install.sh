@@ -53,6 +53,7 @@ check_deps() {
     pkg-config --exists gtk4 2>/dev/null || missing+=("gtk4")
     pkg-config --exists vte-2.91-gtk4 2>/dev/null || missing+=("vte4 (libvte-2.91-gtk4)")
     pkg-config --exists webkitgtk-6.0 2>/dev/null || missing+=("webkitgtk-6.0")
+    pkg-config --exists gstreamer-1.0 2>/dev/null || missing+=("gst-plugins-good gst-plugins-bad")
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "Warning: missing system dependencies: ${missing[*]}"
         echo "turm requires these libraries to run. Install them via your package manager."

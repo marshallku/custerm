@@ -294,8 +294,10 @@ turmctl plugin run my-plugin.do-thing --params '{"key": "value"}'
 ### Arch Linux
 
 ```bash
-sudo pacman -S gtk4 vte4 webkitgtk-6.0
+sudo pacman -S gtk4 vte4 webkitgtk-6.0 gst-plugins-good gst-plugins-bad
 ```
+
+- `gst-plugins-good` / `gst-plugins-bad`: Required by WebKitGTK for media playback. Without these, the WebKit web process crashes on many sites.
 
 ### macOS
 

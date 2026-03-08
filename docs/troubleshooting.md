@@ -93,6 +93,17 @@ Multiple possible causes:
 **Cause:** `GtkOverlay` sizes based on its child widget (`bg_picture`). When no background image is set, `bg_picture` is hidden and has zero natural size, collapsing the entire overlay.
 **Fix:** Call `overlay.set_measure_overlay(&terminal, true)` so the terminal overlay widget contributes to size measurement even when `bg_picture` is hidden. Also set `overlay.set_hexpand(true)` and `overlay.set_vexpand(true)`.
 
+### WebKit web process crashes on many sites
+
+```
+GStreamer element autoaudiosink not found. Please install it
+GLib-GObject-CRITICAL: invalid (NULL) pointer instance
+WebProcess CRASHED
+```
+
+**Cause:** Missing GStreamer plugins. WebKitGTK requires GStreamer for media handling, and crashes when the plugins are absent — even on pages that don't play media.
+**Fix:** `sudo pacman -S gst-plugins-good gst-plugins-bad`
+
 ### D-Bus: `register_object` API mismatch
 
 **Cause:** gio 0.20 uses builder pattern, not positional args.
