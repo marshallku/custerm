@@ -48,7 +48,16 @@ pub struct WebViewPanel {
 
 impl WebViewPanel {
     pub fn new(url: &str, theme: &turm_core::theme::Theme) -> Self {
-        let webview = webkit6::WebView::new();
+        // Dedicated web context for process isolation + sandbox paths
+        let web_context = webkit6::WebContext::new();
+        web_context.add_path_to_sandbox("/tmp", false);
+
+        let network_session = webkit6::NetworkSession::new_ephemeral();
+
+        let webview = webkit6::WebView::builder()
+            .web_context(&web_context)
+            .network_session(&network_session)
+            .build();
 
         // Sane defaults
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
@@ -56,7 +65,7 @@ impl WebViewPanel {
             settings.set_allow_file_access_from_file_urls(false);
             settings.set_allow_universal_access_from_file_urls(false);
             settings.set_enable_developer_extras(true);
-            settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Never);
+            settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Always);
         }
 
         webview.set_hexpand(true);

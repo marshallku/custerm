@@ -766,43 +766,36 @@ impl TabManager {
                     );
                 });
 
-            // Shell integration: precmd (prompt ready)
-            let bus = self.event_bus.clone();
-            let panel_id = term.id.clone();
-            term.terminal.connect_shell_precmd(move |_term| {
-                broadcast(
-                    &bus,
-                    &Event::new("terminal.shell_precmd", json!({ "panel_id": panel_id })),
+            // Shell integration via termprop-changed (VTE ≥0.78)
+            // VTE replaced shell-precmd/preexec signals with termprops.
+            // Use detailed signal connections to subscribe to specific termprops.
+            {
+                let bus = self.event_bus.clone();
+                let panel_id = term.id.clone();
+                term.terminal.connect_closure(
+                    "termprop-changed::vte.shell.precmd",
+                    false,
+                    gtk4::glib::closure_local!(move |_term: vte4::Terminal, _name: &str| {
+                        broadcast(
+                            &bus,
+                            &Event::new("terminal.shell_precmd", json!({ "panel_id": panel_id })),
+                        );
+                    }),
                 );
-            });
 
-            // Shell integration: preexec (command about to run)
-            let bus = self.event_bus.clone();
-            let panel_id = term.id.clone();
-            term.terminal.connect_shell_preexec(move |_term| {
-                broadcast(
-                    &bus,
-                    &Event::new("terminal.shell_preexec", json!({ "panel_id": panel_id })),
+                let bus = self.event_bus.clone();
+                let panel_id = term.id.clone();
+                term.terminal.connect_closure(
+                    "termprop-changed::vte.shell.preexec",
+                    false,
+                    gtk4::glib::closure_local!(move |_term: vte4::Terminal, _name: &str| {
+                        broadcast(
+                            &bus,
+                            &Event::new("terminal.shell_preexec", json!({ "panel_id": panel_id })),
+                        );
+                    }),
                 );
-            });
-
-            // OSC notifications (OSC 9/777)
-            let bus = self.event_bus.clone();
-            let panel_id = term.id.clone();
-            term.terminal
-                .connect_notification_received(move |_term, summary, body| {
-                    broadcast(
-                        &bus,
-                        &Event::new(
-                            "terminal.notification",
-                            json!({
-                                "panel_id": panel_id,
-                                "summary": summary,
-                                "body": body,
-                            }),
-                        ),
-                    );
-                });
+            }
         }
 
         self.track_focus(&panel);

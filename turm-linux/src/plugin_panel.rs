@@ -150,7 +150,13 @@ impl PluginPanel {
         );
         content_manager.add_script(&script);
 
+        // Dedicated web context for process isolation + sandbox paths
+        let web_context = webkit6::WebContext::new();
+        web_context.add_path_to_sandbox(&plugin.dir, true);
+        web_context.add_path_to_sandbox("/tmp", false);
+
         let webview = webkit6::WebView::builder()
+            .web_context(&web_context)
             .user_content_manager(&content_manager)
             .build();
 
@@ -160,7 +166,7 @@ impl PluginPanel {
             settings.set_allow_file_access_from_file_urls(true);
             settings.set_allow_universal_access_from_file_urls(false);
             settings.set_enable_developer_extras(true);
-            settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Never);
+            settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Always);
         }
 
         webview.set_hexpand(true);
