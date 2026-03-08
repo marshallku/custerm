@@ -160,6 +160,7 @@ impl PluginPanel {
             settings.set_allow_file_access_from_file_urls(true);
             settings.set_allow_universal_access_from_file_urls(false);
             settings.set_enable_developer_extras(true);
+            settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Never);
         }
 
         webview.set_hexpand(true);

@@ -56,6 +56,7 @@ impl WebViewPanel {
             settings.set_allow_file_access_from_file_urls(false);
             settings.set_allow_universal_access_from_file_urls(false);
             settings.set_enable_developer_extras(true);
+            settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Never);
         }
 
         webview.set_hexpand(true);
@@ -178,7 +179,53 @@ impl WebViewPanel {
             let entry = url_entry.clone();
             webview.connect_notify_local(Some("uri"), move |wv, _| {
                 if let Some(uri) = wv.uri() {
-                    entry.set_text(&uri);
+                    let uri_str = uri.to_string();
+                    if !uri_str.is_empty() && uri_str != "about:blank" {
+                        entry.set_text(&uri_str);
+                    }
+                }
+            });
+        }
+
+        // Handle load failures — preserve URL in bar
+        {
+            let entry = url_entry.clone();
+            let reload = reload_btn.clone();
+            webview.connect_load_failed(move |_wv, _event, uri, error| {
+                let uri = uri.to_string();
+                eprintln!("[webview] Load failed for {uri}: {error}");
+                entry.set_text(&uri);
+                reload.set_icon_name("view-refresh-symbolic");
+                reload.set_tooltip_text(Some("Reload"));
+                false // let WebKit show its error page
+            });
+        }
+
+        // Recover from web process crashes — reload the page
+        {
+            webview.connect_web_process_terminated(move |wv, reason| {
+                let reason_str = match reason {
+                    webkit6::WebProcessTerminationReason::Crashed => "crashed",
+                    webkit6::WebProcessTerminationReason::ExceededMemoryLimit => {
+                        "exceeded memory limit"
+                    }
+                    _ => "unknown",
+                };
+                eprintln!("[webview] Web process {reason_str}, reloading...");
+
+                // WebKit requires a fresh load after crash — try_close + reload won't work
+                // We need to reload the URI that was being displayed
+                if let Some(uri) = wv.uri() {
+                    let uri = uri.to_string();
+                    if !uri.is_empty() && uri != "about:blank" {
+                        gtk4::glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(500),
+                            {
+                                let wv = wv.clone();
+                                move || wv.load_uri(&uri)
+                            },
+                        );
+                    }
                 }
             });
         }
