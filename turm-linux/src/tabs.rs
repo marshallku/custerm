@@ -12,8 +12,11 @@ use turm_core::protocol::Event;
 use vte4::prelude::*;
 use webkit6::prelude::*;
 
+use turm_core::plugin::LoadedPlugin;
+
 use crate::panel::{Panel, PanelVariant};
-use crate::socket::{EventBus, broadcast};
+use crate::plugin_panel::PluginPanel;
+use crate::socket::{EventBus, SocketCommand, broadcast};
 use crate::split::{CloseResult, TabContent};
 use crate::terminal::TerminalPanel;
 use crate::webview::WebViewPanel;
@@ -31,6 +34,10 @@ pub struct TabManager {
     tab_bar_collapsed: Rc<RefCell<bool>>,
     /// Whether the user has explicitly toggled the tab bar state
     user_toggled: Rc<RefCell<bool>>,
+    /// Loaded plugins
+    plugins: Rc<Vec<LoadedPlugin>>,
+    /// Sender to dispatch socket commands (for plugin JS bridge)
+    dispatch_tx: std::sync::mpsc::Sender<SocketCommand>,
 }
 
 impl TabManager {
@@ -38,6 +45,8 @@ impl TabManager {
         config: &TurmConfig,
         window: &gtk4::ApplicationWindow,
         event_bus: EventBus,
+        plugins: Vec<LoadedPlugin>,
+        dispatch_tx: std::sync::mpsc::Sender<SocketCommand>,
     ) -> Rc<Self> {
         let notebook = gtk4::Notebook::new();
         notebook.set_scrollable(true);
@@ -74,6 +83,8 @@ impl TabManager {
             custom_titles: Rc::new(RefCell::new(std::collections::HashMap::new())),
             tab_bar_collapsed: Rc::new(RefCell::new(config.tabs.collapsed)),
             user_toggled: Rc::new(RefCell::new(false)),
+            plugins: Rc::new(plugins),
+            dispatch_tx,
         });
 
         // Apply initial collapsed state
@@ -190,6 +201,65 @@ impl TabManager {
         );
 
         panel_id
+    }
+
+    pub fn add_plugin_tab(
+        self: &Rc<Self>,
+        plugin: &LoadedPlugin,
+        panel_name: &str,
+    ) -> Option<String> {
+        let panel_def = plugin
+            .manifest
+            .panels
+            .iter()
+            .find(|p| p.name == panel_name)?;
+
+        let config = self.config.borrow();
+        let theme = turm_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
+        drop(config);
+
+        let plugin_panel = PluginPanel::new(
+            plugin,
+            panel_def,
+            &theme,
+            self.dispatch_tx.clone(),
+            self.event_bus.clone(),
+        );
+        let panel_id = plugin_panel.id.clone();
+        let panel = Rc::new(PanelVariant::Plugin(plugin_panel));
+
+        let tab_content = TabContent::new(panel.clone());
+        let tab_label = self.make_tab_label(&panel, &tab_content.container);
+
+        self.notebook
+            .append_page(&tab_content.container, Some(&tab_label));
+        self.notebook
+            .set_tab_reorderable(&tab_content.container, true);
+        self.tabs.borrow_mut().push(tab_content);
+
+        let page_num = self.notebook.n_pages() - 1;
+        self.notebook.set_current_page(Some(page_num));
+        *self.focused.borrow_mut() = Some(panel.clone());
+        panel.grab_focus();
+
+        broadcast(
+            &self.event_bus,
+            &Event::new(
+                "tab.created",
+                json!({
+                    "panel_id": panel_id,
+                    "panel_type": "plugin",
+                    "plugin": plugin.manifest.plugin.name,
+                    "tab": page_num,
+                }),
+            ),
+        );
+
+        Some(panel_id)
+    }
+
+    pub fn plugins(&self) -> &[LoadedPlugin] {
+        &self.plugins
     }
 
     pub fn split_focused(
@@ -524,6 +594,10 @@ impl TabManager {
                         PanelVariant::WebView(wv) => {
                             info["url"] = json!(wv.current_url());
                         }
+                        PanelVariant::Plugin(pp) => {
+                            info["plugin"] = json!(pp.plugin_name);
+                            info["panel_name"] = json!(pp.panel_name);
+                        }
                     }
                     return Some(info);
                 }
@@ -806,6 +880,9 @@ impl TabManager {
             PanelVariant::WebView(wv) => {
                 wv.webview.add_controller(controller);
             }
+            PanelVariant::Plugin(pp) => {
+                pp.webview.add_controller(controller);
+            }
         }
     }
 
@@ -913,11 +990,24 @@ impl TabManager {
         let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         let vertical = self.is_vertical_tabs();
         let (icon_name, default_title) = match &**panel {
-            PanelVariant::Terminal(_) => ("utilities-terminal-symbolic", "Terminal"),
-            PanelVariant::WebView(_) => ("web-browser-symbolic", "WebView"),
+            PanelVariant::Terminal(_) => ("utilities-terminal-symbolic".to_string(), "Terminal"),
+            PanelVariant::WebView(_) => ("web-browser-symbolic".to_string(), "WebView"),
+            PanelVariant::Plugin(pp) => {
+                let icon = pp.plugin_name.as_str();
+                // Look up icon from plugin manifest if available
+                let plugins = &self.plugins;
+                let icon_name = plugins
+                    .iter()
+                    .find(|p| p.manifest.plugin.name == pp.plugin_name)
+                    .and_then(|p| p.manifest.panels.iter().find(|pd| pd.name == pp.panel_name))
+                    .and_then(|pd| pd.icon.clone())
+                    .unwrap_or_else(|| "application-x-addon-symbolic".to_string());
+                let _ = icon;
+                (icon_name, "Plugin")
+            }
         };
 
-        let icon = gtk4::Image::from_icon_name(icon_name);
+        let icon = gtk4::Image::from_icon_name(&icon_name);
         icon.add_css_class("turm-tab-icon");
 
         let label = gtk4::Label::new(Some(default_title));
@@ -978,6 +1068,9 @@ impl TabManager {
                             label_clone.set_text(&title);
                         }
                     });
+            }
+            PanelVariant::Plugin(_) => {
+                // Plugin panels have a static title set at creation
             }
         }
 

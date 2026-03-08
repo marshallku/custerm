@@ -2116,6 +2116,8 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "gtk4",
+ "javascriptcore6",
+ "serde",
  "serde_json",
  "turm-core",
  "uuid",

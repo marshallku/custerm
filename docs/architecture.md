@@ -14,6 +14,7 @@ turm/
 │       ├── lib.rs           # Module declarations
 │       ├── config.rs        # TOML config loading/defaults
 │       ├── background.rs    # Background image cache & rotation
+│       ├── plugin.rs         # Plugin manifest types + discovery
 │       ├── protocol.rs      # cmux V2 JSON protocol types
 │       ├── state.rs         # AppState, Workspace model
 │       ├── pty.rs           # PTY session (portable-pty)
@@ -29,6 +30,7 @@ turm/
 │   │   ├── search.rs        # In-terminal search bar (Ctrl+Shift+F, VTE regex search)
 │   │   ├── panel.rs         # Panel trait + PanelVariant enum
 │   │   ├── webview.rs       # WebView panel (WebKitGTK 6.0)
+│   │   ├── plugin_panel.rs  # Plugin panel (WebView + JS bridge)
 │   │   ├── socket.rs        # Unix socket server + command dispatcher
 │   │   └── dbus.rs          # D-Bus service (com.marshall.turm)
 │   ├── turm.desktop      # Desktop entry for system integration
@@ -103,7 +105,7 @@ turmctl ──Unix socket──► socket server (per-client thread)
                           oneshot response ──► socket thread ──► client
 ```
 
-**Supported commands**: `system.ping`, `background.set`, `background.clear`, `background.set_tint`, `background.next`, `background.toggle`, `tab.new`, `tab.close`, `tab.list`, `tab.info`, `tab.rename`, `tabs.toggle_bar`, `split.horizontal`, `split.vertical`, `session.list`, `session.info`, `event.subscribe`, `terminal.read`, `terminal.state`, `terminal.exec`, `terminal.feed`, `terminal.history`, `terminal.context`, `agent.approve`, `theme.list`, `webview.open`, `webview.navigate`, `webview.back`, `webview.forward`, `webview.reload`, `webview.execute_js`, `webview.get_content`, `webview.screenshot`, `webview.query`, `webview.query_all`, `webview.get_styles`, `webview.click`, `webview.fill`, `webview.scroll`, `webview.page_info`, `webview.devtools`
+**Supported commands**: `system.ping`, `background.set`, `background.clear`, `background.set_tint`, `background.next`, `background.toggle`, `tab.new`, `tab.close`, `tab.list`, `tab.info`, `tab.rename`, `tabs.toggle_bar`, `split.horizontal`, `split.vertical`, `session.list`, `session.info`, `event.subscribe`, `terminal.read`, `terminal.state`, `terminal.exec`, `terminal.feed`, `terminal.history`, `terminal.context`, `agent.approve`, `theme.list`, `plugin.list`, `plugin.open`, `plugin.<name>.<cmd>`, `webview.open`, `webview.navigate`, `webview.back`, `webview.forward`, `webview.reload`, `webview.execute_js`, `webview.get_content`, `webview.screenshot`, `webview.query`, `webview.query_all`, `webview.get_styles`, `webview.click`, `webview.fill`, `webview.scroll`, `webview.page_info`, `webview.devtools`
 
 **Cleanup**: Socket file removed on window destroy.
 
@@ -193,7 +195,9 @@ turm supports multiple panel types via the `PanelVariant` enum:
 - **Terminal** (`TerminalPanel`): VTE4 terminal with shell, background images, search
 - **WebView** (`WebViewPanel`): WebKitGTK 6.0 browser panel with JS execution, URL toolbar (back/forward/reload/URL entry/DevTools toggle)
 
-The `Panel` trait provides a common interface (`widget()`, `title()`, `panel_type()`, `grab_focus()`, `id()`). `PanelVariant` delegates to the inner type and provides `as_terminal()` / `as_webview()` accessors.
+- **Plugin** (`PluginPanel`): WebView-based custom panel loaded from plugin HTML with injected `turm` JS bridge
+
+The `Panel` trait provides a common interface (`widget()`, `title()`, `panel_type()`, `grab_focus()`, `id()`). `PanelVariant` delegates to the inner type and provides `as_terminal()` / `as_webview()` / `as_plugin()` accessors.
 
 ### Tab Bar Controls
 
@@ -228,6 +232,62 @@ The tab bar has two modes: **collapsed** (icon-only, default) and **expanded** (
 | `webview.devtools`    | `id`, `action?` (show/close/attach/detach) | Control WebKit DevTools inspector                 |
 
 `webview.execute_js`, `webview.get_content`, `webview.screenshot`, and all DOM query/interaction commands use async dispatch — the reply sender is captured by the WebKit callback and sent when execution completes. DOM commands use pre-built JS snippets from `webview::js` module.
+
+## Plugin System
+
+Plugins extend turm with custom panels (HTML/JS UIs) and commands (shell scripts).
+
+**Plugin directory**: `~/.config/turm/plugins/<plugin-name>/`
+
+**Manifest** (`plugin.toml`):
+```toml
+[plugin]
+name = "my-plugin"
+title = "My Plugin"
+version = "0.1.0"
+description = "Example plugin"
+
+[[panels]]
+name = "main"
+title = "My Panel"
+file = "index.html"
+icon = "applications-system-symbolic"
+
+[[commands]]
+name = "do-thing"
+exec = "bash scripts/do-thing.sh"
+description = "Does a thing"
+```
+
+**Architecture**: Plugin panels are WebViews (`PluginPanel`) loading local HTML files with an injected `turm` JS bridge. The bridge uses WebKitGTK's `register_script_message_handler_with_reply` so `turm.call()` returns a Promise that resolves with the dispatch result. Events are forwarded to the webview via `evaluate_javascript`.
+
+**JS Bridge API** (injected into plugin webviews):
+```javascript
+window.turm = {
+    panel: { id, name, plugin },
+    async call(method, params = {}) { ... },  // Call any turm socket method
+    on(type, callback) { ... },               // Listen for events
+    off(type, callback) { ... },
+};
+```
+
+**Theme CSS variables** are injected via `UserStyleSheet`: `--turm-bg`, `--turm-fg`, `--turm-surface0/1/2`, `--turm-overlay0`, `--turm-text`, `--turm-subtext0/1`, `--turm-accent`, `--turm-red`.
+
+**Plugin commands** run shell scripts in a thread with `TURM_SOCKET` and `TURM_PLUGIN_DIR` env vars. Params are piped as JSON to stdin, stdout is parsed as JSON for the response.
+
+| Command | Params | Behavior |
+|---------|--------|----------|
+| `plugin.list` | — | List installed plugins with panels/commands |
+| `plugin.open` | `plugin`, `panel?` (default: "main") | Open a plugin panel in a new tab |
+| `plugin.<name>.<cmd>` | arbitrary JSON | Run a plugin shell command |
+
+**CLI usage**:
+```bash
+turmctl plugin list
+turmctl plugin open my-plugin
+turmctl plugin open my-plugin --panel settings
+turmctl plugin run my-plugin.do-thing --params '{"key": "value"}'
+```
 
 ## System Prerequisites
 

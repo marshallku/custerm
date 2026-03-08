@@ -149,7 +149,12 @@ pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<So
 
 /// Dispatch consumes the SocketCommand so async handlers (webview.execute_js) can
 /// capture the reply sender and respond from a callback.
-pub fn dispatch(cmd: SocketCommand, mgr: &Rc<TabManager>, window: &ApplicationWindow) {
+pub fn dispatch(
+    cmd: SocketCommand,
+    mgr: &Rc<TabManager>,
+    window: &ApplicationWindow,
+    socket_path: &str,
+) {
     let req = &cmd.request;
     match req.method.as_str() {
         "system.ping" => {
@@ -414,6 +419,44 @@ pub fn dispatch(cmd: SocketCommand, mgr: &Rc<TabManager>, window: &ApplicationWi
                 req.id.clone(),
                 json!({ "themes": themes, "current": current }),
             ));
+        }
+
+        "plugin.list" => {
+            let plugins: Vec<serde_json::Value> = mgr
+                .plugins()
+                .iter()
+                .map(|p| {
+                    let m = &p.manifest;
+                    json!({
+                        "name": m.plugin.name,
+                        "title": m.plugin.title,
+                        "version": m.plugin.version,
+                        "description": m.plugin.description,
+                        "panels": m.panels.iter().map(|pd| json!({
+                            "name": pd.name,
+                            "title": pd.title,
+                        })).collect::<Vec<_>>(),
+                        "commands": m.commands.iter().map(|cd| json!({
+                            "name": cd.name,
+                            "description": cd.description,
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            let _ = cmd.reply.send(Response::success(
+                req.id.clone(),
+                json!({ "plugins": plugins }),
+            ));
+        }
+
+        "plugin.open" => {
+            let resp = handle_plugin_open(req, mgr);
+            let _ = cmd.reply.send(resp);
+        }
+
+        _ if req.method.starts_with("plugin.") && req.method.matches('.').count() == 2 => {
+            // plugin.<name>.<command>
+            handle_plugin_command(cmd, mgr, &socket_path);
         }
 
         _ => {
@@ -1317,5 +1360,145 @@ fn handle_agent_approve(cmd: SocketCommand, window: &ApplicationWindow) {
             ),
         };
         let _ = cmd.reply.send(resp);
+    });
+}
+
+// -- Plugin command helpers --
+
+fn handle_plugin_open(req: &Request, mgr: &Rc<TabManager>) -> Response {
+    let plugin_name = match req.params.get("plugin").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return Response::error(req.id.clone(), "invalid_params", "Missing 'plugin' param"),
+    };
+    let panel_name = req
+        .params
+        .get("panel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main");
+
+    let plugin = match mgr
+        .plugins()
+        .iter()
+        .find(|p| p.manifest.plugin.name == plugin_name)
+    {
+        Some(p) => p.clone(),
+        None => {
+            return Response::error(
+                req.id.clone(),
+                "not_found",
+                &format!("Plugin not found: {plugin_name}"),
+            );
+        }
+    };
+
+    match mgr.add_plugin_tab(&plugin, panel_name) {
+        Some(panel_id) => Response::success(req.id.clone(), json!({ "panel_id": panel_id })),
+        None => Response::error(
+            req.id.clone(),
+            "not_found",
+            &format!("Panel '{panel_name}' not found in plugin '{plugin_name}'"),
+        ),
+    }
+}
+
+fn handle_plugin_command(cmd: SocketCommand, mgr: &Rc<TabManager>, socket_path: &str) {
+    let req = &cmd.request;
+    let parts: Vec<&str> = req.method.splitn(3, '.').collect();
+    // parts = ["plugin", "<name>", "<command>"]
+    let plugin_name = parts[1];
+    let cmd_name = parts[2];
+
+    let plugin = match mgr
+        .plugins()
+        .iter()
+        .find(|p| p.manifest.plugin.name == plugin_name)
+    {
+        Some(p) => p.clone(),
+        None => {
+            let _ = cmd.reply.send(Response::error(
+                req.id.clone(),
+                "not_found",
+                &format!("Plugin not found: {plugin_name}"),
+            ));
+            return;
+        }
+    };
+
+    let cmd_def = match plugin.manifest.commands.iter().find(|c| c.name == cmd_name) {
+        Some(c) => c.clone(),
+        None => {
+            let _ = cmd.reply.send(Response::error(
+                req.id.clone(),
+                "not_found",
+                &format!("Command '{cmd_name}' not found in plugin '{plugin_name}'"),
+            ));
+            return;
+        }
+    };
+
+    let req_id = req.id.clone();
+    let params = req.params.clone();
+    let dir = plugin.dir.clone();
+    let socket = socket_path.to_string();
+    let reply = cmd.reply;
+
+    std::thread::spawn(move || {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd_def.exec)
+            .current_dir(&dir)
+            .env("TURM_SOCKET", &socket)
+            .env("TURM_PLUGIN_DIR", dir.to_string_lossy().as_ref())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        match child {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(params.to_string().as_bytes());
+                }
+                match child.wait_with_output() {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                        if output.status.success() {
+                            // Try to parse stdout as JSON; fall back to string
+                            let result = serde_json::from_str::<serde_json::Value>(&stdout)
+                                .unwrap_or_else(|_| json!({ "output": stdout.trim() }));
+                            let _ = reply.send(Response::success(req_id, result));
+                        } else {
+                            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                            let _ = reply.send(Response::error(
+                                req_id,
+                                "command_failed",
+                                &format!(
+                                    "Exit code {}: {}",
+                                    output.status.code().unwrap_or(-1),
+                                    stderr.trim()
+                                ),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Response::error(
+                            req_id,
+                            "command_failed",
+                            &format!("Failed to wait for command: {e}"),
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = reply.send(Response::error(
+                    req_id,
+                    "command_failed",
+                    &format!("Failed to spawn command: {e}"),
+                ));
+            }
+        }
     });
 }

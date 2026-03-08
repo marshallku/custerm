@@ -80,6 +80,12 @@ turmctl [--socket <path>] [--json] <command>
 
 - `turmctl agent approve <message> [--title <title>] [--actions "Approve,Deny"]` — show approval dialog, block until user responds
 
+### Plugin
+
+- `turmctl plugin list` — list installed plugins with panels and commands
+- `turmctl plugin open <plugin> [--panel main]` — open a plugin panel in a new tab
+- `turmctl plugin run <plugin>.<command> [--params '{}']` — run a plugin shell command
+
 ### Theme
 
 - `turmctl theme list` — list available themes and current theme

@@ -1,3 +1,4 @@
+use crate::plugin_panel::PluginPanel;
 use crate::terminal::TerminalPanel;
 use crate::webview::WebViewPanel;
 
@@ -12,6 +13,7 @@ pub trait Panel {
 pub enum PanelVariant {
     Terminal(TerminalPanel),
     WebView(WebViewPanel),
+    Plugin(PluginPanel),
 }
 
 impl Panel for PanelVariant {
@@ -19,6 +21,7 @@ impl Panel for PanelVariant {
         match self {
             PanelVariant::Terminal(p) => p.widget(),
             PanelVariant::WebView(p) => p.widget(),
+            PanelVariant::Plugin(p) => p.widget(),
         }
     }
 
@@ -26,6 +29,7 @@ impl Panel for PanelVariant {
         match self {
             PanelVariant::Terminal(p) => p.title(),
             PanelVariant::WebView(p) => p.title(),
+            PanelVariant::Plugin(p) => p.title(),
         }
     }
 
@@ -33,6 +37,7 @@ impl Panel for PanelVariant {
         match self {
             PanelVariant::Terminal(p) => p.panel_type(),
             PanelVariant::WebView(p) => p.panel_type(),
+            PanelVariant::Plugin(p) => p.panel_type(),
         }
     }
 
@@ -40,6 +45,7 @@ impl Panel for PanelVariant {
         match self {
             PanelVariant::Terminal(p) => p.grab_focus(),
             PanelVariant::WebView(p) => p.grab_focus(),
+            PanelVariant::Plugin(p) => p.grab_focus(),
         }
     }
 
@@ -47,6 +53,7 @@ impl Panel for PanelVariant {
         match self {
             PanelVariant::Terminal(p) => p.id(),
             PanelVariant::WebView(p) => p.id(),
+            PanelVariant::Plugin(p) => p.id(),
         }
     }
 }
@@ -62,6 +69,13 @@ impl PanelVariant {
     pub fn as_webview(&self) -> Option<&WebViewPanel> {
         match self {
             PanelVariant::WebView(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn as_plugin(&self) -> Option<&PluginPanel> {
+        match self {
+            PanelVariant::Plugin(p) => Some(p),
             _ => None,
         }
     }

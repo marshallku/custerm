@@ -38,7 +38,24 @@ impl TurmWindow {
         );
 
         let event_bus = socket::new_event_bus();
-        let tab_manager = TabManager::new(config, &window, event_bus.clone());
+
+        // Plugin discovery
+        let plugins = turm_core::plugin::discover_plugins();
+        for p in &plugins {
+            eprintln!(
+                "[turm] plugin loaded: {} v{}",
+                p.manifest.plugin.name, p.manifest.plugin.version
+            );
+        }
+
+        // Socket server (per-instance, so multiple turm windows don't collide)
+        let socket_path = format!("/tmp/turm-{}.sock", std::process::id());
+        let socket_rx = socket::start_server(&socket_path, event_bus.clone());
+
+        // Create a dispatch sender for the plugin JS bridge to reuse
+        let (dispatch_tx, plugin_dispatch_rx) = std::sync::mpsc::channel();
+
+        let tab_manager = TabManager::new(config, &window, event_bus.clone(), plugins, dispatch_tx);
 
         window.set_child(Some(&tab_manager.notebook));
 
@@ -69,14 +86,17 @@ impl TurmWindow {
             glib::ControlFlow::Continue
         });
 
-        // Socket server (per-instance, so multiple turm windows don't collide)
-        let socket_path = format!("/tmp/turm-{}.sock", std::process::id());
-        let socket_rx = socket::start_server(&socket_path, event_bus);
         let mgr = tab_manager.clone();
         let win = window.clone();
+        let sp = socket_path.clone();
         glib::timeout_add_local(Duration::from_millis(50), move || {
+            // Process commands from socket server
             while let Ok(cmd) = socket_rx.try_recv() {
-                socket::dispatch(cmd, &mgr, &win);
+                socket::dispatch(cmd, &mgr, &win, &sp);
+            }
+            // Process commands from plugin JS bridges
+            while let Ok(cmd) = plugin_dispatch_rx.try_recv() {
+                socket::dispatch(cmd, &mgr, &win, &sp);
             }
             glib::ControlFlow::Continue
         });

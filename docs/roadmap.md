@@ -118,7 +118,7 @@ Collapsible tab bar and renamable tabs.
 - [ ] Clipboard integration (OSC 52)
 - [ ] URL detection + click-to-open
 - [ ] Session persistence / restore
-- [ ] Plugin system (Lua or WASM for custom panels/commands)
+- [x] Plugin system (HTML/JS panels + shell commands via plugin.toml manifest)
 - [ ] macOS native app (Swift/AppKit)
 
 ## Pending Cleanup

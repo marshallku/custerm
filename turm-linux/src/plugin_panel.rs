@@ -1,0 +1,317 @@
+use std::sync::mpsc;
+
+use gtk4::prelude::*;
+use webkit6::prelude::*;
+
+use turm_core::plugin::LoadedPlugin;
+use turm_core::protocol::{Request, Response};
+use turm_core::theme::Theme;
+
+use crate::panel::Panel;
+use crate::socket::{EventBus, SocketCommand};
+
+pub struct PluginPanel {
+    pub id: String,
+    pub plugin_name: String,
+    pub panel_name: String,
+    pub title: String,
+    pub container: gtk4::Box,
+    pub webview: webkit6::WebView,
+}
+
+fn build_theme_css(theme: &Theme) -> String {
+    format!(
+        r#":root {{
+    --turm-bg: {bg};
+    --turm-fg: {text};
+    --turm-surface0: {surface0};
+    --turm-surface1: {surface1};
+    --turm-surface2: {surface2};
+    --turm-overlay0: {overlay0};
+    --turm-text: {text};
+    --turm-subtext0: {subtext0};
+    --turm-subtext1: {subtext1};
+    --turm-accent: {accent};
+    --turm-red: {red};
+}}
+body {{
+    background-color: {bg};
+    color: {text};
+    font-family: system-ui, -apple-system, sans-serif;
+    margin: 0;
+    padding: 0;
+}}"#,
+        bg = theme.background,
+        text = theme.text,
+        surface0 = theme.surface0,
+        surface1 = theme.surface1,
+        surface2 = theme.surface2,
+        overlay0 = theme.overlay0,
+        subtext0 = theme.subtext0,
+        subtext1 = theme.subtext1,
+        accent = theme.accent,
+        red = theme.red,
+    )
+}
+
+fn build_bridge_js(plugin_name: &str, panel_name: &str, panel_id: &str) -> String {
+    format!(
+        r#"(() => {{
+    const _listeners = {{}};
+    window.turm = {{
+        panel: {{
+            id: {id},
+            name: {name},
+            plugin: {plugin},
+        }},
+        async call(method, params = {{}}) {{
+            const resp = await window.webkit.messageHandlers.turm.postMessage(
+                JSON.stringify({{ method, params }})
+            );
+            const parsed = JSON.parse(resp);
+            if (!parsed.ok) throw new Error(parsed.error?.message || "Unknown error");
+            return parsed.result;
+        }},
+        on(type, callback) {{
+            if (!_listeners[type]) _listeners[type] = [];
+            _listeners[type].push(callback);
+        }},
+        off(type, callback) {{
+            if (!_listeners[type]) return;
+            _listeners[type] = _listeners[type].filter(cb => cb !== callback);
+        }},
+        _handleEvent(type, data) {{
+            const cbs = _listeners[type] || [];
+            for (const cb of cbs) {{
+                try {{ cb(data); }} catch (e) {{ console.error("turm event handler error:", e); }}
+            }}
+            const wildcards = _listeners["*"] || [];
+            for (const cb of wildcards) {{
+                try {{ cb(type, data); }} catch (e) {{ console.error("turm event handler error:", e); }}
+            }}
+        }},
+    }};
+}})()"#,
+        id = serde_json::to_string(panel_id).unwrap(),
+        name = serde_json::to_string(panel_name).unwrap(),
+        plugin = serde_json::to_string(plugin_name).unwrap(),
+    )
+}
+
+/// Create a JSC string value for replying to script messages.
+fn jsc_string(ctx: &javascriptcore6::Context, s: &str) -> javascriptcore6::Value {
+    javascriptcore6::Value::new_string(ctx, Some(s))
+}
+
+/// Send a Response back through the ScriptMessageReply using a JSC context.
+fn reply_json(
+    reply: &webkit6::ScriptMessageReply,
+    ctx: &javascriptcore6::Context,
+    resp: &Response,
+) {
+    let json = serde_json::to_string(resp).unwrap();
+    reply.return_value(&jsc_string(ctx, &json));
+}
+
+impl PluginPanel {
+    pub fn new(
+        plugin: &LoadedPlugin,
+        panel_def: &turm_core::plugin::PluginPanelDef,
+        theme: &Theme,
+        dispatch_tx: mpsc::Sender<SocketCommand>,
+        event_bus: EventBus,
+    ) -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+        let plugin_name = plugin.manifest.plugin.name.clone();
+        let panel_name = panel_def.name.clone();
+        let title = panel_def.title.clone();
+
+        let content_manager = webkit6::UserContentManager::new();
+
+        // Inject theme CSS
+        let theme_css = build_theme_css(theme);
+        let style_sheet = webkit6::UserStyleSheet::new(
+            &theme_css,
+            webkit6::UserContentInjectedFrames::AllFrames,
+            webkit6::UserStyleLevel::User,
+            &[],
+            &[],
+        );
+        content_manager.add_style_sheet(&style_sheet);
+
+        // Inject bridge JS
+        let bridge_js = build_bridge_js(&plugin_name, &panel_name, &id);
+        let script = webkit6::UserScript::new(
+            &bridge_js,
+            webkit6::UserContentInjectedFrames::AllFrames,
+            webkit6::UserScriptInjectionTime::Start,
+            &[],
+            &[],
+        );
+        content_manager.add_script(&script);
+
+        let webview = webkit6::WebView::builder()
+            .user_content_manager(&content_manager)
+            .build();
+
+        // Settings
+        if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
+            settings.set_enable_javascript(true);
+            settings.set_allow_file_access_from_file_urls(true);
+            settings.set_allow_universal_access_from_file_urls(false);
+            settings.set_enable_developer_extras(true);
+        }
+
+        webview.set_hexpand(true);
+        webview.set_vexpand(true);
+
+        // Register JS bridge message handler with reply
+        let tx = dispatch_tx;
+        content_manager.register_script_message_handler_with_reply("turm", None);
+        content_manager.connect_script_message_with_reply_received(
+            Some("turm"),
+            move |_cm, js_value: &javascriptcore6::Value, reply: &webkit6::ScriptMessageReply| {
+                let ctx = js_value.context().unwrap();
+                let msg_str = js_value.to_str().to_string();
+
+                #[derive(serde::Deserialize)]
+                struct BridgeMessage {
+                    method: String,
+                    #[serde(default)]
+                    params: serde_json::Value,
+                }
+
+                let parsed: Result<BridgeMessage, _> = serde_json::from_str(&msg_str);
+                match parsed {
+                    Ok(msg) => {
+                        let request =
+                            Request::new(uuid::Uuid::new_v4().to_string(), msg.method, msg.params);
+                        let (reply_tx, reply_rx) = mpsc::channel();
+                        let cmd = SocketCommand {
+                            request,
+                            reply: reply_tx,
+                        };
+                        if tx.send(cmd).is_ok() {
+                            let reply_clone = reply.clone();
+                            let ctx_clone = ctx.clone();
+                            gtk4::glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(1),
+                                move || {
+                                    poll_reply(reply_rx, reply_clone, ctx_clone);
+                                },
+                            );
+                        } else {
+                            let resp = Response::error(
+                                String::new(),
+                                "internal_error",
+                                "Dispatch channel closed",
+                            );
+                            reply_json(reply, &ctx, &resp);
+                        }
+                    }
+                    Err(e) => {
+                        let resp = Response::error(
+                            String::new(),
+                            "parse_error",
+                            &format!("Invalid bridge message: {e}"),
+                        );
+                        reply_json(reply, &ctx, &resp);
+                    }
+                }
+                true
+            },
+        );
+
+        // Load the HTML file
+        let file_path = plugin.dir.join(&panel_def.file);
+        let uri = format!("file://{}", file_path.display());
+        webview.load_uri(&uri);
+
+        // Forward events from EventBus to webview JS
+        {
+            let wv = webview.clone();
+            let (etx, erx) = mpsc::channel::<String>();
+            event_bus.lock().unwrap().push(etx);
+
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                while let Ok(event_json) = erx.try_recv() {
+                    if let Ok(event) =
+                        serde_json::from_str::<turm_core::protocol::Event>(&event_json)
+                    {
+                        let type_escaped = serde_json::to_string(&event.event_type).unwrap();
+                        let data_json = serde_json::to_string(&event.data).unwrap();
+                        let js = format!(
+                            "if (window.turm && window.turm._handleEvent) turm._handleEvent({type_escaped}, {data_json})"
+                        );
+                        wv.evaluate_javascript(
+                            &js,
+                            None,
+                            None,
+                            gtk4::gio::Cancellable::NONE,
+                            |_| {},
+                        );
+                    }
+                }
+                gtk4::glib::ControlFlow::Continue
+            });
+        }
+
+        // Container (full-bleed, no toolbar)
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        container.set_hexpand(true);
+        container.set_vexpand(true);
+        container.append(&webview);
+
+        Self {
+            id,
+            plugin_name,
+            panel_name,
+            title,
+            container,
+            webview,
+        }
+    }
+}
+
+fn poll_reply(
+    rx: mpsc::Receiver<Response>,
+    reply: webkit6::ScriptMessageReply,
+    ctx: javascriptcore6::Context,
+) {
+    match rx.try_recv() {
+        Ok(response) => {
+            reply_json(&reply, &ctx, &response);
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(5), move || {
+                poll_reply(rx, reply, ctx);
+            });
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            let resp = Response::error(String::new(), "internal_error", "Reply channel closed");
+            reply_json(&reply, &ctx, &resp);
+        }
+    }
+}
+
+impl Panel for PluginPanel {
+    fn widget(&self) -> &gtk4::Widget {
+        self.container.upcast_ref()
+    }
+
+    fn title(&self) -> String {
+        self.title.clone()
+    }
+
+    fn panel_type(&self) -> &str {
+        "plugin"
+    }
+
+    fn grab_focus(&self) {
+        self.webview.grab_focus();
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}

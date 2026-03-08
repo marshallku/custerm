@@ -57,6 +57,10 @@ pub enum Command {
     #[command(subcommand)]
     Theme(ThemeCommand),
 
+    /// Plugin management
+    #[command(subcommand)]
+    Plugin(PluginCommand),
+
     /// Check for updates or update turm
     #[command(subcommand)]
     Update(UpdateCommand),
@@ -216,6 +220,28 @@ pub enum AgentCommand {
 pub enum ThemeCommand {
     /// List available themes
     List,
+}
+
+#[derive(Subcommand)]
+pub enum PluginCommand {
+    /// List installed plugins
+    List,
+    /// Open a plugin panel in a new tab
+    Open {
+        /// Plugin name
+        plugin: String,
+        /// Panel name within the plugin
+        #[arg(long, default_value = "main")]
+        panel: String,
+    },
+    /// Run a plugin command
+    Run {
+        /// Command in format: plugin.command (e.g., my-plugin.greet)
+        command: String,
+        /// JSON params to pass to the command
+        #[arg(long, default_value = "{}")]
+        params: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -430,6 +456,11 @@ impl Cli {
                 ThemeCommand::List => "theme.list",
             }
             .to_string(),
+            Command::Plugin(cmd) => match cmd {
+                PluginCommand::List => "plugin.list".to_string(),
+                PluginCommand::Open { .. } => "plugin.open".to_string(),
+                PluginCommand::Run { command, .. } => format!("plugin.{command}"),
+            },
             Command::Update(_) => unreachable!("update commands are handled locally"),
         }
     }
@@ -515,6 +546,15 @@ impl Cli {
                         p["actions"] = json!(acts);
                     }
                     p
+                }
+            },
+            Command::Plugin(cmd) => match cmd {
+                PluginCommand::List => json!({}),
+                PluginCommand::Open { plugin, panel } => {
+                    json!({ "plugin": plugin, "panel": panel })
+                }
+                PluginCommand::Run { params, .. } => {
+                    serde_json::from_str(params).unwrap_or_else(|_| json!({}))
                 }
             },
             Command::Theme(_) | Command::Split(_) | Command::Event(_) | Command::Update(_) => {
