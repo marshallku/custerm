@@ -13,13 +13,6 @@ mod terminal;
 mod window;
 
 fn main() {
-    // CEF sub-process check — must happen before anything else.
-    // When CEF spawns renderer/GPU processes, it re-launches this binary
-    // with --type=renderer etc. We detect that and handle it immediately.
-    if cef_init::handle_subprocess() {
-        return;
-    }
-
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -45,7 +38,7 @@ fn main() {
         return;
     }
 
-    // Initialize CEF for the main browser process
+    // Initialize CEF (sub-processes handled by turm-cef-helper binary)
     let _cef = cef_init::initialize();
 
     app::run();

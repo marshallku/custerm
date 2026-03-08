@@ -10,6 +10,10 @@ repository.workspace = true
 name = "turm"
 path = "src/main.rs"
 
+[[bin]]
+name = "turm-cef-helper"
+path = "src/cef_helper.rs"
+
 [dependencies]
 turm-core = { path = "../turm-core" }
 gtk4 = { version = "0.9", features = ["gnome_46"] }

@@ -30,8 +30,4 @@ fn main() {
     let cef_dir = cef_dir.display();
     println!("cargo::rustc-link-arg=-Wl,-rpath,{cef_dir}");
 
-    // CEF requires the host binary to export symbols (e.g. libc's `close`)
-    // so that libcef.so can dlsym them. Without this, sub-processes crash
-    // with "close symbol missing".
-    println!("cargo::rustc-link-arg=-Wl,--export-dynamic");
 }

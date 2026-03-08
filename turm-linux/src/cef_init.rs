@@ -1,37 +1,15 @@
 use cef::*;
 use std::cell::RefCell;
 
-/// Check if the current process is a CEF sub-process (renderer, GPU, etc.).
-/// If so, handle it and return true. The caller should exit immediately.
-/// If this is the main browser process, return false.
-pub fn handle_subprocess() -> bool {
-    let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
-
-    let args = cef::args::Args::new();
-    let Some(cmd) = args.as_cmd_line() else {
-        return false;
-    };
-
-    let switch = CefString::from("type");
-    if cmd.has_switch(Some(&switch)) == 1 {
-        // This is a CEF sub-process — handle and exit
-        execute_process(Some(args.as_main_args()), None::<&mut App>, std::ptr::null_mut());
-        return true;
-    }
-
-    false
-}
-
-/// Initialize CEF for the main browser process.
-/// Must be called before creating any browsers.
-/// Returns the CefState that must be kept alive for the duration of the app.
+/// Initialize CEF for the browser process.
+/// Sub-processes are handled by the separate `turm-cef-helper` binary.
 pub fn initialize() -> CefState {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
 
     let args = cef::args::Args::new();
     let mut app = TurmAppBuilder::build(TurmApp);
 
-    // Execute process first (returns -1 for the browser process)
+    // For the browser process, execute_process returns -1.
     let ret = execute_process(
         Some(args.as_main_args()),
         Some(&mut app),
@@ -39,23 +17,55 @@ pub fn initialize() -> CefState {
     );
     assert_eq!(ret, -1, "Expected browser process, got sub-process");
 
+    // Resolve CEF resource directories and subprocess helper
+    let cef_dir = find_cef_dir();
+    let resources_path = CefString::from(cef_dir.to_str().unwrap());
+    let locales_path = CefString::from(cef_dir.join("locales").to_str().unwrap());
+
+    // Use a separate lightweight helper binary for CEF sub-processes to avoid
+    // GTK/VTE library conflicts with CEF's bundled libraries.
+    let exe_path = std::env::current_exe().expect("Failed to get current exe path");
+    let helper_path = exe_path.with_file_name("turm-cef-helper");
+    let subprocess_path = if helper_path.exists() {
+        CefString::from(helper_path.to_str().unwrap())
+    } else {
+        eprintln!("[cef] warning: turm-cef-helper not found, using self as subprocess");
+        CefString::from(exe_path.to_str().unwrap())
+    };
+
+    eprintln!("[cef] resources: {}", cef_dir.display());
+
     let settings = Settings {
         windowless_rendering_enabled: true as _,
         external_message_pump: true as _,
-        log_file: CefString::from("/tmp/turm-cef.log"),
-        log_severity: LogSeverity::VERBOSE,
-        no_sandbox: true as _,
+        browser_subprocess_path: subprocess_path,
         ..Default::default()
     };
 
+    // CEF's initialize() with external_message_pump may need message pump work
+    // to be called concurrently to complete. Pump from a background thread.
+    let pump_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let pump_flag_clone = pump_flag.clone();
+    let pump_thread = std::thread::spawn(move || {
+        while pump_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            do_message_loop_work();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+
+    eprintln!("[cef] calling cef::initialize...");
     let result = cef::initialize(
         Some(args.as_main_args()),
         Some(&settings),
         Some(&mut app),
         std::ptr::null_mut(),
     );
+    eprintln!("[cef] cef::initialize returned: {result}");
+
+    pump_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = pump_thread.join();
+
     assert_eq!(result, 1, "CEF initialization failed");
-    eprintln!("[cef] initialized");
 
     CefState { _app: app }
 }
