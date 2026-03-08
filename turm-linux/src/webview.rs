@@ -238,10 +238,13 @@ impl WebViewPanel {
             move |result| {
                 let outcome = match result {
                     Ok(value) => {
-                        let s = value.to_str();
-                        Ok(s.to_string())
+                        if value.is_undefined() || value.is_null() {
+                            Ok("null".to_string())
+                        } else {
+                            Ok(value.to_str().to_string())
+                        }
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(Self::friendly_webview_error(e)),
                 };
                 callback(outcome);
             },
@@ -259,11 +262,22 @@ impl WebViewPanel {
                         let bytes = texture.save_to_png_bytes();
                         Ok(gtk4::glib::base64_encode(&bytes).to_string())
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(Self::friendly_webview_error(e)),
                 };
                 callback(outcome);
             },
         );
+    }
+
+    fn friendly_webview_error(e: gtk4::glib::Error) -> String {
+        let msg = e.to_string();
+        if msg.contains("Unsupported result type") {
+            "Page failed to load — cannot execute JavaScript".to_string()
+        } else if msg.contains("error creating the snapshot") {
+            "Page failed to load — cannot take screenshot".to_string()
+        } else {
+            msg
+        }
     }
 
     pub fn current_url(&self) -> String {

@@ -18,7 +18,10 @@ fn main() {
     }
 
     let socket_path = cli.socket.clone().unwrap_or_else(|| {
-        std::env::var("TURM_SOCKET").unwrap_or_else(|_| "/tmp/turm.sock".to_string())
+        std::env::var("TURM_SOCKET")
+            .ok()
+            .filter(|p| std::os::unix::net::UnixStream::connect(p).is_ok())
+            .unwrap_or_else(|| discover_socket().unwrap_or_else(|| "/tmp/turm.sock".to_string()))
     });
 
     // Event subscribe is a long-lived streaming connection
@@ -55,6 +58,34 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn discover_socket() -> Option<String> {
+    let mut sockets: Vec<_> = std::fs::read_dir("/tmp")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("turm-") && name.ends_with(".sock")
+        })
+        .collect();
+
+    // Sort by modification time, newest first
+    sockets.sort_by(|a, b| {
+        let ta = a.metadata().and_then(|m| m.modified()).ok();
+        let tb = b.metadata().and_then(|m| m.modified()).ok();
+        tb.cmp(&ta)
+    });
+
+    // Return the first socket that's actually connectable
+    for entry in sockets {
+        let path = entry.path();
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    None
 }
 
 fn print_result(value: &serde_json::Value) {
