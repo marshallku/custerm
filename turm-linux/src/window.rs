@@ -65,8 +65,8 @@ impl TurmWindow {
             glib::ControlFlow::Continue
         });
 
-        // Socket server
-        let socket_path = "/tmp/turm.sock".to_string();
+        // Socket server (per-instance, so multiple turm windows don't collide)
+        let socket_path = format!("/tmp/turm-{}.sock", std::process::id());
         let socket_rx = socket::start_server(&socket_path, event_bus);
         let mgr = tab_manager.clone();
         let win = window.clone();

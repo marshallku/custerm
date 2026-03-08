@@ -92,7 +92,7 @@ impl TerminalPanel {
         // Spawn shell
         let shell = config.terminal.shell.clone();
         let dbus_env = format!("TURM_DBUS={}", crate::dbus::bus_name());
-        let socket_env = "TURM_SOCKET=/tmp/turm.sock".to_string();
+        let socket_env = format!("TURM_SOCKET=/tmp/turm-{}.sock", std::process::id());
         terminal.spawn_async(
             vte4::PtyFlags::DEFAULT,
             None::<&str>,
