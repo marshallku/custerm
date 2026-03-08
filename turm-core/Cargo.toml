@@ -2,6 +2,9 @@
 name = "turm-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
 
 [dependencies]
 portable-pty = "0.8"
