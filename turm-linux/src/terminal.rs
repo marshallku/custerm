@@ -23,6 +23,7 @@ pub struct TerminalPanel {
     pub id: String,
     pub overlay: gtk4::Overlay,
     pub terminal: Terminal,
+    pub child_pid: Rc<Cell<i32>>,
     pub bg_picture: gtk4::Picture,
     pub tint_overlay: gtk4::Box,
     pub tint_css: gtk4::CssProvider,
@@ -91,6 +92,8 @@ impl TerminalPanel {
         let shell = config.terminal.shell.clone();
         let dbus_env = format!("TURM_DBUS={}", crate::dbus::bus_name());
         let socket_env = format!("TURM_SOCKET=/tmp/turm-{}.sock", std::process::id());
+        let child_pid: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
+        let pid_cell = child_pid.clone();
         terminal.spawn_async(
             vte4::PtyFlags::DEFAULT,
             None::<&str>,
@@ -100,7 +103,15 @@ impl TerminalPanel {
             || {},
             -1,
             gtk4::gio::Cancellable::NONE,
-            |_result| {},
+            move |result| match &result {
+                Ok(pid) => {
+                    eprintln!("[turm] shell spawned, child_pid={}", pid.0);
+                    pid_cell.set(pid.0);
+                }
+                Err(e) => {
+                    eprintln!("[turm] shell spawn error: {e}");
+                }
+            },
         );
 
         terminal.connect_child_exited(move |_terminal, _status| {
@@ -168,6 +179,7 @@ impl TerminalPanel {
             tint_opacity,
             tint_color,
             image_opacity,
+            child_pid,
             has_background: Rc::new(Cell::new(false)),
             search_bar,
             theme: Box::new(theme),
@@ -268,11 +280,36 @@ impl TerminalPanel {
     /// Get terminal state: cursor, dimensions, CWD, title
     pub fn state(&self) -> serde_json::Value {
         let (cursor_col, cursor_row) = self.terminal.cursor_position();
-        let cwd = self.terminal.current_directory_uri().map(|u| {
-            // Strip file:// prefix
-            let s = u.to_string();
-            s.strip_prefix("file://").unwrap_or(&s).to_string()
-        });
+        // Try VTE's OSC 7 first, then fallback to /proc/<pid>/cwd
+        let cwd = self
+            .terminal
+            .current_directory_uri()
+            .map(|u| {
+                let s = u.to_string();
+                // file://hostname/path → /path
+                if let Some(rest) = s.strip_prefix("file://") {
+                    if let Some(idx) = rest.find('/') {
+                        rest[idx..].to_string()
+                    } else {
+                        rest.to_string()
+                    }
+                } else {
+                    s.to_string()
+                }
+            })
+            .or_else(|| {
+                let pid = self.child_pid.get();
+                if pid > 0 {
+                    let result = std::fs::read_link(format!("/proc/{pid}/cwd"))
+                        .ok()
+                        .map(|p| p.to_string_lossy().to_string());
+                    eprintln!("[turm] cwd fallback: pid={pid} -> {:?}", result);
+                    result
+                } else {
+                    eprintln!("[turm] cwd fallback: no child_pid ({})", pid);
+                    None
+                }
+            });
         serde_json::json!({
             "cols": self.terminal.column_count(),
             "rows": self.terminal.row_count(),

@@ -1,43 +1,46 @@
-use std::sync::mpsc;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
 
+use gtk4::glib;
 use gtk4::prelude::*;
 use webkit6::prelude::*;
 
 use turm_core::config::TurmConfig;
 use turm_core::plugin::LoadedPlugin;
-use turm_core::protocol::{Request, Response};
 use turm_core::theme::Theme;
 
-use crate::socket::{EventBus, SocketCommand};
+struct ModuleHandle {
+    /// DOM element id in the WebView
+    dom_id: String,
+    exec: String,
+    interval: u64,
+    plugin_dir: std::path::PathBuf,
+    socket_path: String,
+}
 
 pub struct StatusBar {
     pub container: gtk4::Box,
     webview: webkit6::WebView,
+    #[allow(dead_code)]
+    modules: Rc<RefCell<Vec<ModuleHandle>>>,
 }
 
-/// Build the shell HTML that hosts all modules.
-/// Each module's HTML is injected into left/center/right containers.
+/// Build the shell HTML with empty module containers.
+/// Modules are just <span> elements that get updated via JS.
 fn build_bar_html(plugins: &[LoadedPlugin], theme: &Theme, height: u32) -> String {
-    // Collect modules from all plugins, sorted by (position, order)
     let mut left = Vec::new();
     let mut center = Vec::new();
     let mut right = Vec::new();
 
     for plugin in plugins {
         for module in &plugin.manifest.modules {
-            let file_path = plugin.dir.join(&module.file);
-            let content = match std::fs::read_to_string(&file_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!(
-                        "[turm] failed to read module {}/{}: {e}",
-                        plugin.manifest.plugin.name, module.name
-                    );
-                    continue;
-                }
-            };
-
-            let entry = (module.order, module.name.clone(), content);
+            let dom_id = format!("mod-{}-{}", plugin.manifest.plugin.name, module.name);
+            let class = module.class.as_deref().unwrap_or("");
+            let entry = (
+                module.order,
+                format!(r#"<span id="{dom_id}" class="turm-module {class}" title="">...</span>"#),
+            );
             match module.position.as_str() {
                 "left" => left.push(entry),
                 "center" => center.push(entry),
@@ -46,19 +49,34 @@ fn build_bar_html(plugins: &[LoadedPlugin], theme: &Theme, height: u32) -> Strin
         }
     }
 
-    left.sort_by_key(|(o, _, _)| *o);
-    center.sort_by_key(|(o, _, _)| *o);
-    right.sort_by_key(|(o, _, _)| *o);
+    left.sort_by_key(|(o, _)| *o);
+    center.sort_by_key(|(o, _)| *o);
+    right.sort_by_key(|(o, _)| *o);
 
-    let render_section = |modules: &[(i32, String, String)]| -> String {
-        modules
+    eprintln!(
+        "[turm] statusbar modules: left={}, center={}, right={}",
+        left.len(),
+        center.len(),
+        right.len()
+    );
+
+    let render = |items: &[(i32, String)]| -> String {
+        items
             .iter()
-            .map(|(_, name, html)| {
-                format!(r#"<div class="turm-module" data-module="{name}">{html}</div>"#)
-            })
+            .map(|(_, html)| html.as_str())
             .collect::<Vec<_>>()
             .join("\n")
     };
+
+    // Collect plugin style.css files
+    let mut plugin_css = String::new();
+    for plugin in plugins {
+        let css_path = plugin.dir.join("style.css");
+        if let Ok(css) = std::fs::read_to_string(&css_path) {
+            plugin_css.push_str(&css);
+            plugin_css.push('\n');
+        }
+    }
 
     format!(
         r#"<!DOCTYPE html>
@@ -83,7 +101,7 @@ html, body {{
     height: {height}px;
     overflow: hidden;
     background: {surface0};
-    color: {text};
+    color: {subtext0};
     font-family: system-ui, -apple-system, sans-serif;
     font-size: 12px;
 }}
@@ -107,6 +125,7 @@ body {{
     gap: 4px;
     white-space: nowrap;
 }}
+{plugin_css}
 </style>
 </head>
 <body>
@@ -126,101 +145,80 @@ body {{
         accent = theme.accent,
         red = theme.red,
         height = height,
-        left = render_section(&left),
-        center = render_section(&center),
-        right = render_section(&right),
+        left = render(&left),
+        center = render(&center),
+        right = render(&right),
+        plugin_css = plugin_css,
     )
 }
 
-fn build_bridge_js() -> String {
-    r#"(() => {
-    const _listeners = {};
-    window.turm = {
-        panel: { id: "__statusbar__", name: "statusbar", plugin: "turm" },
-        async call(method, params = {}) {
-            const resp = await window.webkit.messageHandlers.turm.postMessage(
-                JSON.stringify({ method, params })
-            );
-            const parsed = JSON.parse(resp);
-            if (!parsed.ok) throw new Error(parsed.error?.message || "Unknown error");
-            return parsed.result;
-        },
-        on(type, callback) {
-            if (!_listeners[type]) _listeners[type] = [];
-            _listeners[type].push(callback);
-        },
-        off(type, callback) {
-            if (!_listeners[type]) return;
-            _listeners[type] = _listeners[type].filter(cb => cb !== callback);
-        },
-        _handleEvent(type, data) {
-            const cbs = _listeners[type] || [];
-            for (const cb of cbs) {
-                try { cb(data); } catch (e) { console.error("turm event handler error:", e); }
-            }
-            const wildcards = _listeners["*"] || [];
-            for (const cb of wildcards) {
-                try { cb(type, data); } catch (e) { console.error("turm event handler error:", e); }
-            }
-        },
-    };
-})()"#
-        .to_string()
+/// Parse module script output. Supports:
+/// - JSON: {"text": "...", "tooltip": "..."}
+/// - Plain text: used as-is
+fn parse_output(output: &str) -> (String, Option<String>) {
+    let trimmed = output.trim();
+    if trimmed.starts_with('{')
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+    {
+        let text = val["text"].as_str().unwrap_or(trimmed).to_string();
+        let tooltip = val["tooltip"].as_str().map(|s| s.to_string());
+        return (text, tooltip);
+    }
+    (trimmed.to_string(), None)
 }
 
-/// JSC string value helper
-fn jsc_string(ctx: &javascriptcore6::Context, s: &str) -> javascriptcore6::Value {
-    javascriptcore6::Value::new_string(ctx, Some(s))
-}
+/// Run a module's exec command in a thread, send result back via channel.
+fn run_module_exec(
+    exec: &str,
+    plugin_dir: &std::path::Path,
+    socket_path: &str,
+) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let exec = exec.to_string();
+    let dir = plugin_dir.to_path_buf();
+    let sock = socket_path.to_string();
 
-fn reply_json(
-    reply: &webkit6::ScriptMessageReply,
-    ctx: &javascriptcore6::Context,
-    resp: &Response,
-) {
-    let json = serde_json::to_string(resp).unwrap();
-    reply.return_value(&jsc_string(ctx, &json));
+    std::thread::spawn(move || {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&exec)
+            .current_dir(&dir)
+            .env("TURM_SOCKET", &sock)
+            .env("TURM_PLUGIN_DIR", &dir)
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let _ = tx.send(stdout);
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!("[turm] statusbar module error: {stderr}");
+                let _ = tx.send(String::new());
+            }
+            Err(e) => {
+                eprintln!("[turm] statusbar module exec failed: {e}");
+                let _ = tx.send(String::new());
+            }
+        }
+    });
+
+    rx
 }
 
 impl StatusBar {
-    pub fn new(
-        config: &TurmConfig,
-        plugins: &[LoadedPlugin],
-        dispatch_tx: mpsc::Sender<SocketCommand>,
-        event_bus: EventBus,
-    ) -> Self {
+    pub fn new(config: &TurmConfig, plugins: &[LoadedPlugin]) -> Self {
         let theme = Theme::by_name(&config.theme.name).unwrap_or_default();
         let height = config.statusbar.height;
+        let socket_path = format!("/tmp/turm-{}.sock", std::process::id());
 
-        // Check if any plugins have modules
-        let has_modules = plugins.iter().any(|p| !p.manifest.modules.is_empty());
-        if !has_modules {
-            eprintln!("[turm] statusbar: no modules found, bar will be empty");
-        }
+        let webview = webkit6::WebView::new();
 
-        let content_manager = webkit6::UserContentManager::new();
-
-        // Inject bridge JS
-        let bridge_js = build_bridge_js();
-        let script = webkit6::UserScript::new(
-            &bridge_js,
-            webkit6::UserContentInjectedFrames::AllFrames,
-            webkit6::UserScriptInjectionTime::Start,
-            &[],
-            &[],
-        );
-        content_manager.add_script(&script);
-
-        let webview = webkit6::WebView::builder()
-            .user_content_manager(&content_manager)
-            .build();
-
-        // Settings
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
             settings.set_enable_javascript(true);
             settings.set_allow_file_access_from_file_urls(true);
             settings.set_allow_universal_access_from_file_urls(false);
-            settings.set_enable_developer_extras(true);
             settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Always);
         }
 
@@ -228,97 +226,25 @@ impl StatusBar {
         webview.set_vexpand(false);
         webview.set_size_request(-1, height as i32);
 
-        // Register JS bridge message handler
-        let tx = dispatch_tx;
-        content_manager.register_script_message_handler_with_reply("turm", None);
-        content_manager.connect_script_message_with_reply_received(
-            Some("turm"),
-            move |_cm, js_value: &javascriptcore6::Value, reply: &webkit6::ScriptMessageReply| {
-                let ctx = js_value.context().unwrap();
-                let msg_str = js_value.to_str().to_string();
-
-                #[derive(serde::Deserialize)]
-                struct BridgeMessage {
-                    method: String,
-                    #[serde(default)]
-                    params: serde_json::Value,
-                }
-
-                let parsed: Result<BridgeMessage, _> = serde_json::from_str(&msg_str);
-                match parsed {
-                    Ok(msg) => {
-                        let request =
-                            Request::new(uuid::Uuid::new_v4().to_string(), msg.method, msg.params);
-                        let (reply_tx, reply_rx) = mpsc::channel();
-                        let cmd = SocketCommand {
-                            request,
-                            reply: reply_tx,
-                        };
-                        if tx.send(cmd).is_ok() {
-                            let reply_clone = reply.clone();
-                            let ctx_clone = ctx.clone();
-                            gtk4::glib::timeout_add_local_once(
-                                std::time::Duration::from_millis(1),
-                                move || {
-                                    poll_reply(reply_rx, reply_clone, ctx_clone);
-                                },
-                            );
-                        } else {
-                            let resp = Response::error(
-                                String::new(),
-                                "internal_error",
-                                "Dispatch channel closed",
-                            );
-                            reply_json(reply, &ctx, &resp);
-                        }
-                    }
-                    Err(e) => {
-                        let resp = Response::error(
-                            String::new(),
-                            "parse_error",
-                            &format!("Invalid bridge message: {e}"),
-                        );
-                        reply_json(reply, &ctx, &resp);
-                    }
-                }
-                true
-            },
-        );
-
-        // Build and load the bar HTML
+        // Build and load the shell HTML
         let html = build_bar_html(plugins, &theme, height);
         webview.load_html(&html, None);
 
-        // Forward events to webview
-        {
-            let wv = webview.clone();
-            let (etx, erx) = mpsc::channel::<String>();
-            event_bus.lock().unwrap().push(etx);
-
-            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                while let Ok(event_json) = erx.try_recv() {
-                    if let Ok(event) =
-                        serde_json::from_str::<turm_core::protocol::Event>(&event_json)
-                    {
-                        let type_escaped = serde_json::to_string(&event.event_type).unwrap();
-                        let data_json = serde_json::to_string(&event.data).unwrap();
-                        let js = format!(
-                            "if (window.turm && window.turm._handleEvent) turm._handleEvent({type_escaped}, {data_json})"
-                        );
-                        wv.evaluate_javascript(
-                            &js,
-                            None,
-                            None,
-                            gtk4::gio::Cancellable::NONE,
-                            |_| {},
-                        );
-                    }
-                }
-                gtk4::glib::ControlFlow::Continue
-            });
+        // Collect module handles
+        let modules: Rc<RefCell<Vec<ModuleHandle>>> = Rc::new(RefCell::new(Vec::new()));
+        for plugin in plugins {
+            for module in &plugin.manifest.modules {
+                let dom_id = format!("mod-{}-{}", plugin.manifest.plugin.name, module.name);
+                modules.borrow_mut().push(ModuleHandle {
+                    dom_id,
+                    exec: module.exec.clone(),
+                    interval: module.interval,
+                    plugin_dir: plugin.dir.clone(),
+                    socket_path: socket_path.clone(),
+                });
+            }
         }
 
-        // Container
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         container.set_hexpand(true);
         container.set_vexpand(false);
@@ -328,7 +254,25 @@ impl StatusBar {
             container.set_visible(false);
         }
 
-        Self { container, webview }
+        // Schedule module execution after WebView loads
+        let modules_ref = modules.clone();
+        let wv = webview.clone();
+        webview.connect_load_changed(move |_, event| {
+            if event == webkit6::LoadEvent::Finished {
+                let modules_ref2 = modules_ref.clone();
+                let wv2 = wv.clone();
+                // Small delay to ensure DOM is ready
+                glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                    schedule_modules(&modules_ref2, &wv2);
+                });
+            }
+        });
+
+        Self {
+            container,
+            webview,
+            modules,
+        }
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -345,31 +289,93 @@ impl StatusBar {
         new_visible
     }
 
-    /// Reload bar content (e.g., after plugin changes)
     pub fn reload(&self, config: &TurmConfig, plugins: &[LoadedPlugin]) {
         let theme = Theme::by_name(&config.theme.name).unwrap_or_default();
         let html = build_bar_html(plugins, &theme, config.statusbar.height);
         self.webview.load_html(&html, None);
+        // Modules will re-schedule via connect_load_changed
     }
 }
 
-fn poll_reply(
-    rx: mpsc::Receiver<Response>,
-    reply: webkit6::ScriptMessageReply,
-    ctx: javascriptcore6::Context,
-) {
-    match rx.try_recv() {
-        Ok(response) => {
-            reply_json(&reply, &ctx, &response);
-        }
-        Err(mpsc::TryRecvError::Empty) => {
-            gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(5), move || {
-                poll_reply(rx, reply, ctx);
-            });
-        }
-        Err(mpsc::TryRecvError::Disconnected) => {
-            let resp = Response::error(String::new(), "internal_error", "Reply channel closed");
-            reply_json(&reply, &ctx, &resp);
-        }
+fn schedule_modules(modules: &Rc<RefCell<Vec<ModuleHandle>>>, webview: &webkit6::WebView) {
+    let modules_ref = modules.borrow();
+    eprintln!("[turm] statusbar: scheduling {} modules", modules_ref.len());
+    for module in modules_ref.iter() {
+        eprintln!(
+            "[turm] statusbar: module {} exec={} interval={}s",
+            module.dom_id, module.exec, module.interval
+        );
+        let ctx = ModuleRunCtx {
+            dom_id: module.dom_id.clone(),
+            exec: module.exec.clone(),
+            plugin_dir: module.plugin_dir.clone(),
+            socket_path: module.socket_path.clone(),
+            interval: module.interval,
+            webview: webview.clone(),
+        };
+        run_and_schedule(ctx);
     }
+}
+
+#[derive(Clone)]
+struct ModuleRunCtx {
+    dom_id: String,
+    exec: String,
+    plugin_dir: std::path::PathBuf,
+    socket_path: String,
+    interval: u64,
+    webview: webkit6::WebView,
+}
+
+fn run_and_schedule(ctx: ModuleRunCtx) {
+    let rx = run_module_exec(&ctx.exec, &ctx.plugin_dir, &ctx.socket_path);
+
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        match rx.try_recv() {
+            Ok(output) => {
+                let (text, tooltip) = parse_output(&output);
+                eprintln!("[turm] statusbar: {} -> {:?}", ctx.dom_id, text);
+
+                // Update DOM via JavaScript
+                let escaped_text = text
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'")
+                    .replace('\n', "\\n");
+                let escaped_tooltip = tooltip
+                    .as_deref()
+                    .unwrap_or("")
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'")
+                    .replace('\n', "\\n");
+                let dom_id = &ctx.dom_id;
+
+                let js = format!(
+                    r#"(() => {{
+                        const el = document.getElementById('{dom_id}');
+                        if (el) {{
+                            el.textContent = '{escaped_text}';
+                            el.title = '{escaped_tooltip}';
+                        }}
+                    }})()"#,
+                );
+                ctx.webview.evaluate_javascript(
+                    &js,
+                    None,
+                    None,
+                    gtk4::gio::Cancellable::NONE,
+                    |_| {},
+                );
+
+                // Schedule next run
+                let next = ctx.clone();
+                glib::timeout_add_local_once(Duration::from_secs(ctx.interval), move || {
+                    run_and_schedule(next);
+                });
+
+                glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
 }

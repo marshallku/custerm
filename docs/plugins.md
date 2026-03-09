@@ -38,13 +38,14 @@ name = "do-thing"                          # Command identifier
 exec = "bash scripts/do-thing.sh"          # Shell command to run
 description = "Does a thing"               # Optional description
 
-# Modules are small widgets rendered in the status bar
+# Modules are widgets rendered in the status bar (data from shell, styled with CSS)
 [[modules]]
 name = "clock"                             # Module identifier
-title = "Clock"                            # Display name
-file = "clock.html"                        # HTML file to load
+exec = "date '+%H:%M:%S'"                  # Shell command (stdout → module text)
+interval = 1                               # Re-run interval in seconds (default: 10)
 position = "right"                         # left, center, right
 order = 100                                # Sort order within section (lower = first)
+class = "clock"                            # CSS class for styling (optional)
 ```
 
 ### Multiple Panels
@@ -278,60 +279,63 @@ Use `gtk4-icon-browser` to explore all available icons on your system.
 
 ## Status Bar Modules
 
-Plugins can contribute modules to the Waybar-style status bar at the top or bottom of the terminal window. Each module is a self-contained HTML snippet rendered in a shared WebView bar.
+Plugins can contribute modules to the Waybar-style status bar. The bar is a WebView rendering CSS-styled modules, with data provided by shell scripts — similar to Waybar's custom modules.
 
 ### Module Manifest
 
 ```toml
 [[modules]]
 name = "clock"
-title = "Clock"
-file = "clock.html"
-position = "right"      # left, center, right
-order = 100             # sort order (lower = first)
+exec = "date '+%H:%M:%S'"    # shell command, stdout → module text
+interval = 1                   # re-run every N seconds
+position = "right"             # left, center, right
+order = 100                    # sort order (lower = first)
+class = "clock"                # CSS class for styling
 ```
 
-### Module HTML
+### Data Format
 
-Modules are small HTML snippets (not full pages). They share the bar's layout and have access to the `turm` JS bridge and theme CSS variables.
+Module `exec` stdout supports two formats:
 
-```html
-<!-- clock.html -->
-<style>
-    .clock { font-size: 11px; font-family: monospace; color: var(--turm-subtext0); }
-</style>
-<span class="clock" id="clock"></span>
-<script>
-    setInterval(() => {
-        document.getElementById('clock').textContent =
-            new Date().toLocaleTimeString('en-US', { hour12: false });
-    }, 1000);
-</script>
+**Plain text** — used as-is:
+```
+23:45:01
 ```
 
-### Module with turm API
-
-Modules can call `turm.call()` and listen to events with `turm.on()`:
-
-```html
-<!-- cwd.html — shows current working directory -->
-<style>.cwd { font-size: 11px; color: var(--turm-accent); }</style>
-<span class="cwd" id="cwd">~</span>
-<script>
-    async function updateCwd() {
-        try {
-            const state = await turm.call('terminal.state');
-            if (state.cwd) {
-                document.getElementById('cwd').textContent =
-                    state.cwd.replace(/^\/home\/[^/]+/, '~');
-            }
-        } catch (e) {}
-    }
-    turm.on('panel.focused', updateCwd);
-    turm.on('terminal.cwd_changed', updateCwd);
-    updateCwd();
-</script>
+**JSON** — with `text` and optional `tooltip`:
+```json
+{"text": "$12.34 | 62kout", "tooltip": "178 messages today\nModel: opus-4-6"}
 ```
+
+### CSS Styling
+
+Place a `style.css` in the plugin directory. It's injected into the bar alongside theme CSS variables.
+
+```css
+/* ~/.config/turm/plugins/my-plugin/style.css */
+.clock {
+    font-family: monospace;
+    color: var(--turm-subtext0);
+}
+
+.claude-usage {
+    color: var(--turm-accent);
+    font-weight: bold;
+}
+```
+
+Available CSS variables: `--turm-bg`, `--turm-fg`, `--turm-surface0/1/2`, `--turm-overlay0`, `--turm-text`, `--turm-subtext0/1`, `--turm-accent`, `--turm-red`.
+
+### Environment Variables
+
+Module scripts receive:
+
+| Variable | Value |
+|----------|-------|
+| `TURM_SOCKET` | Path to turm's Unix socket |
+| `TURM_PLUGIN_DIR` | Absolute path to the plugin directory |
+
+Scripts can use `turmctl` for turm integration (CWD, tab info, etc.).
 
 ### Config
 
@@ -360,7 +364,7 @@ turmctl statusbar toggle
 
 ### Architecture
 
-The status bar is a single WebView that aggregates all plugin modules into one HTML page. Modules are placed in left/center/right flexbox containers. The bar has its own `turm` JS bridge instance, so all modules can call turm APIs and listen to events.
+The status bar is a single WebView that renders CSS-styled module containers. Rust periodically runs each module's `exec` command in a thread, then updates the corresponding DOM element via `evaluate_javascript()`. This gives full CSS styling power with lightweight shell-based data collection.
 
 ## Tips
 

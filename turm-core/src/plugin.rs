@@ -44,17 +44,29 @@ fn default_module_order() -> i32 {
     50
 }
 
+fn default_module_interval() -> u64 {
+    10
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PluginModuleDef {
     pub name: String,
-    pub title: String,
-    pub file: String,
+    /// Shell command to execute. stdout is used as module text content.
+    /// If stdout is JSON with a "text" field, that's used instead.
+    /// Optional "tooltip" field for hover text.
+    pub exec: String,
+    /// Execution interval in seconds
+    #[serde(default = "default_module_interval")]
+    pub interval: u64,
     /// Position in the status bar: "left", "center", "right"
     #[serde(default = "default_module_position")]
     pub position: String,
     /// Sort order within position section (lower = first)
     #[serde(default = "default_module_order")]
     pub order: i32,
+    /// CSS class name applied to this module's container element
+    #[serde(default)]
+    pub class: Option<String>,
 }
 
 #[derive(Debug, Clone)]

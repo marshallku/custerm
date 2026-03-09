@@ -443,7 +443,8 @@ pub fn dispatch(
                         })).collect::<Vec<_>>(),
                         "modules": m.modules.iter().map(|md| json!({
                             "name": md.name,
-                            "title": md.title,
+                            "exec": md.exec,
+                            "interval": md.interval,
                             "position": md.position,
                         })).collect::<Vec<_>>(),
                     })

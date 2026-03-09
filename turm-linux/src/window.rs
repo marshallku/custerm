@@ -57,8 +57,6 @@ impl TurmWindow {
 
         // Create a dispatch sender for the plugin JS bridge to reuse
         let (dispatch_tx, plugin_dispatch_rx) = std::sync::mpsc::channel();
-        // Separate sender for the statusbar JS bridge
-        let (statusbar_dispatch_tx, statusbar_dispatch_rx) = std::sync::mpsc::channel();
 
         let tab_manager = TabManager::new(
             config,
@@ -68,13 +66,8 @@ impl TurmWindow {
             dispatch_tx,
         );
 
-        // Status bar
-        let statusbar = Rc::new(StatusBar::new(
-            config,
-            &plugins,
-            statusbar_dispatch_tx,
-            event_bus.clone(),
-        ));
+        // Status bar (native GTK labels, no WebView)
+        let statusbar = Rc::new(StatusBar::new(config, &plugins));
 
         // Layout: vertical box with notebook + statusbar
         let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -125,10 +118,6 @@ impl TurmWindow {
             }
             // Process commands from plugin JS bridges
             while let Ok(cmd) = plugin_dispatch_rx.try_recv() {
-                socket::dispatch(cmd, &mgr, &win, &sp, &sb);
-            }
-            // Process commands from statusbar JS bridge
-            while let Ok(cmd) = statusbar_dispatch_rx.try_recv() {
                 socket::dispatch(cmd, &mgr, &win, &sp, &sb);
             }
             glib::ControlFlow::Continue
