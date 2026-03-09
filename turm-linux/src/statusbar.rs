@@ -98,9 +98,9 @@ body {{
     gap: 12px;
     padding: 0 10px;
 }}
-#left {{ justify-content: flex-start; }}
-#center {{ flex: 1; justify-content: center; }}
-#right {{ justify-content: flex-end; }}
+#left {{ flex: 1 1 0; min-width: 0; justify-content: flex-start; overflow: hidden; }}
+#center {{ flex: 0 0 auto; justify-content: center; }}
+#right {{ flex: 1 1 0; min-width: 0; justify-content: flex-end; overflow: hidden; }}
 .turm-module {{
     display: inline-flex;
     align-items: center;
