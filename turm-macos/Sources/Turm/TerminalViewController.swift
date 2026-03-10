@@ -70,6 +70,57 @@ class TerminalViewController: NSViewController {
         tv.startProcess(executable: config.shell, args: [], environment: env, execName: nil)
     }
 
+    // MARK: - Socket Commands (called on main thread by SocketServer)
+
+    /// Send a command + newline to the PTY (terminal.exec)
+    func execCommand(_ command: String) {
+        terminalView?.send(txt: command + "\n")
+    }
+
+    /// Send raw text to the PTY (terminal.feed)
+    func feedText(_ text: String) {
+        terminalView?.send(txt: text)
+    }
+
+    /// Return terminal state: cols, rows, cursor [row, col], title (terminal.state)
+    func terminalState() -> [String: Any] {
+        guard let tv = terminalView else { return [:] }
+        let term = tv.terminal!
+        let cursor = term.getCursorLocation()
+        return [
+            "cols": term.cols,
+            "rows": term.rows,
+            "cursor": [cursor.y, cursor.x],
+            "title": view.window?.title ?? "turm",
+        ]
+    }
+
+    /// Return visible screen text (terminal.read)
+    func readScreen() -> [String: Any] {
+        guard let tv = terminalView else { return [:] }
+        let term = tv.terminal!
+        var lines: [String] = []
+        for row in 0 ..< term.rows {
+            guard let line = term.getLine(row: row) else {
+                lines.append(String(repeating: " ", count: term.cols))
+                continue
+            }
+            var str = ""
+            for col in 0 ..< term.cols {
+                let ch = line[col].getCharacter()
+                str.append(ch == "\0" ? " " : ch)
+            }
+            lines.append(str)
+        }
+        let cursor = term.getCursorLocation()
+        return [
+            "text": lines.joined(separator: "\n"),
+            "cursor": [cursor.y, cursor.x],
+            "rows": term.rows,
+            "cols": term.cols,
+        ]
+    }
+
     // MARK: - Zoom
 
     func zoomIn() {

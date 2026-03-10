@@ -4,6 +4,7 @@ import AppKit
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow?
     var terminalVC: TerminalViewController?
+    private let socketServer = SocketServer()
 
     func applicationDidFinishLaunching(_: Notification) {
         let config = TurmConfig.load()
@@ -29,10 +30,56 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         self.window = window
         terminalVC = termVC
+
+        startSocketServer()
+    }
+
+    func applicationWillTerminate(_: Notification) {
+        socketServer.stop()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool {
         true
+    }
+
+    // MARK: - Socket Server
+
+    private func startSocketServer() {
+        socketServer.commandHandler = { [weak self] method, params in
+            self?.handleCommand(method: method, params: params)
+        }
+        socketServer.start()
+    }
+
+    private func handleCommand(method: String, params: [String: Any]) -> Any? {
+        guard let vc = terminalVC else { return nil }
+        switch method {
+        case "system.ping":
+            return ["status": "ok"]
+
+        case "terminal.exec":
+            guard let command = params["command"] as? String else {
+                return nil
+            }
+            vc.execCommand(command)
+            return ["ok": true]
+
+        case "terminal.feed":
+            guard let text = params["text"] as? String else {
+                return nil
+            }
+            vc.feedText(text)
+            return ["ok": true]
+
+        case "terminal.state":
+            return vc.terminalState()
+
+        case "terminal.read":
+            return vc.readScreen()
+
+        default:
+            return nil
+        }
     }
 
     // MARK: - Menu Bar
