@@ -6,10 +6,16 @@ let package = Package(
     platforms: [
         .macOS(.v14),
     ],
+    dependencies: [
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.2.0"),
+    ],
     targets: [
         .executableTarget(
             name: "Turm",
-            path: "Sources/Turm"
+            dependencies: [
+                .product(name: "SwiftTerm", package: "SwiftTerm"),
+            ],
+            path: "Sources/Turm",
         ),
-    ]
+    ],
 )

@@ -120,7 +120,23 @@ Collapsible tab bar and renamable tabs.
 - [ ] Session persistence / restore
 - [x] Plugin system (HTML/JS panels + shell commands via plugin.toml manifest)
 - [x] Status bar (Waybar-style bar with plugin modules, left/center/right sections)
-- [ ] macOS native app (Swift/AppKit)
+- [~] macOS native app (Swift/AppKit) — Phase 1 MVP complete (see below)
+
+### macOS App (Phase 1 MVP) ✅
+
+- [x] SwiftTerm integration (LocalProcessTerminalView) via Swift Package Manager
+- [x] Shell spawn via PTY (SwiftTerm handles PTY internally)
+- [x] TOML config loading (shell, font_family, font_size, theme name)
+- [x] All 10 built-in themes (color palette + ANSI colors injected into SwiftTerm)
+- [x] Window title update via OSC (setTerminalTitle delegate)
+- [x] Font scale zoom (Cmd+= / Cmd+- / Cmd+0 via View menu)
+- [x] TURM_SOCKET env var injected into shell
+- [x] Process exit → window close
+- [ ] Tab bar (NSTabViewController or custom)
+- [ ] Split panes
+- [ ] Background images
+- [ ] In-terminal search
+- [ ] Unix socket server (IPC with turmctl)
 
 ## Pending Cleanup
 

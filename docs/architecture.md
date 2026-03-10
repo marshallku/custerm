@@ -41,10 +41,14 @@ turm/
 │       ├── main.rs          # Entry point, output formatting
 │       ├── commands.rs      # clap subcommands (session, background, tab, split, event, webview)
 │       └── client.rs        # Unix socket client
-└── turm-macos/           # Swift/AppKit app (stub)
-    ├── Package.swift        # Swift Package Manager config (Swift 6, macOS 14+)
+└── turm-macos/           # Swift/AppKit native terminal (Phase 1 MVP)
+    ├── Package.swift        # Swift Package Manager config (Swift 6, macOS 14+, SwiftTerm dep)
     └── Sources/Turm/
-        └── TurmApp.swift # Basic NSWindow, terminal view TBD
+        ├── TurmApp.swift            # @main entry point
+        ├── AppDelegate.swift        # NSApplicationDelegate, menu bar, window creation
+        ├── TerminalViewController.swift  # NSViewController wrapping LocalProcessTerminalView
+        ├── Config.swift             # TOML config parser (shell, font, theme)
+        └── Theme.swift              # 10 built-in themes (mirrors turm-core/theme.rs)
 ```
 
 ## Tech Stack
@@ -53,7 +57,7 @@ turm/
 | --------------- | ----------------------------------------------------------- |
 | Core library    | Rust (shared across platforms)                              |
 | Linux terminal  | GTK4 + VTE4 (VTE handles PTY internally, zero IPC overhead) |
-| macOS terminal  | Swift/AppKit + SwiftTerm or Ghostty embedding (TBD)         |
+| macOS terminal  | Swift/AppKit + SwiftTerm (LocalProcessTerminalView)         |
 | CLI tool        | clap (Rust)                                                 |
 | Config          | TOML (`~/.config/turm/config.toml`)                         |
 | IPC (Linux)     | D-Bus session bus (`com.marshall.turm`)                     |
