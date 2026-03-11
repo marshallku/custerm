@@ -65,8 +65,6 @@ final class TabViewController: NSViewController {
     }
 
     /// Called by AppDelegate after makeKeyAndOrderFront.
-    /// Sets view.frame from the window's content rect so Auto Layout resolves
-    /// subviews at the real size before the first shell starts.
     func openInitialTab() {
         newTab()
     }
@@ -79,11 +77,8 @@ final class TabViewController: NSViewController {
         terminals.append(termVC)
 
         termVC.onProcessTerminated = { [weak self, weak termVC] in
-            turmDbg("onProcessTerminated closure: self=\(self != nil), termVC=\(termVC != nil)")
             guard let self, let termVC else { return }
-            let index = terminals.firstIndex(where: { $0 === termVC })
-            turmDbg("onProcessTerminated: index=\(index as Any), terminalCount=\(terminals.count)")
-            if let index {
+            if let index = terminals.firstIndex(where: { $0 === termVC }) {
                 closeTab(at: index)
             }
         }
@@ -101,8 +96,7 @@ final class TabViewController: NSViewController {
     }
 
     func closeTab(at index: Int) {
-        turmDbg("closeTab at=\(index), count=\(terminals.count)")
-        guard terminals.indices.contains(index) else { turmDbg("closeTab: index out of range"); return }
+        guard terminals.indices.contains(index) else { return }
 
         // Remove child VC
         let termVC = terminals[index]
@@ -111,7 +105,6 @@ final class TabViewController: NSViewController {
         terminals.remove(at: index)
 
         if terminals.isEmpty {
-            turmDbg("closeTab: last tab, closing window=\(view.window != nil)")
             view.window?.close()
             return
         }
