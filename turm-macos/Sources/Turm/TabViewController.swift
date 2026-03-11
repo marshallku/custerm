@@ -79,8 +79,11 @@ final class TabViewController: NSViewController {
         terminals.append(termVC)
 
         termVC.onProcessTerminated = { [weak self, weak termVC] in
+            turmDbg("onProcessTerminated closure: self=\(self != nil), termVC=\(termVC != nil)")
             guard let self, let termVC else { return }
-            if let index = terminals.firstIndex(where: { $0 === termVC }) {
+            let index = terminals.firstIndex(where: { $0 === termVC })
+            turmDbg("onProcessTerminated: index=\(index as Any), terminalCount=\(terminals.count)")
+            if let index {
                 closeTab(at: index)
             }
         }
@@ -98,7 +101,8 @@ final class TabViewController: NSViewController {
     }
 
     func closeTab(at index: Int) {
-        guard terminals.indices.contains(index) else { return }
+        turmDbg("closeTab at=\(index), count=\(terminals.count)")
+        guard terminals.indices.contains(index) else { turmDbg("closeTab: index out of range"); return }
 
         // Remove child VC
         let termVC = terminals[index]
@@ -107,6 +111,7 @@ final class TabViewController: NSViewController {
         terminals.remove(at: index)
 
         if terminals.isEmpty {
+            turmDbg("closeTab: last tab, closing window=\(view.window != nil)")
             view.window?.close()
             return
         }

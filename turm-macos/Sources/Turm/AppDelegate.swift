@@ -7,6 +7,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let socketServer = SocketServer()
 
     func applicationDidFinishLaunching(_: Notification) {
+        turmDbg("app launched")
         let config = TurmConfig.load()
         let theme = TurmTheme.byName(config.themeName) ?? .catppuccinMocha
 

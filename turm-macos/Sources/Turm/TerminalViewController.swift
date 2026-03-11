@@ -1,15 +1,48 @@
 import AppKit
 import SwiftTerm
 
+func turmDbg(_ msg: String) {
+    guard let data = "\(msg)\n".data(using: .utf8) else { return }
+    let path = "/tmp/turm-debug.log"
+    if let fh = FileHandle(forWritingAtPath: path) {
+        fh.seekToEndOfFile(); fh.write(data); fh.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: data)
+    }
+}
+
 extension Notification.Name {
     static let terminalTitleChanged = Notification.Name("TurmTerminalTitleChanged")
+}
+
+private class TurmTerminalView: LocalProcessTerminalView {
+    private var exitMonitor: (any DispatchSourceProcess)?
+
+    func installExitMonitor() {
+        let pid = process.shellPid
+        guard pid > 0 else { return }
+        let src = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
+        src.setEventHandler { [weak self, weak src] in
+            src?.cancel()
+            guard let self else { return }
+            turmDbg("TurmTerminalView exitMonitor fired, pid=\(pid)")
+            processDelegate?.processTerminated(source: self, exitCode: nil)
+        }
+        exitMonitor = src
+        src.activate()
+        turmDbg("TurmTerminalView installed exitMonitor for pid=\(pid)")
+    }
+
+    deinit {
+        exitMonitor?.cancel()
+    }
 }
 
 @MainActor
 class TerminalViewController: NSViewController {
     private let config: TurmConfig
     private let theme: TurmTheme
-    private var terminalView: LocalProcessTerminalView?
+    private var terminalView: TurmTerminalView?
     private var currentFontSize: CGFloat
 
     private(set) var currentTitle: String = "Terminal"
@@ -29,7 +62,7 @@ class TerminalViewController: NSViewController {
     }
 
     override func loadView() {
-        let tv = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 1200, height: 800))
+        let tv = TurmTerminalView(frame: NSRect(x: 0, y: 0, width: 1200, height: 800))
         configureColors(tv)
         configureFont(tv, size: currentFontSize)
         tv.processDelegate = self
@@ -48,6 +81,7 @@ class TerminalViewController: NSViewController {
     func startShellIfNeeded() {
         guard !shellStarted else { return }
         shellStarted = true
+        turmDbg("startShell")
         startShell()
     }
 
@@ -85,6 +119,8 @@ class TerminalViewController: NSViewController {
         env.append("TURM_SOCKET=\(socketPath)")
 
         tv.startProcess(executable: config.shell, args: [], environment: env, execName: nil)
+        tv.installExitMonitor()
+        turmDbg("startProcess done, shell=\(config.shell)")
     }
 
     // MARK: - Socket Commands (called on main thread by SocketServer)
@@ -169,14 +205,17 @@ extension TerminalViewController: LocalProcessTerminalViewDelegate {
     }
 
     nonisolated func setTerminalTitle(source _: LocalProcessTerminalView, title: String) {
+        turmDbg("setTerminalTitle: \(title)")
         Task { @MainActor in
             self.currentTitle = title.isEmpty ? "Terminal" : title
             NotificationCenter.default.post(name: .terminalTitleChanged, object: self)
         }
     }
 
-    nonisolated func processTerminated(source _: TerminalView, exitCode _: Int32?) {
+    nonisolated func processTerminated(source _: TerminalView, exitCode: Int32?) {
+        turmDbg("processTerminated called, exitCode=\(exitCode as Any)")
         Task { @MainActor in
+            turmDbg("processTerminated MainActor, hasCb=\(onProcessTerminated != nil)")
             if let cb = self.onProcessTerminated {
                 cb()
             } else {
