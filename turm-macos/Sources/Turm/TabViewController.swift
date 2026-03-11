@@ -1,7 +1,6 @@
 import AppKit
 
-/// Manages multiple terminal tabs.
-/// Mirrors the role of TabManager + tabs.rs in turm-linux.
+/// Manages multiple terminal tabs, each backed by a PaneManager (split-pane tree).
 @MainActor
 final class TabViewController: NSViewController {
     private let config: TurmConfig
@@ -9,11 +8,15 @@ final class TabViewController: NSViewController {
 
     private var tabBar: TabBarView!
     private var contentArea: NSView!
-    private var terminals: [TerminalViewController] = []
+    private var paneManagers: [PaneManager] = []
     private(set) var activeIndex: Int = -1
 
+    var activePaneManager: PaneManager? {
+        paneManagers.indices.contains(activeIndex) ? paneManagers[activeIndex] : nil
+    }
+
     var activeTerminal: TerminalViewController? {
-        terminals.indices.contains(activeIndex) ? terminals[activeIndex] : nil
+        activePaneManager?.activePane
     }
 
     init(config: TurmConfig, theme: TurmTheme) {
@@ -37,7 +40,7 @@ final class TabViewController: NSViewController {
         tabBar = TabBarView(theme: theme)
         tabBar.translatesAutoresizingMaskIntoConstraints = false
         tabBar.onSelectTab = { [weak self] i in self?.switchTab(to: i) }
-        tabBar.onCloseTab = { [weak self] i in self?.closeTab(at: i) }
+        tabBar.onCloseTab = { [weak self] i in self?.closeTabByButton(at: i) }
         tabBar.onNewTab = { [weak self] in self?.newTab() }
         root.addSubview(tabBar)
 
@@ -64,7 +67,6 @@ final class TabViewController: NSViewController {
         super.viewDidLoad()
     }
 
-    /// Called by AppDelegate after makeKeyAndOrderFront.
     func openInitialTab() {
         newTab()
     }
@@ -72,91 +74,107 @@ final class TabViewController: NSViewController {
     // MARK: - Tab Operations
 
     func newTab() {
-        let termVC = TerminalViewController(config: config, theme: theme)
-        addChild(termVC)
-        terminals.append(termVC)
-
-        termVC.onProcessTerminated = { [weak self, weak termVC] in
-            guard let self, let termVC else { return }
-            if let index = terminals.firstIndex(where: { $0 === termVC }) {
+        let manager = PaneManager(config: config, theme: theme)
+        manager.onLastPaneClosed = { [weak self, weak manager] in
+            guard let self, let manager else { return }
+            if let index = paneManagers.firstIndex(where: { $0 === manager }) {
                 closeTab(at: index)
             }
         }
+        manager.onActivePaneChanged = { [weak self] in
+            self?.refreshTabBar()
+        }
 
-        // Observe title changes to refresh tab bar
+        // Observe title changes from any terminal in this manager
         NotificationCenter.default.addObserver(
             forName: .terminalTitleChanged,
-            object: termVC,
+            object: nil,
             queue: .main,
         ) { [weak self] _ in
             Task { @MainActor in self?.refreshTabBar() }
         }
 
-        switchTab(to: terminals.count - 1)
+        paneManagers.append(manager)
+        switchTab(to: paneManagers.count - 1)
     }
 
     func closeTab(at index: Int) {
-        guard terminals.indices.contains(index) else { return }
+        guard paneManagers.indices.contains(index) else { return }
 
-        // Remove child VC
-        let termVC = terminals[index]
-        termVC.view.removeFromSuperview()
-        termVC.removeFromParent()
-        terminals.remove(at: index)
+        let manager = paneManagers[index]
+        manager.containerView.removeFromSuperview()
+        paneManagers.remove(at: index)
 
-        if terminals.isEmpty {
+        if paneManagers.isEmpty {
             view.window?.close()
             return
         }
 
-        let nextIndex = min(activeIndex, terminals.count - 1)
-        // Force update even if index didn't change (the tab at that index changed)
+        let nextIndex = min(activeIndex, paneManagers.count - 1)
+        activeIndex = -1
+        switchTab(to: nextIndex)
+    }
+
+    /// Called from tab bar close button — closes all panes in the tab.
+    private func closeTabByButton(at index: Int) {
+        guard paneManagers.indices.contains(index) else { return }
+        let manager = paneManagers[index]
+        // Terminate all shells before closing
+        manager.allTerminals().forEach { $0.view.removeFromSuperview(); $0.removeFromParent() }
+        manager.containerView.removeFromSuperview()
+        paneManagers.remove(at: index)
+
+        if paneManagers.isEmpty {
+            view.window?.close()
+            return
+        }
+
+        let nextIndex = min(activeIndex, paneManagers.count - 1)
         activeIndex = -1
         switchTab(to: nextIndex)
     }
 
     func switchTab(to index: Int) {
-        guard terminals.indices.contains(index), index != activeIndex else { return }
+        guard paneManagers.indices.contains(index), index != activeIndex else { return }
 
-        // Remove current terminal view
-        if let current = activeTerminal {
-            current.view.removeFromSuperview()
+        // Remove current manager's container
+        if let current = activePaneManager {
+            current.containerView.removeFromSuperview()
         }
 
         activeIndex = index
-        let termVC = terminals[index]
+        let manager = paneManagers[index]
 
-        // Embed new terminal view
-        termVC.view.translatesAutoresizingMaskIntoConstraints = false
-        contentArea.addSubview(termVC.view)
+        contentArea.addSubview(manager.containerView)
         NSLayoutConstraint.activate([
-            termVC.view.topAnchor.constraint(equalTo: contentArea.topAnchor),
-            termVC.view.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
-            termVC.view.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
-            termVC.view.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+            manager.containerView.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            manager.containerView.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+            manager.containerView.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+            manager.containerView.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
         ])
 
         view.layoutSubtreeIfNeeded()
-        termVC.startShellIfNeeded()
-
-        termVC.view.window?.makeFirstResponder(termVC.view)
+        manager.allTerminals().forEach { $0.startShellIfNeeded() }
+        manager.activePane.view.window?.makeFirstResponder(manager.activePane.view)
 
         refreshTabBar()
     }
 
-    private func refreshTabBar() {
-        let titles = terminals.map(\.currentTitle)
-        tabBar.setTabs(titles: titles, activeIndex: activeIndex)
+    // MARK: - Split Operations
+
+    func splitActivePane(orientation: SplitOrientation) {
+        activePaneManager?.splitActive(orientation: orientation)
     }
 
-    // MARK: - Terminal tab title updates
+    func closeActivePane() {
+        activePaneManager?.closeActive()
+    }
 
-    func terminalTitleChanged(for termVC: TerminalViewController) {
-        guard let index = terminals.firstIndex(where: { $0 === termVC }) else { return }
-        tabBar.updateTitle(termVC.currentTitle, at: index)
-        if index == activeIndex {
-            view.window?.title = termVC.currentTitle
-        }
+    // MARK: - Tab Bar
+
+    private func refreshTabBar() {
+        let titles = paneManagers.map(\.activePane.currentTitle)
+        tabBar.setTabs(titles: titles, activeIndex: activeIndex)
     }
 
     // MARK: - Socket Commands
@@ -178,8 +196,8 @@ final class TabViewController: NSViewController {
     }
 
     func tabList() -> [[String: Any]] {
-        terminals.enumerated().map { i, t in
-            ["index": i, "title": t.currentTitle, "active": i == activeIndex]
+        paneManagers.enumerated().map { i, m in
+            ["index": i, "title": m.activePane.currentTitle, "active": i == activeIndex]
         }
     }
 }

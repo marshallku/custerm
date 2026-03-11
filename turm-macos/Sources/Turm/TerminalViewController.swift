@@ -208,7 +208,7 @@ extension TerminalViewController: LocalProcessTerminalViewDelegate {
         }
     }
 
-    nonisolated func processTerminated(source _: TerminalView, exitCode: Int32?) {
+    nonisolated func processTerminated(source _: TerminalView, exitCode _: Int32?) {
         Task { @MainActor in
             if let cb = self.onProcessTerminated {
                 cb()

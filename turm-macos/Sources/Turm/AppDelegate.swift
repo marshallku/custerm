@@ -69,9 +69,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         newTabItem.target = self
         shellMenu.addItem(newTabItem)
 
-        let closeTabItem = NSMenuItem(title: "Close Tab", action: #selector(closeTab), keyEquivalent: "w")
-        closeTabItem.target = self
-        shellMenu.addItem(closeTabItem)
+        let closePaneItem = NSMenuItem(title: "Close Pane", action: #selector(closePane), keyEquivalent: "w")
+        closePaneItem.target = self
+        shellMenu.addItem(closePaneItem)
+
+        shellMenu.addItem(.separator())
+
+        let splitHItem = NSMenuItem(title: "Split Pane Horizontally", action: #selector(splitHorizontal), keyEquivalent: "d")
+        splitHItem.target = self
+        shellMenu.addItem(splitHItem)
+
+        let splitVItem = NSMenuItem(title: "Split Pane Vertically", action: #selector(splitVertical), keyEquivalent: "D")
+        splitVItem.keyEquivalentModifierMask = [.command, .shift]
+        splitVItem.target = self
+        shellMenu.addItem(splitVItem)
 
         shellMenu.addItem(.separator())
 
@@ -103,14 +114,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
 
-    // MARK: - Tab Actions
+    // MARK: - Tab / Pane Actions
 
     @objc private func newTab() {
         tabVC?.newTab()
     }
 
-    @objc private func closeTab() {
-        tabVC?.closeTab(at: tabVC?.activeIndex ?? 0)
+    @objc private func closePane() {
+        tabVC?.closeActivePane()
+    }
+
+    @objc private func splitHorizontal() {
+        tabVC?.splitActivePane(orientation: .horizontal)
+    }
+
+    @objc private func splitVertical() {
+        tabVC?.splitActivePane(orientation: .vertical)
     }
 
     @objc private func switchTabByNumber(_ sender: NSMenuItem) {
@@ -167,7 +186,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return ["ok": true]
 
         case "tab.close":
-            vc.closeTab(at: vc.activeIndex)
+            vc.closeActivePane()
+            return ["ok": true]
+
+        case "split.horizontal":
+            vc.splitActivePane(orientation: .horizontal)
+            return ["ok": true]
+
+        case "split.vertical":
+            vc.splitActivePane(orientation: .vertical)
             return ["ok": true]
 
         case "tab.list":
