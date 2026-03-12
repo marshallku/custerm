@@ -196,6 +196,49 @@ nonisolated func setTerminalTitle(...) {
 }
 ```
 
+### TurmPanel.swift
+
+모든 패널 타입의 공통 인터페이스:
+
+```swift
+@MainActor
+protocol TurmPanel: AnyObject {
+    var view: NSView { get }
+    var currentTitle: String { get }
+    func startIfNeeded()
+    func applyBackground(path: String, tint: Double)
+    func clearBackground()
+    func setTint(_ alpha: Double)
+    func removeFromParent()
+}
+```
+
+`TerminalViewController`와 `WebViewController` 모두 이 프로토콜을 구현. `SplitNode`와 `PaneManager`는 `any TurmPanel`로 동작해서 터미널과 웹뷰를 같은 분할 트리에 섞어 쓸 수 있음.
+
+### WebViewController.swift (`@MainActor`)
+
+`WKWebView` 래퍼. `TurmPanel` 프로토콜 구현.
+
+- `startIfNeeded()` — 초기 URL 로드 (없으면 blank page)
+- `navigate(to:)` — URL 탐색 (scheme 없으면 `https://` 자동 추가)
+- `goBack()` / `goForward()` / `reload()` — 네비게이션
+- `executeJS(_:completion:)` — JS 평가 (비동기, WKWebView 콜백)
+- `getContent(completion:)` — `document.documentElement.outerHTML` 반환
+- `toggleDevTools()` — `developerExtrasEnabled` 토글 (Safari Web Inspector)
+- `WKNavigationDelegate.webView(_:didFinish:)` — 탭 제목 업데이트 → `terminalTitleChanged` 알림 발행
+
+**배경 이미지:** `applyBackground`, `clearBackground`, `setTint` 모두 no-op (WebView는 자체 렌더링).
+
+### SocketServer.swift (비동기 핸들러)
+
+```swift
+var commandHandler: ((_ method: String, _ params: [String: Any], _ completion: @escaping (Any?) -> Void) -> Void)?
+```
+
+기존 동기 패턴에서 completion 기반으로 변경. 소켓 스레드는 `DispatchSemaphore`로 블록하고, 메인 스레드에서 핸들러가 completion을 호출하면 unblock. `webview.execute_js`처럼 WKWebView 콜백 이후에 응답해야 하는 커맨드를 지원.
+
+**`ResultBox`**: `@unchecked Sendable` 클래스로 메인 액터 → 소켓 스레드 간 결과 전달. 세마포어가 직렬화를 보장하므로 안전.
+
 ### Config.swift
 
 `~/.config/turm/config.toml`을 직접 파싱.
@@ -265,6 +308,44 @@ turmctl ──Unix socket──► SocketServer (background thread)
 | `split.vertical` | — | 상하 분할 |
 | `session.list` | — | `tab.list`와 동일 |
 | `session.info` | `index` | 특정 탭의 상세 정보 |
+| `webview.open` | `url` (선택) | 새 웹뷰 탭 생성 |
+| `webview.navigate` | `url` | 활성 웹뷰 URL 이동 |
+| `webview.back` | — | 뒤로 |
+| `webview.forward` | — | 앞으로 |
+| `webview.reload` | — | 새로고침 |
+| `webview.execute_js` | `script` | JS 평가 (비동기 응답) |
+| `webview.get_content` | — | 페이지 HTML 반환 (비동기) |
+| `webview.devtools` | — | Safari Web Inspector 토글 |
+| `webview.state` | — | url/title/can_go_back/forward/is_loading |
+
+---
+
+## Linux 대비 미구현 기능 (포팅 예정)
+
+### ~~Phase 2: WebView Panel~~ ✅ 구현 완료
+
+`WebViewController.swift` + `TurmPanel.swift` 참조.
+
+### Phase 3: AI Agent & Shell Integration
+- **Event stream** — `event.subscribe` 소켓 커맨드. 터미널 출력, 포커스 변화, 패널 라이프사이클 이벤트 구독
+- **CWD tracking** — OSC 7 파싱 → `terminal.cwd_changed` 이벤트 발행 (현재 `hostCurrentDirectoryUpdate` stub만 있음)
+- **Shell integration** — OSC 133 시퀀스 파싱 → `terminal.shell_precmd` / `terminal.shell_preexec` 이벤트
+- **Notification channel** — OSC 9/777 → `terminal.notification` 이벤트
+- **Approval workflow** — `agent.approve` 소켓 커맨드, NSAlert 모달 표시 후 결과 반환
+
+### Phase 4: Tab Bar & UX Polish
+- **Tab bar toggle** — 아이콘만 보이는 collapsed 모드 (Cmd+Shift+B), `tabs.toggle_bar` 소켓
+- **Double-click rename** — 탭 라벨 더블클릭으로 인라인 편집
+- **Pane focus navigation** — 키보드로 다음/이전 pane 포커스 이동
+- **Background random rotation** — `background.next` 소켓 커맨드, `[background] directory` 설정
+- **Config hot-reload** — 파일 변경 감지 후 테마/설정 즉시 반영
+
+### Phase 5: Distribution & Ecosystem
+- Session persistence / restore
+- Clipboard integration (OSC 52)
+- URL detection + click-to-open
+- Plugin system
+- Status bar
 
 ---
 

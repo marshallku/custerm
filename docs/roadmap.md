@@ -122,8 +122,11 @@ Collapsible tab bar and renamable tabs.
 - [x] Status bar (Waybar-style bar with plugin modules, left/center/right sections)
 - [~] macOS native app (Swift/AppKit) — Phase 1 MVP complete (see below)
 
-### macOS App ✅
+### macOS App
 
+Goal: full Linux feature parity. Phase 1 MVP complete; porting remaining Linux features.
+
+**Phase 1 — MVP ✅**
 - [x] SwiftTerm integration (LocalProcessTerminalView) via Swift Package Manager
 - [x] Shell spawn via PTY (SwiftTerm handles PTY internally)
 - [x] TOML config loading (shell, font_family, font_size, theme name)
@@ -138,6 +141,37 @@ Collapsible tab bar and renamable tabs.
 - [x] Full socket API: terminal.exec/feed/state/read/history/context, tab.new/close/switch/list/info/rename, split.horizontal/vertical, session.list/info
 - [x] In-terminal search (Cmd+F / Cmd+G / Cmd+Shift+G — SwiftTerm built-in find bar with case/regex/whole-word)
 - [x] Background images (NSImageView + tint overlay per pane, config `[background] path/tint`, socket `background.set/clear/set_tint`)
+
+**Phase 2 — WebView Panel ✅**
+- [x] WKWebView panel type (WebViewController, macOS native WebKit)
+- [x] TurmPanel protocol — TerminalViewController + WebViewController share common interface
+- [x] SplitNode uses `any TurmPanel` — terminal and webview can be split side-by-side
+- [x] Socket API: webview.open/navigate/back/forward/reload/execute_js/get_content/devtools/state
+- [x] Tab title updates via WKNavigationDelegate (posts terminalTitleChanged notification)
+- [x] Tab bar supports mixed terminal + webview tabs
+- [x] SocketServer upgraded to async handler — execute_js/get_content return after WKWebView callback
+- [x] Cmd+Shift+T opens new web tab from menu
+
+**Phase 3 — AI Agent & Shell Integration**
+- [ ] Event stream (socket `event.subscribe` — terminal output, focus, lifecycle events)
+- [ ] CWD tracking (OSC 7 → `terminal.cwd_changed` event)
+- [ ] Shell integration signals (`terminal.shell_precmd` / `terminal.shell_preexec` via OSC 133)
+- [ ] Notification channel (OSC 9/777 → `terminal.notification` event)
+- [ ] Approval workflow (`agent.approve` modal dialog)
+
+**Phase 4 — Tab Bar & UX Polish**
+- [ ] Tab bar toggle (collapsed icon-only mode, Cmd+Shift+B, socket `tabs.toggle_bar`)
+- [ ] Double-click tab rename (inline editing)
+- [ ] Pane focus navigation keyboard shortcuts (next/prev pane)
+- [ ] Background random rotation (socket `background.next`, config `[background] directory`)
+- [ ] Theme hot-reload (config file watcher)
+
+**Phase 5 — Distribution & Ecosystem**
+- [ ] Session persistence / restore
+- [ ] Clipboard integration (OSC 52)
+- [ ] URL detection + click-to-open
+- [ ] Plugin system (HTML/JS panels + shell commands via plugin.toml)
+- [ ] Status bar (Waybar-style modules)
 
 ## Pending Cleanup
 

@@ -38,7 +38,7 @@ private class TurmTerminalView: LocalProcessTerminalView {
 // MARK: - TerminalViewController
 
 @MainActor
-class TerminalViewController: NSViewController {
+class TerminalViewController: NSViewController, TurmPanel {
     private let config: TurmConfig
     private let theme: TurmTheme
     private var terminalView: TurmTerminalView?
@@ -128,9 +128,9 @@ class TerminalViewController: NSViewController {
         }
     }
 
-    /// Called by TabViewController after the view has been added to the hierarchy
+    /// Called after the view has been added to the hierarchy
     /// and Auto Layout has been forced to resolve (layoutSubtreeIfNeeded).
-    func startShellIfNeeded() {
+    func startIfNeeded() {
         guard !shellStarted else { return }
         shellStarted = true
         startShell()

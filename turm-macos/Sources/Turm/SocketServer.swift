@@ -7,15 +7,17 @@ import Foundation
 /// Threading model:
 ///   - Accept loop runs on a dedicated Thread (POSIX blocking)
 ///   - Each client gets its own Thread
-///   - Command handler is always called via DispatchQueue.main.sync
-///   - Caller thread blocks on semaphore until main thread returns result
+///   - Command handler is dispatched via DispatchQueue.main.async
+///   - Socket thread blocks on a DispatchSemaphore until the handler calls its completion
+///   - Async commands (e.g. webview.execute_js) call completion from within a WKWebView callback
 final class SocketServer: @unchecked Sendable {
     private let socketPath: String
     private var serverFd: Int32 = -1
 
     /// Called on the main thread to dispatch a command.
-    /// Returns the result dict, or nil for unknown method.
-    var commandHandler: ((_ method: String, _ params: [String: Any]) -> Any?)?
+    /// Must call `completion` with the result (or nil for unknown method) — may be called
+    /// asynchronously (e.g. after a WKWebView JS evaluation completes).
+    var commandHandler: ((_ method: String, _ params: [String: Any], _ completion: @escaping (Any?) -> Void) -> Void)?
 
     init() {
         let pid = ProcessInfo.processInfo.processIdentifier
@@ -104,6 +106,12 @@ final class SocketServer: @unchecked Sendable {
         }
     }
 
+    /// Box for passing the handler result from main-actor context to socket thread.
+    /// @unchecked Sendable is safe here: access is serialized by the semaphore.
+    private final class ResultBox: @unchecked Sendable {
+        var value: Any?
+    }
+
     private func dispatch(_ data: Data) -> Data {
         guard
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -115,23 +123,29 @@ final class SocketServer: @unchecked Sendable {
 
         let params = json["params"] as? [String: Any] ?? [:]
 
-        // Call handler on main thread and wait synchronously
-        let outcome: (result: Any, ok: Bool) = DispatchQueue.main.sync {
-            guard let result = self.commandHandler?(method, params) else {
-                return (["code": "unknown_method", "message": "unknown: \(method)"] as [String: Any], false)
+        // Dispatch to main thread asynchronously; block socket thread on semaphore.
+        // Supports both sync commands (completion called immediately) and async
+        // commands like webview.execute_js (completion called from WKWebView callback).
+        let sema = DispatchSemaphore(value: 0)
+        let box = ResultBox()
+
+        DispatchQueue.main.async {
+            guard let handler = self.commandHandler else {
+                sema.signal()
+                return
             }
-            return (result, true)
+            handler(method, params) { value in
+                box.value = value
+                sema.signal()
+            }
         }
 
-        if outcome.ok {
-            return success(id: id, result: outcome.result)
+        sema.wait()
+
+        if let result = box.value {
+            return success(id: id, result: result)
         } else {
-            let err = outcome.result as? [String: Any] ?? [:]
-            return error(
-                id: id,
-                code: err["code"] as? String ?? "error",
-                message: err["message"] as? String ?? "unknown error",
-            )
+            return error(id: id, code: "unknown_method", message: "unknown: \(method)")
         }
     }
 

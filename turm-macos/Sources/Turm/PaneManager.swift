@@ -53,6 +53,11 @@ private class EqualSplitView: NSSplitView, NSSplitViewDelegate {
     }
 }
 
+enum InitialPanel {
+    case terminal
+    case webview(url: URL?)
+}
+
 /// Manages the split-pane tree for a single tab.
 /// TabViewController embeds `containerView` once; PaneManager rebuilds its
 /// contents on every split/close using fresh NSSplitView instances.
@@ -62,7 +67,7 @@ final class PaneManager {
     private let theme: TurmTheme
 
     private(set) var root: SplitNode
-    private(set) var activePane: TerminalViewController
+    private(set) var activePane: any TurmPanel
 
     /// Stable container — TabViewController pins this to contentArea once and never re-embeds.
     let containerView: NSView
@@ -77,18 +82,24 @@ final class PaneManager {
 
     // MARK: - Init
 
-    init(config: TurmConfig, theme: TurmTheme) {
+    init(config: TurmConfig, theme: TurmTheme, initialPanel: InitialPanel = .terminal) {
         self.config = config
         self.theme = theme
 
-        let termVC = TerminalViewController(config: config, theme: theme)
-        root = .leaf(termVC)
-        activePane = termVC
+        let panel: any TurmPanel = switch initialPanel {
+        case .terminal:
+            TerminalViewController(config: config, theme: theme)
+        case let .webview(url):
+            WebViewController(url: url)
+        }
+
+        root = .leaf(panel)
+        activePane = panel
 
         containerView = NSView()
         containerView.translatesAutoresizingMaskIntoConstraints = false
 
-        wireTerminal(termVC)
+        wirePanel(panel)
         rebuildViewHierarchy()
         installClickMonitor()
     }
@@ -101,15 +112,28 @@ final class PaneManager {
 
     func splitActive(orientation: SplitOrientation) {
         let newTermVC = TerminalViewController(config: config, theme: theme)
-        wireTerminal(newTermVC)
+        wirePanel(newTermVC)
 
         root = root.splitting(activePane, with: .leaf(newTermVC), orientation: orientation)
 
         rebuildViewHierarchy()
 
         setActive(newTermVC)
-        newTermVC.startShellIfNeeded()
+        newTermVC.startIfNeeded()
         newTermVC.view.window?.makeFirstResponder(newTermVC.view)
+    }
+
+    func splitActiveWithWebView(url: URL? = nil, orientation: SplitOrientation = .horizontal) {
+        let webVC = WebViewController(url: url)
+        wirePanel(webVC)
+
+        root = root.splitting(activePane, with: .leaf(webVC), orientation: orientation)
+
+        rebuildViewHierarchy()
+
+        setActive(webVC)
+        webVC.startIfNeeded()
+        webVC.view.window?.makeFirstResponder(webVC.view)
     }
 
     func closeActive() {
@@ -131,29 +155,41 @@ final class PaneManager {
         next.view.window?.makeFirstResponder(next.view)
     }
 
-    func setActive(_ terminal: TerminalViewController) {
-        activePane = terminal
+    func setActive(_ panel: any TurmPanel) {
+        activePane = panel
         onActivePaneChanged?()
     }
 
-    func allTerminals() -> [TerminalViewController] {
+    func allPanels() -> [any TurmPanel] {
         root.allLeaves()
     }
 
+    func allTerminals() -> [TerminalViewController] {
+        root.allLeaves().compactMap { $0 as? TerminalViewController }
+    }
+
+    func activeTerminal() -> TerminalViewController? {
+        activePane as? TerminalViewController
+    }
+
+    func activeWebView() -> WebViewController? {
+        activePane as? WebViewController
+    }
+
     func setCustomTitle(_ title: String) {
-        activePane.setCustomTitle(title)
+        (activePane as? TerminalViewController)?.setCustomTitle(title)
     }
 
     func applyBackground(path: String, tint: Double) {
-        allTerminals().forEach { $0.applyBackground(path: path, tint: tint) }
+        allPanels().forEach { $0.applyBackground(path: path, tint: tint) }
     }
 
     func clearBackground() {
-        allTerminals().forEach { $0.clearBackground() }
+        allPanels().forEach { $0.clearBackground() }
     }
 
     func setTint(_ alpha: Double) {
-        allTerminals().forEach { $0.setTint(alpha) }
+        allPanels().forEach { $0.setTint(alpha) }
     }
 
     // MARK: - View Hierarchy
@@ -183,10 +219,10 @@ final class PaneManager {
     /// so direct children use translatesAutoresizingMaskIntoConstraints = true.
     private func buildView(from node: SplitNode) -> NSView {
         switch node {
-        case let .leaf(vc):
-            vc.view.translatesAutoresizingMaskIntoConstraints = true
-            vc.view.autoresizingMask = [.width, .height]
-            return vc.view
+        case let .leaf(panel):
+            panel.view.translatesAutoresizingMaskIntoConstraints = true
+            panel.view.autoresizingMask = [.width, .height]
+            return panel.view
 
         case let .branch(orientation, children):
             let sv = EqualSplitView()
@@ -206,11 +242,11 @@ final class PaneManager {
             guard let self else { return event }
             let leaves = root.allLeaves()
             guard leaves.count > 1 else { return event }
-            for termVC in leaves {
-                let view = termVC.view
+            for panel in leaves {
+                let view = panel.view
                 let locationInView = view.convert(event.locationInWindow, from: nil)
                 if view.bounds.contains(locationInView) {
-                    setActive(termVC)
+                    setActive(panel)
                     break
                 }
             }
@@ -218,21 +254,23 @@ final class PaneManager {
         }
     }
 
-    // MARK: - Terminal Wiring
+    // MARK: - Panel Wiring
 
-    private func wireTerminal(_ termVC: TerminalViewController) {
-        termVC.onProcessTerminated = { [weak self, weak termVC] in
-            guard let self, let termVC else { return }
-            if termVC === activePane {
-                closeActive()
-            } else {
-                guard let newRoot = root.removing(termVC) else {
-                    onLastPaneClosed?(); return
+    private func wirePanel(_ panel: any TurmPanel) {
+        if let termVC = panel as? TerminalViewController {
+            termVC.onProcessTerminated = { [weak self, weak termVC] in
+                guard let self, let termVC else { return }
+                if ObjectIdentifier(termVC) == ObjectIdentifier(activePane) {
+                    closeActive()
+                } else {
+                    guard let newRoot = root.removing(termVC) else {
+                        onLastPaneClosed?(); return
+                    }
+                    termVC.view.removeFromSuperview()
+                    termVC.removeFromParent()
+                    root = newRoot
+                    rebuildViewHierarchy()
                 }
-                termVC.view.removeFromSuperview()
-                termVC.removeFromParent()
-                root = newRoot
-                rebuildViewHierarchy()
             }
         }
     }

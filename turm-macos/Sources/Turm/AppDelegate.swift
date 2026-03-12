@@ -25,8 +25,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let vc = TabViewController(config: config, theme: theme)
         window.contentViewController = vc
-        // contentViewController causes the window to resize to the view's Auto Layout
-        // minimum size. Restore the intended 1200×800 and re-center afterwards.
         window.setContentSize(NSSize(width: 1200, height: 800))
         window.center()
 
@@ -38,7 +36,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         startSocketServer()
         vc.openInitialTab()
 
-        // Apply background from config if set
         if let path = config.backgroundPath {
             vc.applyBackground(path: path, tint: config.backgroundTint)
         }
@@ -74,6 +71,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         newTabItem.target = self
         shellMenu.addItem(newTabItem)
 
+        let newWebTabItem = NSMenuItem(title: "New Web Tab", action: #selector(newWebTab), keyEquivalent: "t")
+        newWebTabItem.keyEquivalentModifierMask = [.command, .shift]
+        newWebTabItem.target = self
+        shellMenu.addItem(newWebTabItem)
+
         let closePaneItem = NSMenuItem(title: "Close Pane", action: #selector(closePane), keyEquivalent: "w")
         closePaneItem.target = self
         shellMenu.addItem(closePaneItem)
@@ -98,7 +100,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             shellMenu.addItem(item)
         }
 
-        // Find menu — action is forwarded through the responder chain to SwiftTerm's MacTerminalView
+        // Find menu
         let findItem = NSMenuItem()
         mainMenu.addItem(findItem)
         let findMenu = NSMenu(title: "Find")
@@ -144,6 +146,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         tabVC?.newTab()
     }
 
+    @objc private func newWebTab() {
+        tabVC?.newWebViewTab()
+    }
+
     @objc private func closePane() {
         tabVC?.closeActivePane()
     }
@@ -162,8 +168,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Find
 
-    /// Forwards find panel actions to SwiftTerm's MacTerminalView, which implements
-    /// performFindPanelAction(_:) with a built-in find bar (case/regex/whole-word options).
     @objc func performFindPanelAction(_ sender: NSMenuItem) {
         tabVC?.activeTerminal?.view.perform(#selector(performFindPanelAction(_:)), with: sender)
     }
@@ -185,99 +189,172 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Socket Server
 
     private func startSocketServer() {
-        socketServer.commandHandler = { [weak self] method, params in
-            self?.handleCommand(method: method, params: params)
+        socketServer.commandHandler = { [weak self] method, params, completion in
+            self?.handleCommand(method: method, params: params, completion: completion)
         }
         socketServer.start()
     }
 
-    private func handleCommand(method: String, params: [String: Any]) -> Any? {
-        guard let vc = tabVC else { return nil }
+    private func handleCommand(method: String, params: [String: Any], completion: @escaping (Any?) -> Void) {
+        guard let vc = tabVC else { completion(nil); return }
+
         switch method {
         case "system.ping":
-            return ["status": "ok"]
+            completion(["status": "ok"])
 
         case "terminal.exec":
-            guard let command = params["command"] as? String else { return nil }
+            guard let command = params["command"] as? String else { completion(nil); return }
             vc.execCommand(command)
-            return ["ok": true]
+            completion(["ok": true])
 
         case "terminal.feed":
-            guard let text = params["text"] as? String else { return nil }
+            guard let text = params["text"] as? String else { completion(nil); return }
             vc.feedText(text)
-            return ["ok": true]
+            completion(["ok": true])
 
         case "terminal.state":
-            return vc.terminalState()
+            completion(vc.terminalState())
 
         case "terminal.read":
-            return vc.readScreen()
-
-        case "tab.new":
-            vc.newTab()
-            return ["ok": true]
-
-        case "tab.close":
-            vc.closeActivePane()
-            return ["ok": true]
-
-        case "split.horizontal":
-            vc.splitActivePane(orientation: .horizontal)
-            return ["ok": true]
-
-        case "split.vertical":
-            vc.splitActivePane(orientation: .vertical)
-            return ["ok": true]
-
-        case "tab.switch":
-            guard let index = params["index"] as? Int else { return nil }
-            vc.switchTab(to: index)
-            return ["ok": true]
-
-        case "tab.list":
-            return vc.tabList()
-
-        case "tab.info":
-            return vc.tabInfo()
-
-        case "tab.rename":
-            guard let title = params["title"] as? String else { return nil }
-            let index = params["index"] as? Int ?? vc.activeIndex
-            vc.renameTab(at: index, title: title)
-            return ["ok": true]
+            completion(vc.readScreen())
 
         case "terminal.history":
             let lines = params["lines"] as? Int ?? 100
-            return vc.activeTerminal?.history(lines: lines)
+            completion(vc.activeTerminal?.history(lines: lines))
 
         case "terminal.context":
             let historyLines = params["history_lines"] as? Int ?? 50
-            return vc.activeTerminal?.context(historyLines: historyLines)
+            completion(vc.activeTerminal?.context(historyLines: historyLines))
+
+        case "tab.new":
+            vc.newTab()
+            completion(["ok": true])
+
+        case "tab.close":
+            vc.closeActivePane()
+            completion(["ok": true])
+
+        case "tab.switch":
+            guard let index = params["index"] as? Int else { completion(nil); return }
+            vc.switchTab(to: index)
+            completion(["ok": true])
+
+        case "tab.list":
+            completion(vc.tabList())
+
+        case "tab.info":
+            completion(vc.tabInfo())
+
+        case "tab.rename":
+            guard let title = params["title"] as? String else { completion(nil); return }
+            let index = params["index"] as? Int ?? vc.activeIndex
+            vc.renameTab(at: index, title: title)
+            completion(["ok": true])
+
+        case "split.horizontal":
+            vc.splitActivePane(orientation: .horizontal)
+            completion(["ok": true])
+
+        case "split.vertical":
+            vc.splitActivePane(orientation: .vertical)
+            completion(["ok": true])
 
         case "session.list":
-            return vc.sessionList()
+            completion(vc.sessionList())
 
         case "session.info":
             let index = params["index"] as? Int ?? vc.activeIndex
-            return vc.sessionInfo(index: index)
+            completion(vc.sessionInfo(index: index))
 
         case "background.set":
-            guard let path = params["path"] as? String else { return nil }
+            guard let path = params["path"] as? String else { completion(nil); return }
             let tint = params["tint"] as? Double ?? 0.6
             vc.applyBackground(path: path, tint: tint)
-            return ["ok": true]
+            completion(["ok": true])
 
         case "background.set_tint":
-            guard let tint = params["tint"] as? Double else { return nil }
+            guard let tint = params["tint"] as? Double else { completion(nil); return }
             vc.setTint(tint)
-            return ["ok": true]
+            completion(["ok": true])
 
         case "background.clear":
             vc.clearBackground()
-            return ["ok": true]
+            completion(["ok": true])
+
+        // MARK: WebView commands
+
+        case "webview.open":
+            let urlString = params["url"] as? String
+            let url = urlString.flatMap { s -> URL? in
+                let final = s.hasPrefix("http://") || s.hasPrefix("https://") || s.hasPrefix("file://") ? s : "https://" + s
+                return URL(string: final)
+            }
+            let mode = params["mode"] as? String ?? "tab"
+            switch mode {
+            case "split_h":
+                vc.splitActivePaneWithWebView(url: url, orientation: .horizontal)
+            case "split_v":
+                vc.splitActivePaneWithWebView(url: url, orientation: .vertical)
+            default: // "tab"
+                vc.newWebViewTab(url: url)
+            }
+            completion(["ok": true])
+
+        case "webview.navigate":
+            guard let urlString = params["url"] as? String else { completion(nil); return }
+            guard let webVC = vc.activeWebView else { completion(["error": "no active webview"]); return }
+            webVC.navigate(to: urlString)
+            completion(["ok": true])
+
+        case "webview.back":
+            guard let webVC = vc.activeWebView else { completion(["error": "no active webview"]); return }
+            webVC.goBack()
+            completion(["ok": true])
+
+        case "webview.forward":
+            guard let webVC = vc.activeWebView else { completion(["error": "no active webview"]); return }
+            webVC.goForward()
+            completion(["ok": true])
+
+        case "webview.reload":
+            guard let webVC = vc.activeWebView else { completion(["error": "no active webview"]); return }
+            webVC.reload()
+            completion(["ok": true])
+
+        case "webview.execute_js":
+            guard let script = params["script"] as? String else { completion(nil); return }
+            guard let webVC = vc.activeWebView else { completion(["error": "no active webview"]); return }
+            webVC.executeJS(script) { result, error in
+                if let error {
+                    completion(["error": error.localizedDescription])
+                } else {
+                    completion(["result": result ?? NSNull()])
+                }
+            }
+
+        case "webview.get_content":
+            guard let webVC = vc.activeWebView else { completion(["error": "no active webview"]); return }
+            webVC.getContent { html in
+                completion(["html": html])
+            }
+
+        case "webview.devtools":
+            guard let webVC = vc.activeWebView else { completion(["error": "no active webview"]); return }
+            webVC.toggleDevTools()
+            completion(["ok": true])
+
+        case "webview.state":
+            guard let webVC = vc.activeWebView else { completion(["error": "no active webview"]); return }
+            completion([
+                "url": webVC.currentURL,
+                "title": webVC.currentTitle,
+                "can_go_back": webVC.canGoBack,
+                "can_go_forward": webVC.canGoForward,
+                "is_loading": webVC.isLoading,
+            ])
 
         default:
-            return nil
+            completion(nil)
         }
     }
 }

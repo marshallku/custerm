@@ -8,49 +8,50 @@ enum SplitOrientation {
 }
 
 /// N-ary recursive split tree for a single tab.
+/// Leaves hold any TurmPanel (terminal or webview).
 /// Does NOT store NSSplitView references — the view hierarchy is rebuilt from
 /// scratch on every split/close operation.
 indirect enum SplitNode {
-    case leaf(TerminalViewController)
+    case leaf(any TurmPanel)
     case branch(SplitOrientation, [SplitNode])
 
     // MARK: - Leaf enumeration
 
-    func allLeaves() -> [TerminalViewController] {
+    func allLeaves() -> [any TurmPanel] {
         switch self {
-        case let .leaf(vc): [vc]
+        case let .leaf(p): [p]
         case let .branch(_, children): children.flatMap { $0.allLeaves() }
         }
     }
 
     // MARK: - Tree mutations
 
-    /// Replaces `terminal`'s leaf with a new two-child branch containing the
-    /// original leaf and `newNode`. This always splits the focused pane's own
-    /// space in half, leaving every other pane completely unchanged.
+    /// Replaces `panel`'s leaf with a new two-child branch containing the
+    /// original leaf and `newNode`. Only the focused pane's space is halved;
+    /// all other panes are completely unchanged.
     func splitting(
-        _ terminal: TerminalViewController,
+        _ panel: any TurmPanel,
         with newNode: SplitNode,
         orientation: SplitOrientation,
     ) -> SplitNode {
         switch self {
-        case let .leaf(vc):
-            guard vc === terminal else { return self }
-            return .branch(orientation, [.leaf(vc), newNode])
+        case let .leaf(p):
+            guard ObjectIdentifier(p) == ObjectIdentifier(panel) else { return self }
+            return .branch(orientation, [.leaf(p), newNode])
 
         case let .branch(o, children):
-            return .branch(o, children.map { $0.splitting(terminal, with: newNode, orientation: orientation) })
+            return .branch(o, children.map { $0.splitting(panel, with: newNode, orientation: orientation) })
         }
     }
 
-    /// Returns a new tree with `terminal` removed, or nil if this was the only leaf.
-    func removing(_ terminal: TerminalViewController) -> SplitNode? {
+    /// Returns a new tree with `panel` removed, or nil if this was the only leaf.
+    func removing(_ panel: any TurmPanel) -> SplitNode? {
         switch self {
-        case let .leaf(vc):
-            return vc === terminal ? nil : self
+        case let .leaf(p):
+            return ObjectIdentifier(p) == ObjectIdentifier(panel) ? nil : self
 
         case let .branch(o, children):
-            let remaining = children.compactMap { $0.removing(terminal) }
+            let remaining = children.compactMap { $0.removing(panel) }
             if remaining.isEmpty { return nil }
             if remaining.count == 1 { return remaining[0] } // collapse single-child branch
             return .branch(o, remaining)

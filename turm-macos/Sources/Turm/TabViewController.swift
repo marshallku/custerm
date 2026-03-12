@@ -1,6 +1,7 @@
 import AppKit
 
-/// Manages multiple terminal tabs, each backed by a PaneManager (split-pane tree).
+/// Manages multiple tabs, each backed by a PaneManager (split-pane tree).
+/// Panels can be terminals or webviews.
 @MainActor
 final class TabViewController: NSViewController {
     private let config: TurmConfig
@@ -20,7 +21,11 @@ final class TabViewController: NSViewController {
     }
 
     var activeTerminal: TerminalViewController? {
-        activePaneManager?.activePane
+        activePaneManager?.activeTerminal()
+    }
+
+    var activeWebView: WebViewController? {
+        activePaneManager?.activeWebView()
     }
 
     init(config: TurmConfig, theme: TurmTheme) {
@@ -78,7 +83,19 @@ final class TabViewController: NSViewController {
     // MARK: - Tab Operations
 
     func newTab() {
-        let manager = PaneManager(config: config, theme: theme)
+        addTab(manager: makeTerminalManager())
+    }
+
+    func newWebViewTab(url: URL? = nil) {
+        let manager = PaneManager(config: config, theme: theme, initialPanel: .webview(url: url))
+        addTab(manager: manager)
+    }
+
+    private func makeTerminalManager() -> PaneManager {
+        PaneManager(config: config, theme: theme)
+    }
+
+    private func addTab(manager: PaneManager) {
         manager.onLastPaneClosed = { [weak self, weak manager] in
             guard let self, let manager else { return }
             if let index = paneManagers.firstIndex(where: { $0 === manager }) {
@@ -89,7 +106,6 @@ final class TabViewController: NSViewController {
             self?.refreshTabBar()
         }
 
-        // Observe title changes from any terminal in this manager
         NotificationCenter.default.addObserver(
             forName: .terminalTitleChanged,
             object: nil,
@@ -100,7 +116,6 @@ final class TabViewController: NSViewController {
 
         paneManagers.append(manager)
         switchTab(to: paneManagers.count - 1)
-        // Inherit current background state
         if let path = currentBackgroundPath {
             manager.applyBackground(path: path, tint: currentBackgroundTint)
         }
@@ -127,8 +142,7 @@ final class TabViewController: NSViewController {
     private func closeTabByButton(at index: Int) {
         guard paneManagers.indices.contains(index) else { return }
         let manager = paneManagers[index]
-        // Terminate all shells before closing
-        manager.allTerminals().forEach { $0.view.removeFromSuperview(); $0.removeFromParent() }
+        manager.allPanels().forEach { $0.view.removeFromSuperview(); $0.removeFromParent() }
         manager.containerView.removeFromSuperview()
         paneManagers.remove(at: index)
 
@@ -145,7 +159,6 @@ final class TabViewController: NSViewController {
     func switchTab(to index: Int) {
         guard paneManagers.indices.contains(index), index != activeIndex else { return }
 
-        // Remove current manager's container
         if let current = activePaneManager {
             current.containerView.removeFromSuperview()
         }
@@ -162,7 +175,7 @@ final class TabViewController: NSViewController {
         ])
 
         view.layoutSubtreeIfNeeded()
-        manager.allTerminals().forEach { $0.startShellIfNeeded() }
+        manager.allPanels().forEach { $0.startIfNeeded() }
         manager.activePane.view.window?.makeFirstResponder(manager.activePane.view)
 
         refreshTabBar()
@@ -172,6 +185,10 @@ final class TabViewController: NSViewController {
 
     func splitActivePane(orientation: SplitOrientation) {
         activePaneManager?.splitActive(orientation: orientation)
+    }
+
+    func splitActivePaneWithWebView(url: URL? = nil, orientation: SplitOrientation = .horizontal) {
+        activePaneManager?.splitActiveWithWebView(url: url, orientation: orientation)
     }
 
     func closeActivePane() {
@@ -227,22 +244,19 @@ final class TabViewController: NSViewController {
         }
     }
 
-    /// Extended tab info including pane count (tab.info).
     func tabInfo() -> [[String: Any]] {
         paneManagers.enumerated().map { i, m in
             [
                 "index": i,
                 "title": m.activePane.currentTitle,
                 "active": i == activeIndex,
-                "pane_count": m.allTerminals().count,
+                "pane_count": m.allPanels().count,
             ]
         }
     }
 
-    /// Rename a tab by overriding its title (tab.rename).
     func renameTab(at index: Int, title: String) {
         guard paneManagers.indices.contains(index) else { return }
-        // Store the override title on the active pane of that tab
         paneManagers[index].setCustomTitle(title)
         refreshTabBar()
         if index == activeIndex {
@@ -250,21 +264,19 @@ final class TabViewController: NSViewController {
         }
     }
 
-    /// Session-level info: all tabs (session.list).
     func sessionList() -> [[String: Any]] {
         tabList()
     }
 
-    /// Info for a specific tab by index (session.info).
     func sessionInfo(index: Int) -> [String: Any]? {
         guard paneManagers.indices.contains(index) else { return nil }
         let m = paneManagers[index]
-        let state = m.activePane.terminalState()
+        let state = m.activeTerminal()?.terminalState() ?? [:]
         return [
             "index": index,
             "title": m.activePane.currentTitle,
             "active": index == activeIndex,
-            "pane_count": m.allTerminals().count,
+            "pane_count": m.allPanels().count,
             "cols": state["cols"] ?? 0,
             "rows": state["rows"] ?? 0,
         ]
