@@ -108,3 +108,42 @@ WebProcess CRASHED
 
 **Cause:** gio 0.20 uses builder pattern, not positional args.
 **Fix:** Use `connection.register_object(path, &interface_info).method_call(closure).build()`.
+
+---
+
+## macOS App Issues
+
+### SwiftTerm: `processTerminated` never called after shell exits
+
+**Cause:** SwiftTerm's `LocalProcess.childProcessRead` detects PTY EOF and calls `childStopped()`, which cancels the internal `childMonitor` DispatchSource before it can fire. The `processTerminated` call in the EOF handler is commented out in SwiftTerm source.
+
+**Fix:** Install a separate `DispatchSource.makeProcessSource` after `startProcess()` returns (in `TurmTerminalView.installExitMonitor()`). This source is not affected by `childStopped()` and fires independently when the process exits.
+
+```swift
+func installExitMonitor() {
+    let pid = process.shellPid
+    guard pid > 0 else { return }
+    let src = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
+    src.setEventHandler { [weak self, weak src] in
+        src?.cancel()
+        guard let self else { return }
+        processDelegate?.processTerminated(source: self, exitCode: nil)
+    }
+    exitMonitor = src
+    src.activate()
+}
+```
+
+### macOS split panes: new pane gets wrong initial size
+
+**Cause 1 (`layout()` approach):** NSSplitView calls `resizeSubviews` (which sets subview frames) before calling `layout()`. By the time `layout()` fires, the wrong frames are already committed. Calling `setPosition` in `layout()` fires too late — if the terminal view already has a large frame from before the rebuild, NSSplitView uses that as the basis for proportional sizing.
+
+**Cause 2 (`asyncAfter` approach):** The 50ms delay is unreliable — layout may not have resolved yet, or a subsequent split may have started before the timer fires, applying stale positions.
+
+**Fix:** Use `NSSplitViewDelegate.splitView(_:resizeSubviewsWithOldSize:)`. This delegate method is called by NSSplitView at the exact moment it needs to determine subview frames. Set frames directly here and set `initialSizeSet = true` after the first call to fall back to `adjustSubviews()` for subsequent resizes (preserving user drag behaviour).
+
+### macOS: `becomeFirstResponder` cannot be overridden in SwiftTerm subclass
+
+**Cause:** `MacTerminalView.becomeFirstResponder` is declared `public` but not `open`, so it cannot be overridden by code outside the SwiftTerm module.
+
+**Fix:** Use `NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown)` in `PaneManager` to detect which pane was clicked and update `activePane` accordingly.
