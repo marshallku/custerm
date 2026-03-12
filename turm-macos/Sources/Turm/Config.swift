@@ -22,7 +22,7 @@ struct TurmConfig {
 
     static func parse(_ contents: String) -> TurmConfig {
         var shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-        var fontFamily = "JetBrainsMono Nerd Font Mono"
+        var fontFamily = "JetBrains Mono"
         var fontSize = 14
         var themeName = "catppuccin-mocha"
 
@@ -72,7 +72,7 @@ struct TurmConfig {
     static var defaults: TurmConfig {
         TurmConfig(
             shell: ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh",
-            fontFamily: "JetBrainsMono Nerd Font Mono",
+            fontFamily: "JetBrains Mono",
             fontSize: 14,
             themeName: "catppuccin-mocha",
         )

@@ -45,6 +45,7 @@ class TerminalViewController: NSViewController {
     private var currentFontSize: CGFloat
 
     private(set) var currentTitle: String = "Terminal"
+    private var customTitle: String?
     private var shellStarted = false
     var onProcessTerminated: (() -> Void)?
 
@@ -171,6 +172,42 @@ class TerminalViewController: NSViewController {
         ]
     }
 
+    /// Return recent scrollback lines (terminal.history).
+    /// SwiftTerm exposes scrollback via negative row indices on getLine(row:).
+    func history(lines: Int = 100) -> [String: Any] {
+        guard let tv = terminalView else { return [:] }
+        let term = tv.terminal!
+        let cols = term.cols
+        var result: [String] = []
+        for row in stride(from: -lines, to: 0, by: 1) {
+            guard let line = term.getLine(row: row) else {
+                result.append(String(repeating: " ", count: cols))
+                continue
+            }
+            var str = ""
+            for col in 0 ..< cols {
+                let ch = line[col].getCharacter()
+                str.append(ch == "\0" ? " " : ch)
+            }
+            result.append(str)
+        }
+        return [
+            "text": result.joined(separator: "\n"),
+            "lines_requested": lines,
+            "rows": term.rows,
+            "cols": cols,
+        ]
+    }
+
+    /// Return state + visible screen + recent scrollback (terminal.context).
+    func context(historyLines: Int = 50) -> [String: Any] {
+        [
+            "state": terminalState(),
+            "screen": readScreen(),
+            "history": history(lines: historyLines),
+        ]
+    }
+
     // MARK: - Zoom
 
     func zoomIn() {
@@ -201,8 +238,16 @@ extension TerminalViewController: LocalProcessTerminalViewDelegate {
         // No-op: terminal handles resize internally
     }
 
+    func setCustomTitle(_ title: String) {
+        customTitle = title
+        currentTitle = title
+        NotificationCenter.default.post(name: .terminalTitleChanged, object: self)
+    }
+
     nonisolated func setTerminalTitle(source _: LocalProcessTerminalView, title: String) {
         Task { @MainActor in
+            // Custom title (set via tab.rename) suppresses auto-title updates
+            guard self.customTitle == nil else { return }
             self.currentTitle = title.isEmpty ? "Terminal" : title
             NotificationCenter.default.post(name: .terminalTitleChanged, object: self)
         }

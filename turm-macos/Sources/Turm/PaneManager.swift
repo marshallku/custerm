@@ -1,7 +1,8 @@
 import AppKit
 
 /// Manages the split-pane tree for a single tab.
-/// TabViewController embeds `containerView` once; PaneManager swaps its contents on splits/closes.
+/// TabViewController embeds `containerView` once; PaneManager rebuilds its
+/// contents on every split/close using fresh NSSplitView instances.
 @MainActor
 final class PaneManager {
     private let config: TurmConfig
@@ -17,6 +18,9 @@ final class PaneManager {
     var onActivePaneChanged: (() -> Void)?
 
     private nonisolated(unsafe) var clickMonitor: Any?
+    /// Tracks the fill constraints added to containerView so they can be
+    /// deactivated before the next rebuild.
+    private var rootConstraints: [NSLayoutConstraint] = []
 
     // MARK: - Init
 
@@ -31,9 +35,8 @@ final class PaneManager {
         containerView = NSView()
         containerView.translatesAutoresizingMaskIntoConstraints = false
 
-        // Finish setup after all stored properties are initialized
         wireTerminal(termVC)
-        embedRoot()
+        rebuildViewHierarchy()
         installClickMonitor()
     }
 
@@ -47,18 +50,10 @@ final class PaneManager {
         let newTermVC = TerminalViewController(config: config, theme: theme)
         wireTerminal(newTermVC)
 
-        let svc = makeSplitVC(orientation: orientation, first: activePane, second: newTermVC)
-        let newBranch = SplitNode.branch(svc, orientation, .leaf(activePane), .leaf(newTermVC))
+        let newBranch = SplitNode.branch(orientation, .leaf(activePane), .leaf(newTermVC))
         root = root.replacing(activePane, with: newBranch)
 
-        embedRoot()
-
-        // Equal split after layout
-        let splitView = svc.splitView
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
-            let size = splitView.isVertical ? splitView.frame.width : splitView.frame.height
-            splitView.setPosition(size / 2, ofDividerAt: 0)
-        }
+        rebuildViewHierarchy()
 
         setActive(newTermVC)
         newTermVC.startShellIfNeeded()
@@ -67,22 +62,19 @@ final class PaneManager {
 
     func closeActive() {
         let closing = activePane
-        let newRoot = root.removing(closing)
-
-        // Teardown the closing terminal
-        closing.view.removeFromSuperview()
-        closing.removeFromParent()
-
-        guard let newRoot else {
+        guard let newRoot = root.removing(closing) else {
+            closing.view.removeFromSuperview()
+            closing.removeFromParent()
             onLastPaneClosed?()
             return
         }
 
         root = newRoot
+        closing.view.removeFromSuperview()
+        closing.removeFromParent()
+        rebuildViewHierarchy()
 
-        // Focus the first leaf of the remaining tree
         let next = root.allLeaves().first!
-        embedRoot()
         setActive(next)
         next.view.window?.makeFirstResponder(next.view)
     }
@@ -96,7 +88,67 @@ final class PaneManager {
         root.allLeaves()
     }
 
-    // MARK: - Private
+    func setCustomTitle(_ title: String) {
+        activePane.setCustomTitle(title)
+    }
+
+    // MARK: - View Hierarchy
+
+    /// Rebuilds the entire view hierarchy from the SplitNode tree.
+    /// This is called on every split/close, creating fresh NSSplitViews each time.
+    private func rebuildViewHierarchy() {
+        NSLayoutConstraint.deactivate(rootConstraints)
+        rootConstraints = []
+        containerView.subviews.forEach { $0.removeFromSuperview() }
+
+        var splitViews: [NSSplitView] = []
+        let rootView = buildView(from: root, splitViews: &splitViews)
+        // Root view uses Auto Layout to fill containerView
+        rootView.translatesAutoresizingMaskIntoConstraints = false
+        containerView.addSubview(rootView)
+
+        let constraints = [
+            rootView.topAnchor.constraint(equalTo: containerView.topAnchor),
+            rootView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+            rootView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
+            rootView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
+        ]
+        NSLayoutConstraint.activate(constraints)
+        rootConstraints = constraints
+
+        // Set equal 50/50 split after layout resolves
+        if !splitViews.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                for sv in splitViews {
+                    let size = sv.isVertical ? sv.frame.width : sv.frame.height
+                    guard size > 0 else { continue }
+                    sv.setPosition(size / 2, ofDividerAt: 0)
+                }
+            }
+        }
+    }
+
+    /// Recursively builds the view tree. NSSplitView manages subview sizing,
+    /// so direct children use translatesAutoresizingMaskIntoConstraints = true.
+    private func buildView(from node: SplitNode, splitViews: inout [NSSplitView]) -> NSView {
+        switch node {
+        case let .leaf(vc):
+            vc.view.translatesAutoresizingMaskIntoConstraints = true
+            vc.view.autoresizingMask = [.width, .height]
+            return vc.view
+
+        case let .branch(orientation, first, second):
+            let sv = NSSplitView()
+            sv.isVertical = (orientation == .horizontal)
+            sv.dividerStyle = .thin
+            sv.addSubview(buildView(from: first, splitViews: &splitViews))
+            sv.addSubview(buildView(from: second, splitViews: &splitViews))
+            splitViews.append(sv)
+            return sv
+        }
+    }
+
+    // MARK: - Focus Monitor
 
     private func installClickMonitor() {
         clickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
@@ -115,38 +167,22 @@ final class PaneManager {
         }
     }
 
+    // MARK: - Terminal Wiring
+
     private func wireTerminal(_ termVC: TerminalViewController) {
         termVC.onProcessTerminated = { [weak self, weak termVC] in
             guard let self, let termVC else { return }
             if termVC === activePane {
                 closeActive()
             } else {
-                // Non-active pane exited: remove it silently
-                let newRoot = root.removing(termVC)
+                guard let newRoot = root.removing(termVC) else {
+                    onLastPaneClosed?(); return
+                }
                 termVC.view.removeFromSuperview()
                 termVC.removeFromParent()
-                if let newRoot {
-                    root = newRoot
-                    embedRoot()
-                } else {
-                    onLastPaneClosed?()
-                }
+                root = newRoot
+                rebuildViewHierarchy()
             }
         }
-    }
-
-    private func embedRoot() {
-        // Remove existing subview
-        containerView.subviews.forEach { $0.removeFromSuperview() }
-
-        let rootView = root.rootViewController.view
-        rootView.translatesAutoresizingMaskIntoConstraints = false
-        containerView.addSubview(rootView)
-        NSLayoutConstraint.activate([
-            rootView.topAnchor.constraint(equalTo: containerView.topAnchor),
-            rootView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
-            rootView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
-            rootView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
-        ])
     }
 }

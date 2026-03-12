@@ -93,6 +93,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             shellMenu.addItem(item)
         }
 
+        // Find menu — action is forwarded through the responder chain to SwiftTerm's MacTerminalView
+        let findItem = NSMenuItem()
+        mainMenu.addItem(findItem)
+        let findMenu = NSMenu(title: "Find")
+        findItem.submenu = findMenu
+
+        let findAction = NSMenuItem(title: "Find…", action: #selector(performFindPanelAction(_:)), keyEquivalent: "f")
+        findAction.tag = Int(NSFindPanelAction.showFindPanel.rawValue)
+        findMenu.addItem(findAction)
+
+        let findNextAction = NSMenuItem(title: "Find Next", action: #selector(performFindPanelAction(_:)), keyEquivalent: "g")
+        findNextAction.tag = Int(NSFindPanelAction.next.rawValue)
+        findMenu.addItem(findNextAction)
+
+        let findPrevAction = NSMenuItem(title: "Find Previous", action: #selector(performFindPanelAction(_:)), keyEquivalent: "G")
+        findPrevAction.keyEquivalentModifierMask = NSEvent.ModifierFlags([.command, .shift])
+        findPrevAction.tag = Int(NSFindPanelAction.previous.rawValue)
+        findMenu.addItem(findPrevAction)
+
         // View menu (zoom)
         let viewItem = NSMenuItem()
         mainMenu.addItem(viewItem)
@@ -134,6 +153,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func switchTabByNumber(_ sender: NSMenuItem) {
         tabVC?.switchTab(to: sender.tag - 1)
+    }
+
+    // MARK: - Find
+
+    /// Forwards find panel actions to SwiftTerm's MacTerminalView, which implements
+    /// performFindPanelAction(_:) with a built-in find bar (case/regex/whole-word options).
+    @objc func performFindPanelAction(_ sender: NSMenuItem) {
+        tabVC?.activeTerminal?.view.perform(#selector(performFindPanelAction(_:)), with: sender)
     }
 
     // MARK: - Zoom Actions
@@ -197,8 +224,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             vc.splitActivePane(orientation: .vertical)
             return ["ok": true]
 
+        case "tab.switch":
+            guard let index = params["index"] as? Int else { return nil }
+            vc.switchTab(to: index)
+            return ["ok": true]
+
         case "tab.list":
             return vc.tabList()
+
+        case "tab.info":
+            return vc.tabInfo()
+
+        case "tab.rename":
+            guard let title = params["title"] as? String else { return nil }
+            let index = params["index"] as? Int ?? vc.activeIndex
+            vc.renameTab(at: index, title: title)
+            return ["ok": true]
+
+        case "terminal.history":
+            let lines = params["lines"] as? Int ?? 100
+            return vc.activeTerminal?.history(lines: lines)
+
+        case "terminal.context":
+            let historyLines = params["history_lines"] as? Int ?? 50
+            return vc.activeTerminal?.context(historyLines: historyLines)
+
+        case "session.list":
+            return vc.sessionList()
+
+        case "session.info":
+            let index = params["index"] as? Int ?? vc.activeIndex
+            return vc.sessionInfo(index: index)
 
         default:
             return nil

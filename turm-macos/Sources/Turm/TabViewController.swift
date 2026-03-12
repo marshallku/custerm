@@ -200,4 +200,47 @@ final class TabViewController: NSViewController {
             ["index": i, "title": m.activePane.currentTitle, "active": i == activeIndex]
         }
     }
+
+    /// Extended tab info including pane count (tab.info).
+    func tabInfo() -> [[String: Any]] {
+        paneManagers.enumerated().map { i, m in
+            [
+                "index": i,
+                "title": m.activePane.currentTitle,
+                "active": i == activeIndex,
+                "pane_count": m.allTerminals().count,
+            ]
+        }
+    }
+
+    /// Rename a tab by overriding its title (tab.rename).
+    func renameTab(at index: Int, title: String) {
+        guard paneManagers.indices.contains(index) else { return }
+        // Store the override title on the active pane of that tab
+        paneManagers[index].setCustomTitle(title)
+        refreshTabBar()
+        if index == activeIndex {
+            view.window?.title = title
+        }
+    }
+
+    /// Session-level info: all tabs (session.list).
+    func sessionList() -> [[String: Any]] {
+        tabList()
+    }
+
+    /// Info for a specific tab by index (session.info).
+    func sessionInfo(index: Int) -> [String: Any]? {
+        guard paneManagers.indices.contains(index) else { return nil }
+        let m = paneManagers[index]
+        let state = m.activePane.terminalState()
+        return [
+            "index": index,
+            "title": m.activePane.currentTitle,
+            "active": index == activeIndex,
+            "pane_count": m.allTerminals().count,
+            "cols": state["cols"] ?? 0,
+            "rows": state["rows"] ?? 0,
+        ]
+    }
 }

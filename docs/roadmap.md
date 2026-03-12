@@ -122,7 +122,7 @@ Collapsible tab bar and renamable tabs.
 - [x] Status bar (Waybar-style bar with plugin modules, left/center/right sections)
 - [~] macOS native app (Swift/AppKit) — Phase 1 MVP complete (see below)
 
-### macOS App (Phase 1 MVP) ✅
+### macOS App ✅
 
 - [x] SwiftTerm integration (LocalProcessTerminalView) via Swift Package Manager
 - [x] Shell spawn via PTY (SwiftTerm handles PTY internally)
@@ -131,12 +131,13 @@ Collapsible tab bar and renamable tabs.
 - [x] Window title update via OSC (setTerminalTitle delegate)
 - [x] Font scale zoom (Cmd+= / Cmd+- / Cmd+0 via View menu)
 - [x] TURM_SOCKET env var injected into shell
-- [x] Process exit → window close
-- [ ] Tab bar (NSTabViewController or custom)
-- [ ] Split panes
+- [x] Process exit → pane/tab/window close (SwiftTerm bug fix via separate DispatchSource)
+- [x] Tab bar (custom TabBarView with add/close/switch)
+- [x] Split panes (Cmd+D horizontal, Cmd+Shift+D vertical, Cmd+W close pane)
+- [x] Unix socket server (IPC with turmctl — same protocol as Linux)
+- [x] Full socket API: terminal.exec/feed/state/read/history/context, tab.new/close/switch/list/info/rename, split.horizontal/vertical, session.list/info
+- [x] In-terminal search (Cmd+F / Cmd+G / Cmd+Shift+G — SwiftTerm built-in find bar with case/regex/whole-word)
 - [ ] Background images
-- [ ] In-terminal search
-- [ ] Unix socket server (IPC with turmctl)
 
 ## Pending Cleanup
 
