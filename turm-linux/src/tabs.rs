@@ -1263,16 +1263,97 @@ pub enum FocusDirection {
     Prev,
 }
 
+fn spawn_command(command: &str) {
+    let cmd = if command.starts_with("spawn:") {
+        &command["spawn:".len()..]
+    } else {
+        command
+    };
+
+    let expanded = shellexpand::tilde(cmd).to_string();
+    let dbus_name = crate::dbus::bus_name();
+    let socket_path = format!("/tmp/turm-{}.sock", std::process::id());
+
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&expanded)
+            .env("TURM_DBUS", &dbus_name)
+            .env("TURM_SOCKET", &socket_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    });
+}
+
+fn check_custom_keybinding(
+    mgr: &TabManager,
+    keyval: gdk::Key,
+    keycode: u32,
+    modifier: gdk::ModifierType,
+) -> bool {
+    let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+    let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
+    let alt = modifier.contains(gdk::ModifierType::ALT_MASK);
+
+    let config = mgr.config.borrow();
+    let bindings = config.keybindings.parse();
+
+    let key_name = keyval.name().map(|n| n.to_string().to_lowercase());
+    let Some(key_name) = key_name else {
+        return false;
+    };
+
+    // When shift is held, GDK gives us the shifted keyval (e.g. braceright instead of bracketright).
+    // Also resolve the unshifted key from the hardware keycode for matching.
+    let unshifted_name = if shift {
+        gdk::Display::default().and_then(|d| {
+            let entries = d.map_keycode(keycode);
+            entries
+                .iter()
+                .flatten()
+                .find(|(k, _)| k.group() == 0 && k.level() == 0)
+                .and_then(|(_, v)| v.name().map(|n| n.to_string().to_lowercase()))
+        })
+    } else {
+        None
+    };
+
+    for binding in &bindings {
+        if binding.ctrl != ctrl || binding.shift != shift || binding.alt != alt {
+            continue;
+        }
+        if binding.key == key_name {
+            spawn_command(&binding.command);
+            return true;
+        }
+        if let Some(ref unshifted) = unshifted_name {
+            if binding.key == *unshifted {
+                spawn_command(&binding.command);
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
     let controller = gtk4::EventControllerKey::new();
     let mgr = Rc::downgrade(manager);
     let win = window.clone();
 
     controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    controller.connect_key_pressed(move |_, keyval, _, modifier| {
+    controller.connect_key_pressed(move |_, keyval, keycode, modifier| {
         let Some(mgr) = mgr.upgrade() else {
             return glib::Propagation::Proceed;
         };
+
+        // Check custom keybindings first (from config)
+        if check_custom_keybinding(&mgr, keyval, keycode, modifier) {
+            return glib::Propagation::Stop;
+        }
 
         let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -161,6 +162,62 @@ impl Default for StatusBarConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KeybindingsConfig {
+    /// Key combo → command mapping, e.g. "ctrl+shift+g" = "spawn:~/script.sh --arg"
+    #[serde(flatten)]
+    pub map: HashMap<String, String>,
+}
+
+/// Parsed keybinding ready for matching
+#[derive(Debug, Clone)]
+pub struct ParsedKeybinding {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub key: String,
+    pub command: String,
+}
+
+impl KeybindingsConfig {
+    /// Parse all keybinding entries into structured form
+    pub fn parse(&self) -> Vec<ParsedKeybinding> {
+        self.map
+            .iter()
+            .filter_map(|(combo, cmd)| Self::parse_one(combo, cmd))
+            .collect()
+    }
+
+    fn parse_one(combo: &str, command: &str) -> Option<ParsedKeybinding> {
+        let parts: Vec<&str> = combo.split('+').collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut ctrl = false;
+        let mut shift = false;
+        let mut alt = false;
+        let mut key = None;
+
+        for part in &parts {
+            match part.to_lowercase().as_str() {
+                "ctrl" | "control" => ctrl = true,
+                "shift" => shift = true,
+                "alt" => alt = true,
+                k => key = Some(k.to_string()),
+            }
+        }
+
+        Some(ParsedKeybinding {
+            ctrl,
+            shift,
+            alt,
+            key: key?,
+            command: command.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TurmConfig {
     #[serde(default)]
     pub terminal: TerminalConfig,
@@ -176,6 +233,9 @@ pub struct TurmConfig {
 
     #[serde(default)]
     pub statusbar: StatusBarConfig,
+
+    #[serde(default)]
+    pub keybindings: KeybindingsConfig,
 }
 
 impl TurmConfig {
@@ -231,6 +291,11 @@ name = "catppuccin-mocha"
 # enabled = true       # Show/hide the status bar
 # position = "bottom"  # "top" or "bottom"
 # height = 28          # Height in pixels
+
+[keybindings]
+# Map key combos to shell commands (spawn:) — runs in background
+# "ctrl+shift+g" = "spawn:~/my-script.sh --next"
+# "ctrl+shift+m" = "spawn:~/my-script.sh --toggle"
 "##;
         std::fs::write(&path, default_config)?;
         Ok(path)
