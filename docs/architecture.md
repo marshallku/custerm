@@ -41,13 +41,21 @@ turm/
 │       ├── main.rs          # Entry point, output formatting
 │       ├── commands.rs      # clap subcommands (session, background, tab, split, event, webview)
 │       └── client.rs        # Unix socket client
-└── turm-macos/           # Swift/AppKit native terminal (Phase 1 MVP)
+└── turm-macos/           # Swift/AppKit native terminal (Phases 1–3 complete)
     ├── Package.swift        # Swift Package Manager config (Swift 6, macOS 14+, SwiftTerm dep)
     └── Sources/Turm/
         ├── TurmApp.swift            # @main entry point
-        ├── AppDelegate.swift        # NSApplicationDelegate, menu bar, window creation
-        ├── TerminalViewController.swift  # NSViewController wrapping LocalProcessTerminalView
-        ├── Config.swift             # TOML config parser (shell, font, theme)
+        ├── AppDelegate.swift        # NSApplicationDelegate, menu bar, socket command routing
+        ├── TabViewController.swift  # Tab list manager, PaneManager array
+        ├── TabBarView.swift         # Custom tab bar + add-panel popover
+        ├── PaneManager.swift        # Split-pane tree for a single tab
+        ├── SplitNode.swift          # N-ary split tree (any TurmPanel leaves)
+        ├── TurmPanel.swift          # Common protocol for terminal + webview panels
+        ├── TerminalViewController.swift  # SwiftTerm wrapper, shell, delegates
+        ├── WebViewController.swift  # WKWebView wrapper, TurmPanel impl
+        ├── EventBus.swift           # Event broadcast hub + per-subscriber channel
+        ├── SocketServer.swift       # POSIX Unix socket server (async completion handler)
+        ├── Config.swift             # TOML config parser (shell, font, theme, background)
         └── Theme.swift              # 10 built-in themes (mirrors turm-core/theme.rs)
 ```
 
@@ -120,7 +128,7 @@ Clients can subscribe to real-time events via `event.subscribe`. The socket stay
 
 **Protocol**: Send `{"id":"...","method":"event.subscribe","params":{}}`, receive `{"id":"...","ok":true,"result":{"status":"subscribed"}}`, then receive event lines indefinitely.
 
-**Event format**: `{"type":"<event_type>","data":{...}}`
+**Event format**: `{"event":"<event_type>","data":{...}}`
 
 **Event types**:
 | Event | Data | Trigger |
@@ -128,8 +136,8 @@ Clients can subscribe to real-time events via `event.subscribe`. The socket stay
 | `panel.focused` | `{panel_id}` | Panel gains focus |
 | `panel.title_changed` | `{panel_id, title}` | Terminal window title changes |
 | `panel.exited` | `{panel_id, tab}` | Shell process exits |
-| `tab.created` | `{panel_id, tab}` | New tab opened |
-| `tab.closed` | `{panel_id, tab}` | Tab closed |
+| `tab.opened` | `{index, panel_id}` | New tab opened |
+| `tab.closed` | `{index}` | Tab closed |
 | `terminal.output` | `{panel_id, text}` | Terminal receives output (high frequency) |
 | `terminal.cwd_changed` | `{panel_id, cwd}` | Terminal CWD changes (OSC 7) |
 | `terminal.shell_precmd` | `{panel_id}` | Shell prompt ready (precmd) |
