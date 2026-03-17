@@ -1,18 +1,17 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
 use gtk4::glib;
 use gtk4::prelude::*;
-use webkit6::prelude::*;
 
 use turm_core::config::TurmConfig;
 use turm_core::plugin::LoadedPlugin;
 use turm_core::theme::Theme;
 
 struct ModuleHandle {
-    /// DOM element id in the WebView
-    dom_id: String,
+    label: gtk4::Label,
     exec: String,
     interval: u64,
     plugin_dir: std::path::PathBuf,
@@ -21,135 +20,10 @@ struct ModuleHandle {
 
 pub struct StatusBar {
     pub container: gtk4::Box,
-    webview: webkit6::WebView,
-    #[allow(dead_code)]
+    bar: gtk4::Box,
     modules: Rc<RefCell<Vec<ModuleHandle>>>,
-}
-
-/// Build the shell HTML with empty module containers.
-/// Modules are just <span> elements that get updated via JS.
-fn build_bar_html(plugins: &[LoadedPlugin], theme: &Theme, height: u32) -> String {
-    let mut left = Vec::new();
-    let mut center = Vec::new();
-    let mut right = Vec::new();
-
-    for plugin in plugins {
-        for module in &plugin.manifest.modules {
-            let dom_id = format!("mod-{}-{}", plugin.manifest.plugin.name, module.name);
-            let class = module.class.as_deref().unwrap_or("");
-            let entry = (
-                module.order,
-                format!(r#"<span id="{dom_id}" class="turm-module {class}" title="">...</span>"#),
-            );
-            match module.position.as_str() {
-                "left" => left.push(entry),
-                "center" => center.push(entry),
-                _ => right.push(entry),
-            }
-        }
-    }
-
-    left.sort_by_key(|(o, _)| *o);
-    center.sort_by_key(|(o, _)| *o);
-    right.sort_by_key(|(o, _)| *o);
-
-    eprintln!(
-        "[turm] statusbar modules: left={}, center={}, right={}",
-        left.len(),
-        center.len(),
-        right.len()
-    );
-
-    let render = |items: &[(i32, String)]| -> String {
-        items
-            .iter()
-            .map(|(_, html)| html.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    // Collect plugin style.css files
-    let mut plugin_css = String::new();
-    for plugin in plugins {
-        let css_path = plugin.dir.join("style.css");
-        if let Ok(css) = std::fs::read_to_string(&css_path) {
-            plugin_css.push_str(&css);
-            plugin_css.push('\n');
-        }
-    }
-
-    format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-<style>
-:root {{
-    --turm-bg: {bg};
-    --turm-fg: {text};
-    --turm-surface0: {surface0};
-    --turm-surface1: {surface1};
-    --turm-surface2: {surface2};
-    --turm-overlay0: {overlay0};
-    --turm-text: {text};
-    --turm-subtext0: {subtext0};
-    --turm-subtext1: {subtext1};
-    --turm-accent: {accent};
-    --turm-red: {red};
-}}
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-html, body {{
-    height: {height}px;
-    overflow: hidden;
-    background: {surface0};
-    color: {subtext0};
-    font-family: system-ui, -apple-system, sans-serif;
-    font-size: 12px;
-}}
-body {{
-    display: flex;
-    align-items: center;
-    border-top: 1px solid {overlay0};
-}}
-#left, #center, #right {{
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 0 10px;
-}}
-#left {{ flex: 1 1 0; min-width: 0; justify-content: flex-start; overflow: hidden; }}
-#center {{ flex: 0 0 auto; justify-content: center; }}
-#right {{ flex: 1 1 0; min-width: 0; justify-content: flex-end; overflow: hidden; }}
-.turm-module {{
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    white-space: nowrap;
-}}
-{plugin_css}
-</style>
-</head>
-<body>
-<div id="left">{left}</div>
-<div id="center">{center}</div>
-<div id="right">{right}</div>
-</body>
-</html>"#,
-        bg = theme.background,
-        text = theme.text,
-        surface0 = theme.surface0,
-        surface1 = theme.surface1,
-        surface2 = theme.surface2,
-        overlay0 = theme.overlay0,
-        subtext0 = theme.subtext0,
-        subtext1 = theme.subtext1,
-        accent = theme.accent,
-        red = theme.red,
-        height = height,
-        left = render(&left),
-        center = render(&center),
-        right = render(&right),
-        plugin_css = plugin_css,
-    )
+    /// Label widgets keyed by dom_id for reload lookups
+    labels: Rc<RefCell<HashMap<String, gtk4::Label>>>,
 }
 
 /// Parse module script output. Supports:
@@ -207,36 +81,89 @@ fn run_module_exec(
     rx
 }
 
+/// Apply theme CSS to the status bar widget tree.
+fn apply_theme_css(theme: &Theme, height: u32) {
+    let css = format!(
+        r#"
+        .turm-statusbar {{
+            background-color: {surface0};
+            border-top: 1px solid {overlay0};
+            min-height: {height}px;
+            padding: 0 10px;
+        }}
+        .turm-statusbar label {{
+            color: {subtext0};
+            font-family: system-ui, -apple-system, sans-serif;
+            font-size: 12px;
+        }}
+        "#,
+        surface0 = theme.surface0,
+        overlay0 = theme.overlay0,
+        subtext0 = theme.subtext0,
+        height = height,
+    );
+
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_string(&css);
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::gdk::Display::default().unwrap(),
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+    );
+}
+
+/// Sorted module entries for a section
+struct ModuleEntry {
+    order: i32,
+    label: gtk4::Label,
+}
+
+fn build_section(entries: &mut Vec<ModuleEntry>) -> gtk4::Box {
+    entries.sort_by_key(|e| e.order);
+    let section = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    for entry in entries.iter() {
+        section.append(&entry.label);
+    }
+    section
+}
+
 impl StatusBar {
     pub fn new(config: &TurmConfig, plugins: &[LoadedPlugin]) -> Self {
         let theme = Theme::by_name(&config.theme.name).unwrap_or_default();
         let height = config.statusbar.height;
         let socket_path = format!("/tmp/turm-{}.sock", std::process::id());
 
-        let webview = webkit6::WebView::new();
+        apply_theme_css(&theme, height);
 
-        if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
-            settings.set_enable_javascript(true);
-            settings.set_allow_file_access_from_file_urls(true);
-            settings.set_allow_universal_access_from_file_urls(false);
-            settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Always);
-        }
+        let mut left_entries: Vec<ModuleEntry> = Vec::new();
+        let mut center_entries: Vec<ModuleEntry> = Vec::new();
+        let mut right_entries: Vec<ModuleEntry> = Vec::new();
 
-        webview.set_hexpand(true);
-        webview.set_vexpand(false);
-        webview.set_size_request(-1, height as i32);
-
-        // Build and load the shell HTML
-        let html = build_bar_html(plugins, &theme, height);
-        webview.load_html(&html, None);
-
-        // Collect module handles
         let modules: Rc<RefCell<Vec<ModuleHandle>>> = Rc::new(RefCell::new(Vec::new()));
+        let labels: Rc<RefCell<HashMap<String, gtk4::Label>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
         for plugin in plugins {
             for module in &plugin.manifest.modules {
                 let dom_id = format!("mod-{}-{}", plugin.manifest.plugin.name, module.name);
+
+                let label = gtk4::Label::new(Some("..."));
+                label.set_widget_name(&dom_id);
+
+                let entry = ModuleEntry {
+                    order: module.order,
+                    label: label.clone(),
+                };
+
+                match module.position.as_str() {
+                    "left" => left_entries.push(entry),
+                    "center" => center_entries.push(entry),
+                    _ => right_entries.push(entry),
+                }
+
+                labels.borrow_mut().insert(dom_id.clone(), label.clone());
                 modules.borrow_mut().push(ModuleHandle {
-                    dom_id,
+                    label,
                     exec: module.exec.clone(),
                     interval: module.interval,
                     plugin_dir: plugin.dir.clone(),
@@ -245,33 +172,53 @@ impl StatusBar {
             }
         }
 
+        eprintln!(
+            "[turm] statusbar modules: left={}, center={}, right={}",
+            left_entries.len(),
+            center_entries.len(),
+            right_entries.len()
+        );
+
+        let left_box = build_section(&mut left_entries);
+        left_box.set_halign(gtk4::Align::Start);
+        left_box.set_hexpand(true);
+
+        let center_box = build_section(&mut center_entries);
+        center_box.set_halign(gtk4::Align::Center);
+
+        let right_box = build_section(&mut right_entries);
+        right_box.set_halign(gtk4::Align::End);
+        right_box.set_hexpand(true);
+
+        let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        bar.add_css_class("turm-statusbar");
+        bar.set_hexpand(true);
+        bar.set_vexpand(false);
+        bar.set_valign(gtk4::Align::Center);
+        bar.append(&left_box);
+        bar.append(&center_box);
+        bar.append(&right_box);
+
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         container.set_hexpand(true);
         container.set_vexpand(false);
-        container.append(&webview);
+        container.append(&bar);
 
-        if !config.statusbar.enabled {
+        let has_modules = !modules.borrow().is_empty();
+        if !config.statusbar.enabled || !has_modules {
             container.set_visible(false);
         }
 
-        // Schedule module execution after WebView loads
-        let modules_ref = modules.clone();
-        let wv = webview.clone();
-        webview.connect_load_changed(move |_, event| {
-            if event == webkit6::LoadEvent::Finished {
-                let modules_ref2 = modules_ref.clone();
-                let wv2 = wv.clone();
-                // Small delay to ensure DOM is ready
-                glib::timeout_add_local_once(Duration::from_millis(100), move || {
-                    schedule_modules(&modules_ref2, &wv2);
-                });
-            }
-        });
+        // Schedule module execution
+        if has_modules {
+            schedule_modules(&modules);
+        }
 
         Self {
             container,
-            webview,
+            bar,
             modules,
+            labels,
         }
     }
 
@@ -291,27 +238,117 @@ impl StatusBar {
 
     pub fn reload(&self, config: &TurmConfig, plugins: &[LoadedPlugin]) {
         let theme = Theme::by_name(&config.theme.name).unwrap_or_default();
-        let html = build_bar_html(plugins, &theme, config.statusbar.height);
-        self.webview.load_html(&html, None);
-        // Modules will re-schedule via connect_load_changed
+        apply_theme_css(&theme, config.statusbar.height);
+
+        // Re-collect modules with updated socket/plugin info
+        let socket_path = format!("/tmp/turm-{}.sock", std::process::id());
+
+        // Clear existing labels from the bar sections
+        let mut child = self.bar.first_child();
+        while let Some(section) = child {
+            child = section.next_sibling();
+            if let Some(bx) = section.downcast_ref::<gtk4::Box>() {
+                let mut label_child = bx.first_child();
+                while let Some(lc) = label_child {
+                    label_child = lc.next_sibling();
+                    bx.remove(&lc);
+                }
+            }
+        }
+
+        let mut left_entries: Vec<ModuleEntry> = Vec::new();
+        let mut center_entries: Vec<ModuleEntry> = Vec::new();
+        let mut right_entries: Vec<ModuleEntry> = Vec::new();
+
+        self.modules.borrow_mut().clear();
+        self.labels.borrow_mut().clear();
+
+        for plugin in plugins {
+            for module in &plugin.manifest.modules {
+                let dom_id = format!("mod-{}-{}", plugin.manifest.plugin.name, module.name);
+
+                let label = gtk4::Label::new(Some("..."));
+                label.set_widget_name(&dom_id);
+
+                let entry = ModuleEntry {
+                    order: module.order,
+                    label: label.clone(),
+                };
+
+                match module.position.as_str() {
+                    "left" => left_entries.push(entry),
+                    "center" => center_entries.push(entry),
+                    _ => right_entries.push(entry),
+                }
+
+                self.labels
+                    .borrow_mut()
+                    .insert(dom_id.clone(), label.clone());
+                self.modules.borrow_mut().push(ModuleHandle {
+                    label,
+                    exec: module.exec.clone(),
+                    interval: module.interval,
+                    plugin_dir: plugin.dir.clone(),
+                    socket_path: socket_path.clone(),
+                });
+            }
+        }
+
+        // Re-populate sections (bar has 3 children: left, center, right)
+        let sections: Vec<gtk4::Box> = {
+            let mut v = Vec::new();
+            let mut child = self.bar.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                if let Some(bx) = c.downcast_ref::<gtk4::Box>() {
+                    v.push(bx.clone());
+                }
+            }
+            v
+        };
+
+        if sections.len() == 3 {
+            left_entries.sort_by_key(|e| e.order);
+            center_entries.sort_by_key(|e| e.order);
+            right_entries.sort_by_key(|e| e.order);
+
+            for entry in &left_entries {
+                sections[0].append(&entry.label);
+            }
+            for entry in &center_entries {
+                sections[1].append(&entry.label);
+            }
+            for entry in &right_entries {
+                sections[2].append(&entry.label);
+            }
+        }
+
+        let has_modules = !self.modules.borrow().is_empty();
+        self.container
+            .set_visible(config.statusbar.enabled && has_modules);
+
+        if has_modules {
+            schedule_modules(&self.modules);
+        }
     }
 }
 
-fn schedule_modules(modules: &Rc<RefCell<Vec<ModuleHandle>>>, webview: &webkit6::WebView) {
+fn schedule_modules(modules: &Rc<RefCell<Vec<ModuleHandle>>>) {
     let modules_ref = modules.borrow();
     eprintln!("[turm] statusbar: scheduling {} modules", modules_ref.len());
     for module in modules_ref.iter() {
         eprintln!(
             "[turm] statusbar: module {} exec={} interval={}s",
-            module.dom_id, module.exec, module.interval
+            module.label.widget_name(),
+            module.exec,
+            module.interval,
         );
         let ctx = ModuleRunCtx {
-            dom_id: module.dom_id.clone(),
+            label: module.label.clone(),
             exec: module.exec.clone(),
             plugin_dir: module.plugin_dir.clone(),
             socket_path: module.socket_path.clone(),
             interval: module.interval,
-            webview: webview.clone(),
         };
         run_and_schedule(ctx);
     }
@@ -319,12 +356,11 @@ fn schedule_modules(modules: &Rc<RefCell<Vec<ModuleHandle>>>, webview: &webkit6:
 
 #[derive(Clone)]
 struct ModuleRunCtx {
-    dom_id: String,
+    label: gtk4::Label,
     exec: String,
     plugin_dir: std::path::PathBuf,
     socket_path: String,
     interval: u64,
-    webview: webkit6::WebView,
 }
 
 fn run_and_schedule(ctx: ModuleRunCtx) {
@@ -334,37 +370,16 @@ fn run_and_schedule(ctx: ModuleRunCtx) {
         match rx.try_recv() {
             Ok(output) => {
                 let (text, tooltip) = parse_output(&output);
-                eprintln!("[turm] statusbar: {} -> {:?}", ctx.dom_id, text);
-
-                // Update DOM via JavaScript
-                let escaped_text = text
-                    .replace('\\', "\\\\")
-                    .replace('\'', "\\'")
-                    .replace('\n', "\\n");
-                let escaped_tooltip = tooltip
-                    .as_deref()
-                    .unwrap_or("")
-                    .replace('\\', "\\\\")
-                    .replace('\'', "\\'")
-                    .replace('\n', "\\n");
-                let dom_id = &ctx.dom_id;
-
-                let js = format!(
-                    r#"(() => {{
-                        const el = document.getElementById('{dom_id}');
-                        if (el) {{
-                            el.textContent = '{escaped_text}';
-                            el.title = '{escaped_tooltip}';
-                        }}
-                    }})()"#,
+                eprintln!(
+                    "[turm] statusbar: {} -> {:?}",
+                    ctx.label.widget_name(),
+                    text
                 );
-                ctx.webview.evaluate_javascript(
-                    &js,
-                    None,
-                    None,
-                    gtk4::gio::Cancellable::NONE,
-                    |_| {},
-                );
+
+                ctx.label.set_text(&text);
+                if let Some(tt) = &tooltip {
+                    ctx.label.set_tooltip_text(Some(tt));
+                }
 
                 // Schedule next run
                 let next = ctx.clone();

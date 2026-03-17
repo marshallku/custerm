@@ -66,7 +66,7 @@ impl TurmWindow {
             dispatch_tx,
         );
 
-        // Status bar (native GTK labels, no WebView)
+        // Status bar
         let statusbar = Rc::new(StatusBar::new(config, &plugins));
 
         // Layout: vertical box with notebook + statusbar
