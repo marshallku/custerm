@@ -70,6 +70,29 @@ enum TurmError { Io, Config, Protocol }
 type Result<T> = std::result::Result<T, TurmError>;
 ```
 
+### action_registry.rs
+
+Name → handler map for all invocable actions (see [workflow-runtime.md](./workflow-runtime.md)). v1 is synchronous; async registration will be added when the first service provider (Calendar, Slack) needs non-blocking I/O.
+
+```rust
+ActionRegistry::new()
+ActionRegistry::register(name, |params| -> Result<Value, ResponseError>)
+ActionRegistry::invoke(name, params) -> Result<Value, ResponseError>
+ActionRegistry::has(name) -> bool
+ActionRegistry::names() -> Vec<String>   // sorted
+ActionRegistry::len() / is_empty()
+```
+
+**Errors:** returns `turm_core::protocol::ResponseError` so socket dispatch can wrap it directly in a `Response::error(...)`. Error helpers:
+
+- `action_registry::invalid_params(msg)` — `code: "invalid_params"`
+- `action_registry::internal_error(msg)` — `code: "internal_error"`
+- Unknown action — `code: "action_not_found"` (produced by `invoke()`)
+
+**Thread safety:** backed by `RwLock<HashMap>`. Multiple threads can invoke concurrently; registration takes a short write lock. Handlers must be `Fn(Value) -> ActionResult + Send + Sync + 'static` — state capture via `Arc<Mutex<T>>` or `Arc<AtomicX>`.
+
+**Not wired yet:** this is a pure primitive. `turm-linux/socket.rs`'s `dispatch()` still uses its hard-coded match. Migration is incremental — new commands register through the registry; legacy commands move over one at a time.
+
 ### event_bus.rs
 
 In-process pub/sub hub for the workflow runtime (see [workflow-runtime.md](./workflow-runtime.md)). All internal event sources (shell signals, VTE output, service providers) publish through this bus; the socket `event.subscribe` stream becomes a projection of it.

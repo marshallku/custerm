@@ -185,7 +185,7 @@ Reframe `turm-core` as a personal workflow runtime. See [workflow-runtime.md](./
 
 - [x] **Event Bus** in turm-core (pub/sub with glob pattern matching, bounded mpsc delivery, drop-newest on subscriber overflow, 9 unit tests)
 - [ ] **Socket event stream refactor** — existing `event.subscribe` becomes a bus projection
-- [ ] **Action Registry** in turm-core (name → handler map, JSON Schema for AI tool use)
+- [~] **Action Registry** in turm-core (name → handler map; sync v1 with 11 unit tests incl. nested-register / nested-invoke deadlock regressions — JSON Schema + async variants deferred until first service provider needs them)
 - [ ] **Socket dispatcher migration** — new commands go through registry, existing match kept
 - [ ] **Context Service** (active panel, cwd, upcoming events, recent mentions, open documents)
 - [ ] **Trigger engine** — TOML rules, hot-reload, `{event.*}` / `{context.*}` interpolation
