@@ -42,6 +42,15 @@ impl ActionRegistry {
         handler(params)
     }
 
+    /// Like `invoke`, but returns `None` if the action is not registered
+    /// (rather than synthesizing an `action_not_found` error). Useful for
+    /// dispatchers that want to fall through to a different handler when
+    /// the registry has no entry for the method.
+    pub fn try_invoke(&self, name: &str, params: Value) -> Option<ActionResult> {
+        let handler = self.handlers.read().unwrap().get(name).cloned()?;
+        Some(handler(params))
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.handlers.read().unwrap().contains_key(name)
     }
@@ -102,6 +111,15 @@ mod tests {
         reg.register("ping", |_| Ok(json!({"pong": true})));
         let out = reg.invoke("ping", json!({})).unwrap();
         assert_eq!(out, json!({"pong": true}));
+    }
+
+    #[test]
+    fn try_invoke_returns_none_for_unknown() {
+        let reg = ActionRegistry::new();
+        reg.register("known", |_| Ok(json!("ok")));
+        assert!(reg.try_invoke("missing", json!({})).is_none());
+        let some = reg.try_invoke("known", json!({})).expect("registered");
+        assert_eq!(some.unwrap(), json!("ok"));
     }
 
     #[test]

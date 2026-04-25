@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use gtk4::ApplicationWindow;
 use serde_json::json;
 
+use turm_core::action_registry::ActionRegistry;
 use turm_core::event_bus::{Event as BusEvent, EventBus as CoreEventBus};
 use turm_core::protocol::{Event, Request, Response};
 
@@ -163,15 +164,28 @@ pub fn dispatch(
     window: &ApplicationWindow,
     socket_path: &str,
     statusbar: &Rc<crate::statusbar::StatusBar>,
+    actions: &Arc<ActionRegistry>,
 ) {
     let req = &cmd.request;
-    match req.method.as_str() {
-        "system.ping" => {
-            let _ = cmd
-                .reply
-                .send(Response::success(req.id.clone(), json!({ "status": "ok" })));
-        }
 
+    // Action Registry: try registered handlers first. New commands register
+    // through the registry; legacy commands stay in the match below until
+    // migrated. `try_invoke` returns None on miss so we fall through cleanly.
+    if let Some(result) = actions.try_invoke(&req.method, req.params.clone()) {
+        let resp = match result {
+            Ok(value) => Response::success(req.id.clone(), value),
+            Err(err) => Response {
+                id: req.id.clone(),
+                ok: false,
+                result: None,
+                error: Some(err),
+            },
+        };
+        let _ = cmd.reply.send(resp);
+        return;
+    }
+
+    match req.method.as_str() {
         "background.set" => {
             let resp = handle_bg_set(req, mgr);
             let _ = cmd.reply.send(resp);

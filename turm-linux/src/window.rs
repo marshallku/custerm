@@ -1,9 +1,12 @@
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, gio, glib};
+use serde_json::json;
 
+use turm_core::action_registry::ActionRegistry;
 use turm_core::config::TurmConfig;
 
 use crate::panel::Panel;
@@ -40,6 +43,11 @@ impl TurmWindow {
         );
 
         let event_bus = socket::new_event_bus();
+
+        // Action Registry: shared across socket + plugin dispatch paths.
+        // Migrating commands one at a time from the match arm in socket::dispatch.
+        let actions = Arc::new(ActionRegistry::new());
+        actions.register("system.ping", |_| Ok(json!({ "status": "ok" })));
 
         // Plugin discovery
         let plugins = turm_core::plugin::discover_plugins();
@@ -86,14 +94,15 @@ impl TurmWindow {
         let win = window.clone();
         let sp = socket_path.clone();
         let sb = statusbar.clone();
+        let act = actions.clone();
         glib::timeout_add_local(Duration::from_millis(50), move || {
             // Process commands from socket server
             while let Ok(cmd) = socket_rx.try_recv() {
-                socket::dispatch(cmd, &mgr, &win, &sp, &sb);
+                socket::dispatch(cmd, &mgr, &win, &sp, &sb, &act);
             }
             // Process commands from plugin JS bridges
             while let Ok(cmd) = plugin_dispatch_rx.try_recv() {
-                socket::dispatch(cmd, &mgr, &win, &sp, &sb);
+                socket::dispatch(cmd, &mgr, &win, &sp, &sb, &act);
             }
             glib::ControlFlow::Continue
         });
