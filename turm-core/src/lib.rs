@@ -6,3 +6,4 @@ pub mod event_bus;
 pub mod plugin;
 pub mod protocol;
 pub mod theme;
+pub mod trigger;

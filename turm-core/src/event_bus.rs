@@ -156,7 +156,16 @@ impl Default for EventBus {
     }
 }
 
-fn pattern_matches(pattern: &str, kind: &str) -> bool {
+/// Glob-style matcher used by the bus for routing and shared with other
+/// modules (e.g. `trigger::Trigger`) so user-facing `event_kind` patterns
+/// have one and only one definition of "matches".
+///
+/// Rules:
+/// - `"*"` matches everything.
+/// - `"foo.*"` matches any kind that starts with `foo.` (deep — also matches
+///   `foo.bar.baz`). Does NOT match the bare prefix `foo` alone.
+/// - Otherwise, exact string equality.
+pub fn pattern_matches(pattern: &str, kind: &str) -> bool {
     if pattern == "*" {
         return true;
     }

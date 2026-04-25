@@ -188,7 +188,7 @@ Reframe `turm-core` as a personal workflow runtime. See [workflow-runtime.md](./
 - [~] **Action Registry** in turm-core (name → handler map; sync v1 with 11 unit tests incl. nested-register / nested-invoke deadlock regressions — JSON Schema + async variants deferred until first service provider needs them)
 - [ ] **Socket dispatcher migration** — new commands go through registry, existing match kept
 - [x] **Context Service** v1 wired in turm-linux (pumped from GTK timer, exposed via `context.snapshot` action + `turmctl context`. `active_panel` + `active_cwd`, per-panel cwd cache, 10 unit tests. Other fields land with their providers.)
-- [ ] **Trigger engine** — TOML rules, hot-reload, `{event.*}` / `{context.*}` interpolation
+- [~] **Trigger engine** primitive — TOML/JSON `Trigger` + `TriggerEngine` in turm-core (13 unit tests). Glob `event_kind` + flat payload-field equality matcher; `{event.*}`/`{context.*}` interpolation walking nested values; `set_triggers` hot-reload swap; action errors logged not propagated. Wiring into turm-linux + config loader is the next turn.
 - [ ] **Google Calendar provider** (OAuth + polling + `calendar.event_imminent` events + context contribution)
 - [ ] **First vertical PoC**: meeting-prep trigger opens meeting link tab + Notion doc in WebView panel split
 - [ ] Slack / Discord event gateway (native WebSocket adapter, Event Bus publisher)

@@ -70,6 +70,34 @@ enum TurmError { Io, Config, Protocol }
 type Result<T> = std::result::Result<T, TurmError>;
 ```
 
+### trigger.rs
+
+Config-driven `event → action` automation. Pure primitive — no bus subscription, no config loading; the platform layer pumps events into `dispatch()`. See [workflow-runtime.md](./workflow-runtime.md) for the broader trigger model.
+
+```rust
+Trigger { name, when: WhenSpec, action, params: Value }
+WhenSpec { event_kind: String, payload_match: Map<String, Value> }
+TriggerEngine::new(registry: Arc<ActionRegistry>)
+TriggerEngine::set_triggers(Vec<Trigger>)        // hot-reloadable
+TriggerEngine::dispatch(&Event, Option<&Context>) -> usize  // returns # fired
+TriggerEngine::count() / names()
+```
+
+**`when` matching:**
+- `event_kind` is a glob — same semantics as `event_bus::pattern_matches` (`*`, `foo.*`, exact).
+- All other keys under `[when]` (TOML `#[serde(flatten)]`) are required payload-field equality matches. Missing field or different value → trigger does not fire.
+
+**Param interpolation (`{token}` in any string in `params`):**
+- `{event.foo}` → `event.payload["foo"]` value (scalar JSON → string; null → "null"; objects/arrays → `Display` of `serde_json::Value`).
+- `{context.active_panel}` / `{context.active_cwd}` → from the `Context` snapshot the dispatcher passes in.
+- Unresolvable tokens are kept as literal `{token}` so misconfigured triggers fail loudly in their target action rather than silently substituting empty.
+- Unclosed `{` is preserved verbatim.
+- Walks nested arrays/objects; non-string scalars pass through unchanged.
+
+**Error handling:** action failures (`Err` from registry, or unknown action) are logged via `log::warn!` and never propagate out of `dispatch`. One bad trigger cannot poison the dispatcher or block other triggers.
+
+**Hot reload:** `set_triggers()` replaces the list under a write lock. `dispatch` snapshots the list under a short read lock then iterates; concurrent writers see all-or-nothing.
+
 ### context.rs
 
 Live snapshot of "what the user is currently doing." Reads from the Event Bus. See [workflow-runtime.md](./workflow-runtime.md) for the broader Context Service design and how triggers / AI agent / command palette consume it.
