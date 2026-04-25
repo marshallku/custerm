@@ -130,6 +130,60 @@ impl TriggerEngine {
     }
 }
 
+/// Reduce a set of trigger `event_kind` patterns to the minimal set that
+/// covers all of them — used by the platform layer to compute a deduplicated
+/// list of bus subscriptions. Without this, declaring overlapping patterns
+/// (e.g. `*` plus `panel.focused`) would cause the same bus event to be
+/// delivered to multiple receivers and trigger every matching action once
+/// per delivery instead of once per event.
+///
+/// Rules (matching `event_bus::pattern_matches`):
+/// - `*` covers every pattern → if `*` is present, it's the only result.
+/// - `foo.*` covers `foo.X`, `foo.X.Y`, and `foo.X.*` (any narrower pattern
+///   under the same dotted prefix).
+/// - Exact patterns cover only themselves; they survive only when no other
+///   pattern in the set covers them.
+pub fn covering_patterns<I, S>(patterns: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut set: Vec<String> = patterns.into_iter().map(Into::into).collect();
+    set.sort();
+    set.dedup();
+    if set.iter().any(|p| p == "*") {
+        return vec!["*".to_string()];
+    }
+    let mut result = Vec::new();
+    for p in &set {
+        let covered = set.iter().any(|other| other != p && pattern_covers(other, p));
+        if !covered {
+            result.push(p.clone());
+        }
+    }
+    result
+}
+
+fn pattern_covers(broader: &str, narrower: &str) -> bool {
+    if broader == "*" {
+        return true;
+    }
+    let Some(prefix) = broader.strip_suffix(".*") else {
+        return false;
+    };
+    if let Some(narr_prefix) = narrower.strip_suffix(".*") {
+        // `prefix.*` covers `prefix.X.*`, `prefix.X.Y.*`, etc.
+        narr_prefix.len() > prefix.len()
+            && narr_prefix.starts_with(prefix)
+            && narr_prefix.as_bytes()[prefix.len()] == b'.'
+    } else {
+        // `prefix.*` covers `prefix.X`, `prefix.X.Y`, etc. (exact targets)
+        narrower.len() > prefix.len()
+            && narrower.starts_with(prefix)
+            && narrower.as_bytes()[prefix.len()] == b'.'
+    }
+}
+
 fn interpolate_value(template: &Value, event: &Event, context: Option<&Context>) -> Value {
     match template {
         Value::String(s) => Value::String(interpolate_string(s, event, context)),
@@ -488,6 +542,56 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2);
         engine.dispatch(&evt("c", json!({})), None);
         assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn covering_dedupes_exact_duplicates() {
+        let out = covering_patterns(vec!["foo.bar", "foo.bar"]);
+        assert_eq!(out, vec!["foo.bar"]);
+    }
+
+    #[test]
+    fn covering_star_subsumes_everything() {
+        let out = covering_patterns(vec!["*", "panel.focused", "calendar.*"]);
+        assert_eq!(out, vec!["*"]);
+    }
+
+    #[test]
+    fn covering_glob_subsumes_exact_under_same_prefix() {
+        let mut out = covering_patterns(vec!["panel.*", "panel.focused", "panel.exited"]);
+        out.sort();
+        assert_eq!(out, vec!["panel.*"]);
+    }
+
+    #[test]
+    fn covering_glob_subsumes_deeper_glob() {
+        // `foo.*` covers `foo.bar.*` (both globs, latter is narrower).
+        let out = covering_patterns(vec!["foo.*", "foo.bar.*"]);
+        assert_eq!(out, vec!["foo.*"]);
+    }
+
+    #[test]
+    fn covering_keeps_disjoint_patterns() {
+        let mut out =
+            covering_patterns(vec!["panel.*", "calendar.*", "terminal.cwd_changed"]);
+        out.sort();
+        assert_eq!(
+            out,
+            vec![
+                "calendar.*".to_string(),
+                "panel.*".to_string(),
+                "terminal.cwd_changed".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn covering_does_not_match_substring_namespaces() {
+        // `panel.*` must NOT cover `panelfoo` or `panelfoo.bar` — the dot
+        // separator is significant.
+        let mut out = covering_patterns(vec!["panel.*", "panelfoo.bar"]);
+        out.sort();
+        assert_eq!(out, vec!["panel.*".to_string(), "panelfoo.bar".to_string()]);
     }
 
     #[test]

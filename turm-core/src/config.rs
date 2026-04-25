@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::trigger::Trigger;
 
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
@@ -236,6 +237,10 @@ pub struct TurmConfig {
 
     #[serde(default)]
     pub keybindings: KeybindingsConfig,
+
+    /// Declarative event → action automation. See `docs/workflow-runtime.md`.
+    #[serde(default)]
+    pub triggers: Vec<Trigger>,
 }
 
 impl TurmConfig {
@@ -296,6 +301,13 @@ name = "catppuccin-mocha"
 # Map key combos to shell commands (spawn:) — runs in background
 # "ctrl+shift+g" = "spawn:~/my-script.sh --next"
 # "ctrl+shift+m" = "spawn:~/my-script.sh --toggle"
+
+# [[triggers]]
+# name = "log-cwd"
+# action = "system.log"
+# params = { message = "cwd: {event.cwd}" }
+# [triggers.when]
+# event_kind = "terminal.cwd_changed"
 "##;
         std::fs::write(&path, default_config)?;
         Ok(path)

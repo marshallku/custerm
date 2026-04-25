@@ -95,6 +95,8 @@ Handlers are async so that service calls (HTTP, WebSocket) are non-blocking with
 
 Existing socket commands migrate _incrementally_. The dispatcher keeps its hard-coded match for a while; new commands register through the registry from day one. No big-bang refactor.
 
+**Trigger reach implication (current state):** because triggers invoke via `ActionRegistry` directly, only registry-registered actions are trigger-reachable today. The bulk of useful actions still live in the legacy match and are not yet usable as trigger sinks. Closing this gap is a separate Phase 8 subtask (either sink fallthrough through `socket::dispatch`, or incremental per-command migration into the registry). Until then, Calendar/Slack-style automations that want to spawn tabs, run shell commands, or open WebView panels will need their target actions migrated first.
+
 ## Context Service
 
 Centralized read model of "what is the user doing right now." Services contribute, any consumer can query. This is what makes triggers and the AI agent feel aware rather than blind.

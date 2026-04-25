@@ -98,6 +98,10 @@ TriggerEngine::count() / names()
 
 **Hot reload:** `set_triggers()` replaces the list under a write lock. `dispatch` snapshots the list under a short read lock then iterates; concurrent writers see all-or-nothing.
 
+**`covering_patterns(patterns)`:** helper used by the platform layer to compute the minimal cover of trigger `event_kind` patterns before subscribing to the bus. `*` covers all; `foo.*` covers `foo.X`, `foo.X.Y`, and `foo.X.*`. Without this, declaring overlapping kinds would cause the same event to land in multiple subscriptions and trigger every matching action once per delivery.
+
+**Reach limitation (v1):** `TriggerEngine::dispatch` invokes via `ActionRegistry` directly, so triggers can fire only actions that have been registered there. The legacy `socket::dispatch` match in turm-linux still owns most actions (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`, etc.); those are not trigger-reachable yet. Closing this gap requires either routing trigger invocations through `socket::dispatch` (sink fallthrough so unregistered actions fall through to the match) or migrating hot actions into the registry one at a time. Tracked in roadmap Phase 8.
+
 ### context.rs
 
 Live snapshot of "what the user is currently doing." Reads from the Event Bus. See [workflow-runtime.md](./workflow-runtime.md) for the broader Context Service design and how triggers / AI agent / command palette consume it.
