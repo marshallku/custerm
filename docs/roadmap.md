@@ -190,12 +190,42 @@ Reframe `turm-core` as a personal workflow runtime. See [workflow-runtime.md](./
 - [x] **Context Service** v1 wired in turm-linux (pumped from GTK timer, exposed via `context.snapshot` action + `turmctl context`. `active_panel` + `active_cwd`, per-panel cwd cache, 10 unit tests. Other fields land with their providers.)
 - [~] **Trigger engine** wired in turm-linux. `TurmConfig.triggers: Vec<Trigger>` loaded at startup; pumped from GTK timer with **scoped** `subscribe_unbounded(pattern)` per unique trigger `event_kind`, deduplicated through `covering_patterns` so overlapping declarations (e.g. `*` plus `panel.focused`) collapse to a single broader receiver — no double-dispatch on shared events, no OOM hazard from unrelated kinds. Per-event `Context` snapshot for `{context.*}` interpolation. Built-in `system.log` action available as a trigger sink. Config hot-reload runs `engine.set_triggers()` (atomic swap) and `subs.reconcile()` (preserves still-needed receivers' pending events, drops removed patterns, adds new). E2E verified: trigger fires on `terminal.cwd_changed` with `{event.cwd}` interpolation; 5000-line `terminal.output` flood causes zero spurious dispatches (unmatched kinds never enter the trigger queues). **Reach:** since the `TriggerSink` trait + `LiveTriggerSink` landed, every command handled by `socket::dispatch` is trigger-reachable (`event.subscribe` is special-cased earlier in `start_server` and is intentionally not a trigger sink). Registry actions get full sync error semantics; legacy match-arm fallthrough surfaces `ok=false` replies asynchronously via a consumer thread (stderr). See the next entry for details.
 - [x] **Trigger reach expansion** via `TriggerSink` trait + `LiveTriggerSink` (turm-linux). `TriggerEngine` now invokes through `Arc<dyn TriggerSink>`. Default impl on `ActionRegistry` (registry-only); `LiveTriggerSink` tries registry first, falls through to `socket::dispatch` for legacy match-arm commands. Triggers can now fire any command handled by `socket::dispatch` (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`, …; `event.subscribe` is intentionally not reachable since it's special-cased in `start_server` and not a meaningful trigger sink). Fallthrough surfaces failures asynchronously: `LiveTriggerSink::new` spawns a consumer thread that drains a shared reply channel and prints `[turm] trigger fallthrough id=... failed: <code>: <msg>` to stderr for any `ok=false` response (typos, unknown methods, runtime errors). Per-event `fired` count over-counts on fallthrough (counts queueing as success), but misconfiguration is visible. Registry actions retain full sync error semantics. E2E verified: legacy `terminal.exec` trigger writes a marker file on `cd /tmp`; misspelled `terminal.execc` trigger is logged via the consumer thread.
-- [ ] **Google Calendar provider** (OAuth + polling + `calendar.event_imminent` events + context contribution)
-- [ ] **First vertical PoC**: meeting-prep trigger opens meeting link tab + Notion doc in WebView panel split
-- [ ] Slack / Discord event gateway (native WebSocket adapter, Event Bus publisher)
-- [ ] Notion document provider (WebView panel with saved-documents quick switcher)
-- [ ] Command palette (Ctrl+Shift+P) over Action Registry
-- [ ] Knowledge base layer (local embeddings + semantic search over context + notes)
+- [ ] Command palette (Ctrl+Shift+P) over Action Registry — orthogonal to plugin pivot, stays in core
+
+> **Architectural pivot (after Phase 8 Trigger reach landed):** all external integrations originally listed under Phase 8 — Google Calendar provider, Slack/Discord gateway, Notion document provider, Knowledge base layer — moved to **service plugins** in Phase 9–13. They are no longer turm-core modules. See [service-plugins.md](./service-plugins.md) for end-state vision, plugin-first decisions, and the detailed plan.
+
+### Phase 9: Service Plugin Protocol & Host
+
+Plugin-first foundation. See [service-plugins.md](./service-plugins.md) for full rationale.
+
+- [ ] Manifest extension: `[[services]]` (name, exec, activation, restart, **provides**, **subscribes**) parsed in `turm-core::plugin`. Both `provides` and `subscribes` are source-of-truth for capability registration. The runtime `initialize` response is checked asymmetrically against the manifest, applied identically to both fields: subset = degraded mode OK (turm wires up only what runtime declared); superset rejected with warn (extras dropped; plugin keeps serving manifest-approved set so the pre-spawn ownership/subscription analysis stays accurate).
+- [ ] Service supervisor in turm-linux (spawn, monitor stdio, restart per policy, exponential backoff)
+- [ ] Initialization handshake (turm→service `initialize`; service replies with capability snapshot covering both `provides` and `subscribes`. turm checks against manifest with the same asymmetric rule for both fields: subset = degraded OK, superset rejected with warn)
+- [ ] Bidirectional RPC: `action.invoke`, `event.dispatch` (turm→service); `event.publish`, `action.invoke`, `log` (service→turm)
+- [ ] Lazy activation: `onStartup`, `onAction:<glob>`, `onEvent:<glob>`. Request buffering during `Starting`. Timeout → `service_unavailable`.
+- [ ] Deterministic conflict resolution: walk all enabled plugin manifests at load time, build the global action-ownership table BEFORE spawning anything; on `provides` collision, the alphabetically-earlier `[plugin].name` wins, the loser skips the conflicting entry only (rest of its declarations register normally). Warn loudly with both `[plugin].name` values + the conflicting action.
+- [ ] Mock `turm-plugin-echo` (Rust binary): `onStartup`, registers `echo.ping`, publishes `system.heartbeat` every 30s — verifies protocol shape
+- [ ] `docs/kb-protocol.md` defining `kb.search`/`kb.read`/`kb.append`/`kb.ensure` request/response shapes
+- [ ] First-party `turm-plugin-kb` (Rust): grep + filename over `~/docs`, `onAction:kb.*` lazy
+
+### Phase 10: Calendar (first vertical PoC)
+
+- [ ] `turm-plugin-calendar` (Rust): Google Calendar OAuth + polling, publishes `calendar.event_imminent`
+- [ ] Meeting-prep TOML trigger: `kb.ensure` only (creates/refreshes `~/docs/meetings/<event_id>.md`). Panel auto-open deferred — depends on the chained-trigger / composite-action decision tracked in service-plugins.md Open questions, expected after Phase 9 wrap-up.
+
+### Phase 11: Messenger ingestion
+
+- [ ] `turm-plugin-slack`: OAuth + WebSocket gateway, publishes `slack.mention`/`slack.dm`/etc, raw-archive to `~/docs/.raw/slack/...`
+- [ ] Derived markdown ingestion (depends on Phase 12 LLM plugin)
+
+### Phase 12: LLM plugin (when desired)
+
+- [ ] `turm-plugin-llm`: registers `llm.complete`/`llm.summarize`/`llm.draft_reply`
+- [ ] Per-user secrets store, cost tracking via `llm.usage`
+
+### Phase 13: KB indexing upgrade (when grep is slow)
+
+- [ ] SQLite FTS5 sidecar index, fs-watcher rebuild — KB plugin internal change only, protocol unchanged
 
 ## Pending Cleanup
 

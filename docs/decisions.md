@@ -135,3 +135,19 @@ Using the latest Rust edition. No compatibility concerns since the project is ne
 - Knowledge base is the last layer, built on the three abstractions — not a parallel system.
 
 **See:** [workflow-runtime.md](./workflow-runtime.md) for the abstraction design and first vertical PoC plan.
+
+## 17. Plugin-First for External Integrations (Post-Phase 8)
+
+**Problem:** ADR 16 reframed turm as a personal workflow runtime, with the implicit assumption that integrations like Calendar, Slack, KB, Notion, and LLM would land as modules in `turm-core`/`turm-linux`. As the integration surface grew it became clear this would make turm a kitchen-sink monolith, lock the user to specific backends (e.g. KB always means `~/docs` if KB is built in), and make third-party contributions painful. The user explicitly raised the comparison to VSCode-style extensions.
+
+**Decision:** Every external integration is a **service plugin** — a long-running supervised subprocess that speaks newline-delimited JSON over stdin/stdout and registers itself with `turm-core` via a manifest-declared `[[services]]` section. The KB action protocol (and similar contracts) lives in `turm-core` as documented protocol; implementations live in plugins. `turm-core` and `turm-linux` own the runtime primitives only — Event Bus, Action Registry, Trigger Engine, Context Service, Plugin Loader.
+
+**Tradeoff:** First-call latency of a few hundred milliseconds (lazy plugin spawn) and IPC overhead per action call vs in-process performance. Acceptable at personal scale; the gain is extensibility, swappability of backends, crash isolation, and language-agnostic plugin authoring. Subprocess + stdio is the dominant pattern across the editor/IDE ecosystem (VSCode language servers, Neovim remote plugins, LSP) so it carries proven integration patterns.
+
+**Key sub-decisions** (with research validation):
+- **Lazy activation** like VSCode `activationEvents`. Initial instinct toward eager startup was wrong — research showed mature systems uniformly chose lazy.
+- **LSP-style initialization handshake** for capability and version negotiation.
+- **Manifest-declared `provides`/`subscribes` as source of truth + lexical-name conflict resolution** at load time. The runtime `initialize` response is checked asymmetrically against the manifest — applied identically to BOTH `provides` AND `subscribes`: subset allowed (degraded mode — turm wires up only what runtime declared); superset rejected with warning (extras dropped, plugin keeps running for manifest-approved set). The pre-spawn ownership analysis stays accurate. Two enabled plugins with overlapping `provides` resolve via alphabetical `[plugin].name` ordering (the existing canonical plugin identifier from [plugins.md](./plugins.md)) — deterministic across runs and filesystems. User controls precedence by enabling/disabling plugins, or by editing the manifest `[plugin].name` if a finer override is needed.
+- **Subprocess + stdio + newline-JSON**, NOT WASM yet. WASM (Zed's choice) adds Wasmtime runtime and WIT compilation barriers that personal-scale turm doesn't yet need.
+
+**See:** [service-plugins.md](./service-plugins.md) for full vision, decisions, rationale, research sources, and the Phase 9–13 roadmap.

@@ -95,7 +95,9 @@ Handlers are async so that service calls (HTTP, WebSocket) are non-blocking with
 
 Existing socket commands migrate _incrementally_. The dispatcher keeps its hard-coded match for a while; new commands register through the registry from day one. No big-bang refactor.
 
-**Trigger reach (current):** the `TriggerSink` trait is the seam — default impl on `ActionRegistry` covers registered actions; turm-linux's `LiveTriggerSink` extends reach by falling through to `socket::dispatch` for legacy match-arm commands. Net effect: every command handled by `socket::dispatch` (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`, …) is trigger-reachable today. Exception: `event.subscribe` is special-cased earlier in the socket server (it owns the connection for the lifetime of a stream) and is not a meaningful trigger sink. Fallthrough surfaces failures asynchronously via a reply-consumer thread (`eprintln!` to stderr) — the trigger pump can't block on the reply because it runs on the GTK main thread that would later process the queued command. Migrating a hot action into the registry recovers full sync error semantics and accurate `fired` accounting.
+**Trigger reach (current):** the `TriggerSink` trait is the seam — default impl on `ActionRegistry` covers registered actions; turm-linux's `LiveTriggerSink` extends reach by falling through to `socket::dispatch` for legacy match-arm commands. Net effect: every command handled by `socket::dispatch` (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`, …) is trigger-reachable today. Exception: `event.subscribe` is special-cased earlier in the socket server (it owns the connection for the lifetime of a stream) and is not a meaningful trigger sink.
+
+**Beyond Phase 8 — plugin-first evolution:** the natural next layer is hosting external integrations (Calendar, Slack, KB, LLM, Notion) as **service plugins** rather than turm-core modules. The runtime primitives this doc describes are conceptually a plugin host already; the missing piece is a long-running supervised-subprocess model with a documented stdio RPC protocol. The headline rule from that protocol — for cross-reference here — is that each service's `[[services]]` manifest entry declares both `provides = [action names]` and `subscribes = [event-kind globs]` as the source of truth, and the runtime `initialize` reply is checked asymmetrically against the manifest (subset OK as degraded mode for both fields; superset rejected with a warning, plugin keeps serving its manifest-approved set). Conflict between two plugins claiming the same `provides` entry resolves by lexical `[plugin].name`. See [service-plugins.md](./service-plugins.md) for the end-state vision, all the decisions and rationale, and the Phase 9–13 roadmap. Fallthrough surfaces failures asynchronously via a reply-consumer thread (`eprintln!` to stderr) — the trigger pump can't block on the reply because it runs on the GTK main thread that would later process the queued command. Migrating a hot action into the registry recovers full sync error semantics and accurate `fired` accounting.
 
 ## Context Service
 
@@ -144,14 +146,23 @@ Triggers are the user-facing feature that makes the three abstractions worth the
 [[triggers]]
 name = "meeting-prep"
 when = { event_kind = "calendar.event_imminent", minutes = 10 }
-action = "plugin.notion.open_event_doc"
-params = { event_id = "{event.id}" }
+# `kb.ensure` is registered by the KB service plugin (Phase 9.3); see
+# service-plugins.md. v1 fires kb.ensure only — the meeting note path is
+# created/refreshed but the user opens it themselves. Auto-opening in a
+# WebView panel requires a chained-trigger or composite-action mechanism
+# that is deliberately not yet defined; see "Chained triggers / composite
+# actions" under Open questions in service-plugins.md.
+action = "kb.ensure"
+params = { id = "meetings/{event.id}.md", default_template = "# {event.title}\n\n" }
 
 [[triggers]]
 name = "slack-alert"
+# `slack.mention` is published by the Slack service plugin (Phase 11);
+# see service-plugins.md. The action below is a built-in core action
+# that already exists on the legacy match-arm dispatch path.
 when = { event_kind = "slack.mention", channel = "alerts" }
 action = "terminal.exec"
-params = { command = "echo {text} >> ~/pings.log" }
+params = { command = "echo {event.text} >> ~/pings.log" }
 ```
 
 Parameter interpolation (`{event.foo}`, `{context.bar}`) is the only logic triggers need for v1. Users who want conditional logic can point at a plugin action that does the filtering.
@@ -169,17 +180,16 @@ Parameter interpolation (`{event.foo}`, `{context.bar}`) is the only logic trigg
 
 Most existing features are already shaped correctly; the refactor is about unifying the internal plumbing that they all share.
 
-## First vertical PoC
+## First vertical PoC (superseded — now plugin-first)
 
-One concrete workflow that exercises all three abstractions end-to-end:
+The original PoC sketched here described a Google Calendar **provider** built into `turm-core` plus a built-in `workflow.meeting_prep` action. Both have moved to the plugin-first plan. Concretely:
 
-1. Google Calendar provider (OAuth + polling) publishes `calendar.event_imminent` events to the bus at 10 / 5 / 1 min before each meeting.
-2. Provider also maintains `Context.upcoming_events`.
-3. Trigger rule: `calendar.event_imminent (10m)` → action `workflow.meeting_prep`.
-4. Action `workflow.meeting_prep` (built-in): opens the meeting link in a new tab and opens the Notion page whose title matches the event title in a WebView panel split.
-5. User verifies: 10 minutes before a real meeting, two panels appear automatically.
+1. `calendar.event_imminent` is published by `turm-plugin-calendar` (Phase 10), not a core module.
+2. `Context.upcoming_events` would be contributed by the same plugin via context-provider extension (still TBD; v1 keeps Context to active panel + cwd).
+3. The meeting-prep workflow Phase 10 ships is a TOML trigger calling `kb.ensure` (handled by `turm-plugin-kb`, Phase 9.3) only — `~/docs/meetings/<event_id>.md` is created/refreshed and the user opens it themselves. Auto-opening the panel needs a chained-trigger or composite-action mechanism that is deliberately deferred to a Phase 9 wrap-up decision; see Open questions in service-plugins.md.
+4. End-to-end demo for Phase 10: 10 minutes before a real meeting, the kb plugin creates / refreshes the matching note. (Auto-opening lands as a follow-up trigger config update once the chain mechanism exists.)
 
-This PoC forces implementation of all three abstractions at minimal-viable level. Every later integration reuses the plumbing.
+See [service-plugins.md](./service-plugins.md) Phase 10 for the full plan. This section stays here as a record of the design intent that motivated the runtime primitives.
 
 ## Non-goals (v1)
 
@@ -192,4 +202,4 @@ This PoC forces implementation of all three abstractions at minimal-viable level
 
 - **Never build service clients from scratch** when a mature web UI exists. Embed in a WebView panel instead (`webkit6` on Linux, `WKWebView` on macOS — the existing `PanelVariant::WebView`).
 - **Implement native event streams** only for persistent push (WebSocket gateways, webhooks). Everything else polls via provider.
-- **Knowledge base is the last layer.** Do not start it until all three abstractions plus at least two real service integrations are in place.
+- **Service plugins, not core modules.** Calendar / Slack / Notion / KB / LLM all land as service plugins (subprocess + stdio + newline-JSON, manifest-declared capabilities, lazy activation by default). See [service-plugins.md](./service-plugins.md). The "knowledge base layer" guardrail above is now Phase 9.3 (KB plugin, grep + filename) plus Phase 13 (FTS / embedding upgrade) — same staging, different packaging.
