@@ -12,7 +12,9 @@ use turm_core::action_registry::{ActionRegistry, internal_error};
 use turm_core::config::TurmConfig;
 use turm_core::context::ContextService;
 use turm_core::event_bus::{Event as BusEvent, EventBus as CoreEventBus, EventReceiver};
-use turm_core::trigger::{Trigger, TriggerEngine, covering_patterns};
+use turm_core::trigger::{Trigger, TriggerEngine, TriggerSink, covering_patterns};
+
+use crate::trigger_sink::LiveTriggerSink;
 
 use crate::panel::Panel;
 use crate::socket;
@@ -77,15 +79,30 @@ impl TurmWindow {
             });
         }
 
+        // Dispatch channel: TabManager owns the original sender (used by
+        // plugin JS bridges). Trigger sink gets a clone so trigger-fired
+        // legacy actions (anything not in the registry yet) can fall through
+        // to `socket::dispatch` via the same path.
+        let (dispatch_tx, plugin_dispatch_rx) = std::sync::mpsc::channel();
+
+        // Trigger Engine + scoped bus subscriptions. Sink is `LiveTriggerSink`,
+        // which tries the in-process registry first and falls through to
+        // `socket::dispatch` for legacy match-arm commands. That makes every
+        // existing action (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`,
+        // …) reachable from triggers without per-command migration.
+        // Fire-and-forget caveat for fallthrough actions is documented on
+        // `LiveTriggerSink` itself.
+        //
         // PumpState bundles every per-tick drain target — context-driving
         // receivers AND trigger subscriptions — so the timer and the config
         // hot-reload callback can both invoke the same `pump_all` sequence.
-        // Critical: `pump_all` drains context BEFORE triggers, so any
-        // `{context.*}` interpolation inside a trigger sees the freshest
-        // state. Exact-match context subscriptions (not `*` and not glob) so
-        // high-frequency unrelated kinds (`terminal.output`,
-        // `panel.title_changed`) cannot flood these bounded queues.
-        let triggers = Arc::new(TriggerEngine::new(actions.clone()));
+        // Exact-match context subscriptions (not `*` and not glob) so high-
+        // frequency unrelated kinds cannot flood the bounded ctx queues.
+        let sink: Arc<dyn TriggerSink> = Arc::new(LiveTriggerSink::new(
+            actions.clone(),
+            dispatch_tx.clone(),
+        ));
+        let triggers = Arc::new(TriggerEngine::new(sink));
         triggers.set_triggers(config.triggers.clone());
         let pump_state = Rc::new(RefCell::new(PumpState {
             ctx_focused: event_bus.subscribe("panel.focused"),
@@ -115,9 +132,6 @@ impl TurmWindow {
         // Socket server (per-instance, so multiple turm windows don't collide)
         let socket_path = format!("/tmp/turm-{}.sock", std::process::id());
         let socket_rx = socket::start_server(&socket_path, event_bus.clone());
-
-        // Create a dispatch sender for the plugin JS bridge to reuse
-        let (dispatch_tx, plugin_dispatch_rx) = std::sync::mpsc::channel();
 
         let tab_manager = TabManager::new(
             config,

@@ -4,19 +4,37 @@
 //! - Triggers are declared declaratively in TOML / JSON as `[[triggers]]`.
 //! - `when` matches an event kind (glob) plus optional payload-field equality.
 //! - `params` may contain `{event.X}` / `{context.X}` interpolation tokens.
-//! - Action invocations go through `ActionRegistry`; errors are logged but
-//!   never propagate, so one bad trigger cannot poison the dispatcher.
+//! - Action invocations go through an `Arc<dyn TriggerSink>`. Default impl
+//!   on `ActionRegistry` gives synchronous error semantics for registered
+//!   actions. Platforms can plug a wider sink (e.g. `turm-linux`'s
+//!   `LiveTriggerSink` falls through to `socket::dispatch`, which gives
+//!   ASYNCHRONOUS error visibility for legacy match-arm commands). Either
+//!   way, errors are surfaced — one bad trigger cannot poison the dispatcher.
 //!
 //! This module is the pure primitive — no bus subscription, no config
 //! loading, no thread management. The platform layer is responsible for
 //! pumping events into `dispatch()`.
 
-use crate::action_registry::ActionRegistry;
+use crate::action_registry::{ActionRegistry, ActionResult};
 use crate::context::Context;
 use crate::event_bus::{Event, pattern_matches};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::{Arc, RwLock};
+
+/// Pluggable action invoker for the trigger engine. Default impl on
+/// `ActionRegistry` covers registry-only reach. Platform integrations can
+/// implement this to widen reach (e.g. routing unregistered actions through
+/// `socket::dispatch` so legacy match-arm commands become trigger-reachable).
+pub trait TriggerSink: Send + Sync {
+    fn dispatch_action(&self, action: &str, params: Value) -> ActionResult;
+}
+
+impl TriggerSink for ActionRegistry {
+    fn dispatch_action(&self, action: &str, params: Value) -> ActionResult {
+        self.invoke(action, params)
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Trigger {
@@ -59,14 +77,14 @@ impl Trigger {
 
 pub struct TriggerEngine {
     triggers: RwLock<Vec<Trigger>>,
-    registry: Arc<ActionRegistry>,
+    sink: Arc<dyn TriggerSink>,
 }
 
 impl TriggerEngine {
-    pub fn new(registry: Arc<ActionRegistry>) -> Self {
+    pub fn new(sink: Arc<dyn TriggerSink>) -> Self {
         Self {
             triggers: RwLock::new(Vec::new()),
-            registry,
+            sink,
         }
     }
 
@@ -91,8 +109,13 @@ impl TriggerEngine {
     }
 
     /// Match every trigger against `event`, interpolate params, invoke
-    /// the corresponding action via `ActionRegistry`. Errors are logged.
-    /// Returns the number of triggers that fired.
+    /// the corresponding action via the configured `TriggerSink`. Sink
+    /// errors returned synchronously are logged here. Returns the number
+    /// of triggers that fired (counts a synchronous `Ok` from the sink —
+    /// note that some sinks, e.g. `LiveTriggerSink`'s legacy fallthrough,
+    /// return `Ok` on queueing without waiting for the underlying action's
+    /// outcome; those failures are surfaced asynchronously by the sink
+    /// itself).
     pub fn dispatch(&self, event: &Event, context: Option<&Context>) -> usize {
         // Snapshot the trigger list under a short read lock so a concurrent
         // `set_triggers` can't observe partial iteration. Triggers are small
@@ -104,7 +127,7 @@ impl TriggerEngine {
                 continue;
             }
             let params = trigger.interpolate(event, context);
-            match self.registry.invoke(&trigger.action, params) {
+            match self.sink.dispatch_action(&trigger.action, params) {
                 Ok(_) => {
                     fired += 1;
                     log::debug!(

@@ -95,7 +95,7 @@ Handlers are async so that service calls (HTTP, WebSocket) are non-blocking with
 
 Existing socket commands migrate _incrementally_. The dispatcher keeps its hard-coded match for a while; new commands register through the registry from day one. No big-bang refactor.
 
-**Trigger reach implication (current state):** because triggers invoke via `ActionRegistry` directly, only registry-registered actions are trigger-reachable today. The bulk of useful actions still live in the legacy match and are not yet usable as trigger sinks. Closing this gap is a separate Phase 8 subtask (either sink fallthrough through `socket::dispatch`, or incremental per-command migration into the registry). Until then, Calendar/Slack-style automations that want to spawn tabs, run shell commands, or open WebView panels will need their target actions migrated first.
+**Trigger reach (current):** the `TriggerSink` trait is the seam — default impl on `ActionRegistry` covers registered actions; turm-linux's `LiveTriggerSink` extends reach by falling through to `socket::dispatch` for legacy match-arm commands. Net effect: every command handled by `socket::dispatch` (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`, …) is trigger-reachable today. Exception: `event.subscribe` is special-cased earlier in the socket server (it owns the connection for the lifetime of a stream) and is not a meaningful trigger sink. Fallthrough surfaces failures asynchronously via a reply-consumer thread (`eprintln!` to stderr) — the trigger pump can't block on the reply because it runs on the GTK main thread that would later process the queued command. Migrating a hot action into the registry recovers full sync error semantics and accurate `fired` accounting.
 
 ## Context Service
 

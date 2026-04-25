@@ -77,7 +77,7 @@ Config-driven `event → action` automation. Pure primitive — no bus subscript
 ```rust
 Trigger { name, when: WhenSpec, action, params: Value }
 WhenSpec { event_kind: String, payload_match: Map<String, Value> }
-TriggerEngine::new(registry: Arc<ActionRegistry>)
+TriggerEngine::new(sink: Arc<dyn TriggerSink>)  // ActionRegistry impls TriggerSink
 TriggerEngine::set_triggers(Vec<Trigger>)        // hot-reloadable
 TriggerEngine::dispatch(&Event, Option<&Context>) -> usize  // returns # fired
 TriggerEngine::count() / names()
@@ -94,13 +94,13 @@ TriggerEngine::count() / names()
 - Unclosed `{` is preserved verbatim.
 - Walks nested arrays/objects; non-string scalars pass through unchanged.
 
-**Error handling:** action failures (`Err` from registry, or unknown action) are logged via `log::warn!` and never propagate out of `dispatch`. One bad trigger cannot poison the dispatcher or block other triggers.
+**Error handling:** registry-action failures (sync `Err` returned by the sink) are logged via `log::warn!` inside `dispatch` and never propagate. Fallthrough-action failures (sink returns `Ok` synchronously but the legacy command later fails) are surfaced ASYNCHRONOUSLY — see the `LiveTriggerSink` reply-consumer thread. One bad trigger cannot poison the dispatcher or block other triggers.
 
 **Hot reload:** `set_triggers()` replaces the list under a write lock. `dispatch` snapshots the list under a short read lock then iterates; concurrent writers see all-or-nothing.
 
 **`covering_patterns(patterns)`:** helper used by the platform layer to compute the minimal cover of trigger `event_kind` patterns before subscribing to the bus. `*` covers all; `foo.*` covers `foo.X`, `foo.X.Y`, and `foo.X.*`. Without this, declaring overlapping kinds would cause the same event to land in multiple subscriptions and trigger every matching action once per delivery.
 
-**Reach limitation (v1):** `TriggerEngine::dispatch` invokes via `ActionRegistry` directly, so triggers can fire only actions that have been registered there. The legacy `socket::dispatch` match in turm-linux still owns most actions (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`, etc.); those are not trigger-reachable yet. Closing this gap requires either routing trigger invocations through `socket::dispatch` (sink fallthrough so unregistered actions fall through to the match) or migrating hot actions into the registry one at a time. Tracked in roadmap Phase 8.
+**Reach via `TriggerSink` trait:** `TriggerEngine` invokes through an `Arc<dyn TriggerSink>` (default impl on `ActionRegistry`). Platforms can plug in a wider sink — turm-linux uses `LiveTriggerSink` which tries the registry first and falls through to `socket::dispatch` for legacy match-arm commands, so triggers can fire any command handled by `socket::dispatch` (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`, …) without per-command migration. Exception: `event.subscribe` is special-cased earlier in `socket::start_server` (it owns the connection for the lifetime of the stream) and is intentionally not reachable from triggers — its semantics don't fit a fire-once trigger action. **Async error path for fallthrough:** the sink hands `socket::dispatch` a clone of a shared reply channel and a dedicated consumer thread `eprintln!`s any `ok=false` response (typos, unknown methods, runtime errors) to stderr — format: `[turm] trigger fallthrough id=... failed: <code>: <msg>`. Per-event `fired` count over-counts on fallthrough — it counts queueing as success — but misconfigured trigger actions are still visible on stderr. Registry actions retain full SYNC error semantics; migration of a hot action into the registry recovers the synchronous `fired` accounting too.
 
 ### context.rs
 

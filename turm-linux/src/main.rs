@@ -8,6 +8,7 @@ mod split;
 mod statusbar;
 mod tabs;
 mod terminal;
+mod trigger_sink;
 mod webview;
 mod window;
 
