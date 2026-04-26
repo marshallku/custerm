@@ -1,0 +1,114 @@
+# Example triggers driven by the Google Calendar plugin.
+#
+# Drop relevant pieces of this file into your turm config (or include
+# a `[[triggers]]` block in `~/.config/turm/config.toml`) once the
+# calendar plugin is authenticated.
+#
+# The plugin emits ONE event kind: `calendar.event_imminent` — payload
+# fields shown in the inline comments below. From there it's all
+# trigger config: which action to run, what to pass it, when to skip.
+#
+# Calendar plugin is purely an event emitter — it does NOT itself
+# create KB notes, post Slack messages, or open panels. Those are
+# trigger destinations and you compose them however you want.
+#
+# ---------------------------------------------------------------------
+# IMPORTANT — current trigger language limitation
+# ---------------------------------------------------------------------
+# As of Phase 10.1 the trigger engine supports only POSITIVE matches in
+# `[triggers.when]` (event_kind glob + payload-field equality). It does
+# NOT support negation, "skip if X", or attendance-status checks. That
+# means when the same event matches multiple `[[triggers]]` rules,
+# ALL of them fire — there is no built-in way to "disable common for
+# event Y" or "skip if I declined". Phase 10.2 will add a `condition`
+# clause for this.
+#
+# Practical patterns that work today:
+#   - Make per-event overrides idempotent over the common rule
+#     (e.g. the 1:1 override below ALSO triggers `meeting-prep-common`,
+#     but that just `kb.ensure`s a never-opened-by-you file — noise,
+#     not breakage).
+#   - Move conditional logic into the action (a shell trigger that
+#     branches on `{event.recurring_id}` or `{event.my_response_status}`).
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# 1. Common pre-meeting prep: ensure a per-event meeting note in KB
+#    exists. Fires for EVERY `calendar.event_imminent` at lead=10
+#    (including events you declined and the 1:1 below — see note above).
+# ---------------------------------------------------------------------
+[[triggers]]
+name = "meeting-prep-common"
+action = "kb.ensure"
+params = { id = "meetings/{event.id}.md", default_template = """\
+---
+title: {event.title}
+date: {event.start_time}
+attendees:
+location: {event.location}
+---
+
+# {event.title}
+
+""" }
+
+[triggers.when]
+event_kind = "calendar.event_imminent"
+# 10-min lead only — not the 60-min one (if you also configure 60m).
+lead_minutes = 10
+
+# ---------------------------------------------------------------------
+# 2. Per-recurring-event addition: weekly 1:1 ALSO appends to a single
+#    rolling note. (`meeting-prep-common` above also fires for this
+#    event — see "current trigger language limitation" at the top.)
+# ---------------------------------------------------------------------
+[[triggers]]
+name = "weekly-1on1-rolling-note"
+action = "kb.append"
+# `content` is the documented kb.append param name (see docs/kb-protocol.md).
+params = { id = "meetings/1on1-rolling.md", content = """
+
+## {event.start_time}
+
+""", ensure = true }
+
+[triggers.when]
+event_kind = "calendar.event_imminent"
+recurring_id = "REPLACE_WITH_YOUR_WEEKLY_1ON1_RECURRING_ID"
+lead_minutes = 10
+
+# ---------------------------------------------------------------------
+# 3. 60-min "block focus time" reminder via system notification
+#    (assuming a notify plugin exposes notify.send — illustrative).
+# ---------------------------------------------------------------------
+# [[triggers]]
+# name = "block-focus-before-meeting"
+# action = "notify.send"
+# params = { title = "Meeting in 60 min", body = "{event.title} at {event.start_time}" }
+# [triggers.when]
+# event_kind = "calendar.event_imminent"
+# lead_minutes = 60
+
+# ---------------------------------------------------------------------
+# 4. Open the calendar UI on demand — trigger via turmctl, not a
+#    calendar event. Run:
+#
+#      turmctl call webview.open --params '{"url":"https://calendar.google.com","mode":"tab"}'
+#
+#    Or bind it to a shortcut by wrapping in a [[triggers]] entry that
+#    listens for whatever event your shortcut publishes (e.g.
+#    `keybind.calendar_open`).
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# 5. Auto-open the meeting's video link 1 minute before start
+#    (illustrative — uncomment when you have a 1m lead configured
+#    and you actually want this).
+# ---------------------------------------------------------------------
+# [[triggers]]
+# name = "open-meet-link"
+# action = "webview.open"
+# params = { url = "{event.conference_url}", mode = "tab" }
+# [triggers.when]
+# event_kind = "calendar.event_imminent"
+# lead_minutes = 1

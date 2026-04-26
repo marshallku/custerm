@@ -1,0 +1,27 @@
+[plugin]
+name = "calendar"
+title = "Google Calendar"
+version = "0.1.0"
+description = "Polls Google Calendar and emits calendar.event_imminent events at user-configured lead times. Provides read-only calendar.* actions."
+
+[[services]]
+name = "main"
+exec = "turm-plugin-calendar"
+# onStartup: the polling daemon must be alive whenever turm is running
+# so it can publish lead-time events on schedule. Lazy activation
+# (onAction:calendar.*) would only spawn on the first explicit
+# query — too late for "10 minutes before meeting" use cases.
+activation = "onStartup"
+restart = "on-crash"
+provides = [
+    "calendar.list_events",
+    "calendar.event_details",
+    "calendar.auth_status",
+]
+subscribes = []
+# Required env (set by user): TURM_CALENDAR_CLIENT_ID, TURM_CALENDAR_CLIENT_SECRET
+# Optional env: TURM_CALENDAR_ACCOUNT (default "default"),
+#               TURM_CALENDAR_LEAD_MINUTES (default "10"),
+#               TURM_CALENDAR_POLL_SECS (default 60),
+#               TURM_CALENDAR_LOOKAHEAD_HOURS (default 24),
+#               TURM_CALENDAR_REQUIRE_SECURE_STORE (default false)

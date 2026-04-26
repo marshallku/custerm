@@ -6,6 +6,7 @@ members = [
     "turm-cli",
     "turm-plugin-echo",
     "turm-plugin-kb",
+    "turm-plugin-calendar",
 ]
 
 [workspace.package]

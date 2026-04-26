@@ -13,6 +13,11 @@ turm/
 │   └── src/main.rs            # newline-JSON over stdio: echo.ping + system.heartbeat
 ├── turm-plugin-kb/          # First-party KB plugin (grep + filename over ~/docs)
 │   └── src/                    # main.rs (RPC loop), kb.rs (4 actions + atomic IO)
+├── turm-plugin-calendar/   # First-party Google Calendar plugin (Unix only — Linux + macOS)
+│   └── src/                    # main.rs (RPC + auth subcommand), config.rs (env),
+│                                # store.rs (keyring + plaintext fallback), oauth.rs
+│                                # (device-code flow + refresh), gcal.rs (events.list),
+│                                # poller.rs (lead-time dedupe), event.rs (payload mapping)
 ├── turm-core/            # Shared Rust library
 │   └── src/
 │       ├── lib.rs           # Module declarations
