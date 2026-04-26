@@ -10,7 +10,7 @@ The pattern is identical to VSCode (extensions in a separate process), Neovim (r
 
 A working day in this end state:
 1. `turm` starts. KB plugin spawns lazily on first `kb.*` call. Calendar plugin starts on `onStartup` because it needs to poll. Slack plugin starts on `onStartup` to keep its WebSocket alive.
-2. 10 minutes before a meeting, Calendar plugin publishes `calendar.event_imminent`. A user-defined trigger fires `kb.ensure` (handled by KB plugin) which creates-or-returns `~/docs/meetings/<event_id>.md`, and a follow-up step (chained trigger or composite-action helper, TBD post-Phase 9; see Open questions) opens that path in a WebView panel.
+2. 10 minutes before a meeting, Calendar plugin publishes `calendar.event_imminent`. A user-defined trigger fires `kb.ensure` (handled by KB plugin) which creates-or-returns `~/docs/meetings/<event_id>.md`. The follow-up step that opens that path in a WebView panel uses the chained-trigger primitive scheduled for Phase 14 — `kb.ensure.completed` events fan out on the bus and a downstream trigger consumes them to fire `webview.open`.
 3. A Slack mention arrives. Slack plugin publishes `slack.mention`. A trigger writes the raw thread to `~/docs/.raw/slack/...` and asks the LLM plugin to write a derived summary at `~/docs/threads/<topic>.md`.
 4. The user types `turmctl draft-reply <topic>`. CLI invokes a registry action that asks the LLM plugin (with KB context as input) to produce a draft reply, opening it in the active terminal.
 
@@ -280,8 +280,8 @@ Each "Turn N.x" is one commit-sized unit (codex review + save.sh).
 - `activation = "onStartup"`
 
 **10.2 Meeting-prep trigger** (turn 2)
-- TOML trigger: on `calendar.event_imminent`, call `kb.ensure` to get-or-create `~/docs/meetings/<event_id>.md`. **Auto-opening the panel is deferred** until the chained-trigger / composite-action decision (see Open questions). v1 of this slice creates/refreshes the note; the user opens it. After the chain mechanism lands, the trigger configuration upgrades to also call `webview.open` with the returned path.
-- E2E: launch turm, fake or wait for a real calendar event, observe `~/docs/meetings/<event_id>.md` created/refreshed (the kb plugin's primary effect for this slice). Panel auto-open is NOT part of this E2E — it ships after the chained-trigger / composite-action decision lands.
+- TOML trigger: on `calendar.event_imminent`, call `kb.ensure` to get-or-create `~/docs/meetings/<event_id>.md`. Auto-opening the panel is **scheduled for Phase 14** (chained `webview.open` after `kb.ensure.completed`). v1 ships note creation only — the user opens it.
+- E2E: launch turm, fake or wait for a real calendar event, observe `~/docs/meetings/<event_id>.md` created/refreshed.
 
 ### Phase 11: Messenger ingestion
 
@@ -290,8 +290,11 @@ Each "Turn N.x" is one commit-sized unit (codex review + save.sh).
 - Publishes `slack.mention`, `slack.dm`, etc. with payload including thread URL
 - Stores raw message JSON to `~/docs/.raw/slack/...` (fidelity)
 
-**11.2 Derived markdown ingestion trigger** (depends on Phase 12 LLM plugin existing)
-- TOML trigger: on `slack.mention`, call LLM action to summarize thread, write derived markdown to `~/docs/threads/<topic>.md`
+**11.2 Raw archive + write actions** (shipped — see roadmap.md)
+- `slack.raw` firehose event, `slack.post_message` write action, `.raw/slack/<team>/<event_id>.json` archive pattern via `kb.ensure`.
+
+**11.3 Derived markdown ingestion trigger** (depends on Phase 14 chained-trigger primitive)
+- TOML trigger: on `slack.mention`, call LLM action to summarize thread, write derived markdown to `~/docs/threads/<topic>.md`. Blocked on Phase 14 because the LLM result has to feed `kb.ensure` in the same workflow.
 
 ### Phase 12: LLM plugin
 
@@ -316,14 +319,71 @@ Each "Turn N.x" is one commit-sized unit (codex review + save.sh).
 **12.2 (deferred)** — multi-provider, streaming SSE, per-action
 timeout override.
 
-**12.3 (deferred)** — Phase 11.3-style derived markdown ingestion
-that composes `kb.search` + `kb.read` + `llm.complete` +
-`kb.ensure`. Needs the chained-trigger mechanism (still open).
+**12.3 (depends on Phase 14)** — Phase 11.3-style derived markdown
+ingestion that composes `kb.search` + `kb.read` + `llm.complete`
++ `kb.ensure`. Unblocked once Phase 14's chained-trigger
+primitive lands.
 
 ### Phase 13: KB indexing upgrade (when grep is slow)
 
 - SQLite FTS5 sidecar index, rebuilt on file change (filesystem watcher)
 - KB plugin internal change only — protocol unchanged
+
+### Phase 14: Composite / chained workflow primitive
+
+The architectural piece every other phase has been deferring around. Resolves the long-standing "Chained triggers / composite actions" Open Question (now scheduled, not deferred).
+
+**14.1 Decision** (will commit during prototype):
+- (a) Synthetic `<action>.completed` / `<action>.failed` events on every dispatch — downstream triggers match them. Most extensible.
+- (b) Composite `workflow.<name>` actions — fixed-shape multi-step procedures in Rust.
+- (c) Multi-step trigger TOML with `actions = [...]`.
+
+Recommendation: **(a) + selective (b)**. (a) is the bus-native solution and naturally extends to async-correlation use cases (Slack send → wait for reply → next step). (b) for hand-rolled fixed sequences where TOML noise outweighs the chained-trigger flexibility. (c) loses to (a) on async; not chosen.
+
+**14.2 Implementation plan**
+- Action result fan-out: opt-in `register_with_completion_event` flag so high-frequency actions don't spam the bus.
+- Async-correlation `await` extension on `[[triggers]]`: `await = { event_kind, payload_match, timeout }` blocks the next step until a matching event arrives, payload merged into `event.*` for downstream interpolation.
+- `workflow.<name>` namespace as a future escape hatch.
+
+**14.3 Backfill**: re-enable Phase 11.3 derived markdown ingestion, Phase 12.1 trigger-fired LLM result handling, and the meeting-prep auto-open trigger that's been deferred since Phase 10 (chained `webview.open` after `kb.ensure` for `calendar.event_imminent`).
+
+### Phase 15: Todo system (with UI panel)
+
+User-explicit gap. Workflow entry point: a Todo's `start` action drives the branch-creation flow in Phases 17/18.
+
+**Packaging**: standalone `turm-plugin-todo` plugin — its own manifest, its own actions, its own UI panel via the existing `plugin.open` activation surface. SHARES the markdown-with-frontmatter file format with KB plugin's filesystem layout but registers its own actions and watcher; KB plugin's surface stays unchanged.
+
+**15.1 File format**: markdown checkbox files at `~/docs/todos/<workspace>/<id>.md`, frontmatter carries `status` / `priority` / `due` / `linked_jira` / `linked_slack` / `tags` / `workspace`. File is source of truth — vim-edit + git-version compatible.
+
+**15.2 Events** via `turm-plugin-todo`'s file-watcher: `todo.created`, `todo.changed`, `todo.completed`, `todo.deleted`. Payload is the parsed frontmatter + body excerpt.
+
+**15.3 Actions**: `todo.create` / `todo.set_status` / `todo.list` / `todo.start`. `todo.start` emits a `todo.start_requested` event for Phase 14 chained triggers to drive branch creation + Claude spawn.
+
+**15.4 UI**: Plugin Panel route (HTML/JS via existing `plugin_panel.rs`) — list view, markdown render, click-to-trigger-action. Default activation goes through `turmctl plugin open todo`; keybinding is left to the user's `[keybindings]` config since `Ctrl+Shift+T` is already "new tab". Native GTK widget is the fallback if WebView UX proves insufficient.
+
+### Phase 16: Jira plugin
+
+Same shape as Slack — REST + auth + events + actions.
+- **Auth**: API token (Atlassian Cloud), email + token combo. Keyring + plaintext fallback like other plugins.
+- **Polling** (no public webhooks for desktop): `/rest/api/3/search` for assigned-to-me + watching tickets, default 300s interval (Jira rate limits aggressively).
+- **Events**: `jira.ticket_assigned` / `jira.status_changed` / `jira.comment_added` / `jira.mention`. Payload includes `event_json` raw for archive symmetry with `slack.raw`.
+- **Actions**: `jira.list_my_tickets` / `jira.create_ticket` / `jira.transition` / `jira.add_comment` / `jira.get_ticket`.
+- **Integration with Phase 15**: `jira.ticket_assigned` → `todo.create` linked back to the ticket.
+
+### Phase 17: Git workspace plugin
+
+Lightweight — local git only, no external API.
+- **Workspaces**: `~/.config/turm/workspaces.toml` with `{name, path, default_base}` entries.
+- **Events**: file-watcher on `.git/HEAD` + `.git/refs/heads/` per configured workspace → `git.branch_created`, `git.branch_deleted`, `git.checkout`.
+- **Actions**: `git.list_workspaces` / `git.checkout_new_branch` / `git.current_branch` / `git.status`.
+- **Composability test for Phase 14**: `todo.start_requested` chained to `git.checkout_new_branch` (branch name derived from `event.linked_jira` if present, else `todo-<id>`).
+
+### Phase 18: Claude Code spawn integration
+
+Closes the loop: workflow stages a workspace + branch + context, then drops the user into Claude Code.
+- **Action `claude.start {workspace, prompt?, resume_session?}`**: opens a new turm tab with `cwd=<workspace path>`, runs `claude` (or `claude --resume <id>`). `prompt` fed as initial input or via `claude --print`.
+- Built on `tab.new` + `terminal.exec` — no custom IPC with claude-code.
+- **End-to-end Phase 14 test**: `todo.start_requested` → `git.checkout_new_branch.completed` → `claude.start` with prompt interpolated from todo + jira metadata.
 
 ## Open questions
 
@@ -331,7 +391,7 @@ that composes `kb.search` + `kb.read` + `llm.complete` +
 - **Service plugin in non-Rust languages.** Protocol over stdio is language-agnostic, so a Python or Node plugin works. Need to publish a small "protocol client" library at some point. Defer until first non-Rust contributor needs it.
 - ~~**Authentication / per-user secrets.** Calendar OAuth, Slack tokens. Where do they live? Probably `~/.config/turm/secrets.toml`...~~ **Resolved (Phase 10–12)**: every credential-bearing plugin uses the `keyring` crate (Linux Secret Service via D-Bus, macOS Keychain) with plaintext 0600 fallback at `$XDG_CONFIG_HOME/turm/<plugin>-token-<account>.json`. Account label scoped via env var (`TURM_<PLUGIN>_ACCOUNT`). `<PLUGIN>_REQUIRE_SECURE_STORE=1` opt-in refuses plaintext fallback. The `~/.config/turm/secrets.toml` shared-file design was abandoned — per-plugin keyring entries are simpler and prevent one plugin's credentials from leaking through another's process boundary.
 - **Multi-instance turm.** Currently socket per PID. Each turm spawns its own copies of all service plugins? Or shared daemons? For v1, per-instance. Revisit if plugin spawn cost matters.
-- **Chained triggers / composite actions.** The current trigger engine (Phase 8) maps one event to one action with `{event.*}/{context.*}` interpolation. Common workflows want a sequence — e.g. "on `calendar.event_imminent`, call `kb.ensure` → use its returned path to call `webview.open`". Three possible designs (decision deferred to Phase 9 wrap-up): (a) chained triggers — the result of one action is published as a synthetic event another trigger consumes; (b) composite actions — a built-in helper like `workflow.open_kb_doc` does both calls; (c) trigger templates with multi-step `actions = [...]`. (a) is most extensible, (c) most readable. **Until this decision is made, the Phase 10 meeting-prep slice ships strictly with `kb.ensure` only — no inline workaround.** The user opens the created file themselves; auto-open lands as a follow-up trigger config update once the chain mechanism is implemented.
+- ~~**Chained triggers / composite actions.** The current trigger engine maps one event to one action...~~ **Scheduled for Phase 14** (no longer an open question). Three sketches still in play — (a) synthetic `<action>.completed` events with bus-native chaining, (b) hand-rolled `workflow.<name>` composite actions, (c) multi-step `actions = [...]` TOML. Recommended path is (a) primary + selective (b); see roadmap.md Phase 14 for the rationale and implementation plan. Resolving this unblocks Phase 11.3 (derived slack markdown), Phase 12.3 (LLM-backed ingestion), Phase 15+ (todo workflows), and the Phase 10.2 `webview.open` follow-up. **Phase 14 is now the next scheduled phase.**
 
 ## Sources (research informing this plan)
 

@@ -2,9 +2,16 @@
 
 ## Vision
 
-turm = personal workflow runtime surfaced through a terminal.
-Terminal remains the primary surface, but `turm-core` is a workflow engine — services (calendar, messengers, docs, knowledge base), triggers, and AI agents all plug into a shared Event Bus, Action Registry, and Context Service (see [workflow-runtime.md](./workflow-runtime.md)).
-Goal: every daily work task — coding, checking meetings, processing notifications, searching personal notes — is driven from turm without context-switching.
+turm = a single work tool that fuses **terminal (Vim) + Calendar + Slack + Jira + Todo + git workspaces + Claude Code spawn** into one orchestratable surface. The terminal stays the primary editing surface; everything else plugs into a shared workflow runtime (Event Bus, Action Registry, Context Service, Trigger Engine — see [workflow-runtime.md](./workflow-runtime.md)).
+
+Concretely the user wants flows like:
+
+1. **Calendar event imminent** → KB note auto-created with title / start / location interpolated into the frontmatter; the calendar event payload also exposes `event.attendees`, `event.description`, `event.recurring_id`, etc. for users who want a richer template. *(Building blocks shipped — Phase 9.3 KB plugin + Phase 10.1 Calendar plugin; example trigger config at `examples/plugins/calendar/triggers.example.toml`.)*
+2. **Slack mention/DM** → archived to KB with full fidelity, optionally summarized via LLM. *(Archive shipped — Phase 11.2; LLM-summarize step blocked on chained-trigger work — Phase 14.)*
+3. **Todo with `start` action** → optional Slack message asking for context → wait for reply containing Jira ticket # → branch created in the matching git workspace using the Jira id as the branch name → Claude Code spawned in the new branch with context. *(Not yet expressible — needs Phases 14–18. Branch naming happens once at creation; no rename step needed.)*
+4. **Jira ticket assigned** → Todo auto-created, frontmatter `linked_jira` populated with the ticket key. *(Not yet expressible — needs Phases 15 + 16. Cross-linking back to related Slack threads is a future enhancement that depends on Phase 11.3's derived ingestion landing first.)*
+
+Flows 1–2 are end-to-end working today (with the LLM step in 2 deferred). Flows 3–4 require composite/chained workflows + Todo + Jira + git plugins, all currently missing — see Phases 14–18.
 
 ## Implementation Phases
 
@@ -303,6 +310,128 @@ Plugin-first foundation. See [service-plugins.md](./service-plugins.md) for full
 ### Phase 13: KB indexing upgrade (when grep is slow)
 
 - [ ] SQLite FTS5 sidecar index, fs-watcher rebuild — KB plugin internal change only, protocol unchanged
+
+### Phase 14: Composite / chained workflow primitive 🎯 next
+
+The biggest unresolved architectural item. Currently the trigger engine is `event → 1 action → done` — every multi-step flow the vision describes ("Todo start → branch → Slack ask → wait for reply → Jira lookup → Claude Code spawn") collapses against this. It's the same root cause as: Phase 11.3's deferred derived markdown ingestion, Phase 12.1's "trigger-fired `llm.complete` result is discarded", and the long-deferred Open Question at the end of [service-plugins.md](./service-plugins.md). Resolving this unblocks every other phase below.
+
+**14.1 — design decision** ([service-plugins.md](./service-plugins.md) Open Q reopened)
+
+Three sketches, pick one:
+- **(a) Chained triggers via synthetic events**: every action's `try_dispatch` callback publishes a synthetic `<action>.completed` (with the result payload) and `<action>.failed` event onto the bus. Downstream triggers match on those. Most extensible — the bus already exists. Most uniform — every step is just another trigger.
+- **(b) Composite actions**: a built-in `workflow.<name>` action whose handler runs a multi-step procedure inline. Easiest for hand-rolled wrappers like `workflow.start_todo` but doesn't help the user-config case.
+- **(c) Multi-step trigger TOML**: extend `[[triggers]]` with `actions = [...]` instead of single `action`. Most readable for users but less flexible (no async wait, no branching).
+
+Recommendation: **(a) primary + selective (b) for hand-rolled wrappers** when the chain is fixed. (c) loses to (a) on async-correlation cases (Slack send → wait for reply).
+
+**14.2 — implementation**
+
+- [ ] Action result fan-out: `ActionRegistry::try_dispatch`'s callback (or `LiveTriggerSink`) publishes `<action>.completed` / `<action>.failed` on the bus on every dispatched action with the result as payload. Triggers can match on `event_kind = "kb.append.completed"` etc. Optional via `register_with_completion_event` flag so high-frequency actions (e.g. `system.ping`) don't pollute the bus.
+- [ ] Async correlation primitive: a state-aware trigger variant that waits for a specific follow-up event before firing the next step. `[[triggers]]` extension with `await = { event_kind, payload_match, timeout }` — fires after the matching follow-up arrives within timeout, payload merged into `event` for downstream interpolation. Required for "Slack send → wait for reply with Jira ticket # → next step" flows.
+- [ ] `workflow.<name>` action namespace for hand-rolled multi-step Rust handlers when chained TOML gets cumbersome. Built into core or registered by a `turm-plugin-workflow` (TBD).
+
+**14.3 — backfill: re-enable derived workflows that need composition**
+
+- [ ] Phase 11.3 derived markdown ingestion (`slack.raw` → LLM summarize → `kb.ensure`) now expressible
+- [ ] Phase 12.1 trigger-fired `llm.complete` results land in subsequent triggers
+- [ ] LLM example trigger ("auto-summarize DM to KB") rewritten as a real chain, not a fire-and-forget
+
+### Phase 15: Todo system
+
+User explicit requirement. Todos are first-class workflow entry points (Todo `start` action drives branch-creation flow in Phase 17/18) and need a UI panel (turm already has `PanelVariant`).
+
+**Packaging**: standalone `turm-plugin-todo` plugin (its own manifest, its own actions, its own UI panel). The plugin SHARES the markdown-with-frontmatter file format with the KB plugin's filesystem layout — todos under `~/docs/todos/...` are just KB documents with a known schema — but the actions, the file-watcher, and the UI all live in `turm-plugin-todo` for clean separation. KB plugin keeps its current surface unchanged. This is what makes `turmctl plugin open todo` (standard `plugin.open` activation surface) work.
+
+**15.1 — file format**
+
+- [ ] Markdown checkbox files at `~/docs/todos/<workspace>/<id>.md` with frontmatter:
+  ```yaml
+  ---
+  id: T-123
+  status: open | in_progress | blocked | done
+  created: 2026-04-27T12:00:00Z
+  due: 2026-05-01
+  priority: high | normal | low
+  workspace: turm
+  linked_jira: PROJ-456
+  linked_slack:
+    - { team: T0, channel: D123, ts: 1700.000 }
+  tags: [feature, api]
+  ---
+  body markdown with `- [ ]` subtasks
+  ```
+- [ ] `turm-plugin-todo` file-watcher: on changes under `~/docs/todos/`, parse frontmatter and emit `todo.created` / `todo.changed` / `todo.completed` / `todo.deleted` events with the parsed payload. The file is the source of truth — vim-edit + git-version compatible.
+- [ ] Existing `kb.search` (KB plugin) works on todo files with no extension needed (frontmatter `tags:` filterable via search-in-text); `turm-plugin-todo` doesn't reimplement search.
+
+**15.2 — actions** (registered by `turm-plugin-todo`)
+
+- [ ] `todo.create {workspace, title, body?, priority?, due?, linked_jira?, linked_slack?}` → returns `{id, path}`. Internally calls `kb.ensure` (cross-plugin) with the rendered template.
+- [ ] `todo.set_status {id, status}` — read-modify-write of the frontmatter `status` field. Implementation owned by `turm-plugin-todo`'s file I/O (single-syscall O_APPEND won't work here — need a full rewrite of the file with `renameat2(RENAME_EXCHANGE)` for atomicity, OR add a `kb.replace` action in a Phase 9 extension. Decision deferred to Phase 15 implementation.)
+- [ ] `todo.list {status?, workspace?, due_before?, tag?}` — file-system walk over `~/docs/todos/` parsing frontmatter; or delegates to `kb.search` for the text filter. Pick at impl time.
+- [ ] `todo.start {id}` — convenience action that emits `todo.start_requested` event with full todo payload, intended for Phase 14 chained triggers to pick up (branch creation, Claude spawn).
+
+**15.3 — UI panel** (turm-linux side, uses existing `PanelVariant` infra)
+
+Two implementation paths:
+- **(a) Plugin Panel (HTML/JS)** — same surface as the existing `plugin_panel.rs` WebView wrapper. Plugin ships a `panel.html` that lists todos via `turm.call("todo.list")`, renders markdown, exposes click-to-trigger-action UI. Cheaper to build (no GTK widget code), themeable, follows the existing webview-plugin pattern.
+- **(b) Native GTK widget** (new `TodoPanel` variant) — list view + inline actions. Heavier but native feel.
+
+Recommendation: **(a) first — Plugin Panel route**. Native widget can come if the WebView path proves insufficient. Default activation goes through the existing `plugin.open` action (`turmctl plugin open todo`); keybinding is configurable via `[keybindings]` since `Ctrl+Shift+T` is already "new tab" — pick a free chord (`Ctrl+Shift+K` checklist or `Ctrl+Shift+G` agenda are candidates) at implementation time.
+
+**15.4 — initial example triggers**
+
+- [ ] `calendar.event_imminent` → `todo.create` for prep tasks (with link back to event id)
+- [ ] `slack.mention` matching specific patterns (e.g. text contains "todo:") → `todo.create`
+- [ ] `jira.ticket_assigned` (Phase 16) → `todo.create` linked to the ticket
+
+### Phase 16: Jira plugin
+
+Same shape as Slack plugin — REST + auth + events + actions.
+
+- [ ] **Auth**: API token (Atlassian Cloud) via env or keyring. Email + token combination per Atlassian's API spec. Same token-store pattern as `turm-plugin-slack`.
+- [ ] **Polling** (no public webhooks for self-hosted desktop): `/rest/api/3/search` for assigned-to-me + watching tickets. Configurable poll interval (default 300s — Jira rate limits aggressively).
+- [ ] **Events**: `jira.ticket_assigned`, `jira.status_changed`, `jira.comment_added`, `jira.mention` (when text mentions current user). Each carries `{key, summary, status, assignee, reporter, project, url}` plus `event_json` raw.
+- [ ] **Actions**:
+  - `jira.list_my_tickets {status?, project?, updated_since?}`
+  - `jira.create_ticket {project, summary, description?, assignee?, parent?}`
+  - `jira.transition {key, status}` (via Jira's transition workflow)
+  - `jira.add_comment {key, body}`
+  - `jira.get_ticket {key}` — returns full ticket json
+- [ ] **Cross-plugin trigger example** (in `examples/plugins/jira/triggers.example.toml`): `jira.ticket_assigned` → `todo.create` with `linked_jira` field populated.
+
+### Phase 17: Git workspace plugin
+
+Lightweight — no external API, just local git operations. Could be built into core but lives as a plugin for uniformity (and so the `current_credentials` / supervisor patterns don't need an exception).
+
+- [ ] **Workspace concept**: configured via `~/.config/turm/workspaces.toml`:
+  ```toml
+  [[workspace]]
+  name = "turm"
+  path = "/home/marshall/dev/turm"
+  default_base = "master"
+
+  [[workspace]]
+  name = "site"
+  path = "/home/marshall/dev/site"
+  default_base = "main"
+  ```
+- [ ] **Events** (file-watcher on `.git/HEAD` + `.git/refs/heads/`): `git.branch_created`, `git.branch_deleted`, `git.checkout`. Per-workspace event payload.
+- [ ] **Actions**:
+  - `git.list_workspaces` → returns names + paths + current branch each
+  - `git.checkout_new_branch {workspace, base?, name}` — runs `git -C <path> checkout -b <name> <base>`. Returns `{workspace, branch, sha}`.
+  - `git.current_branch {workspace}` → string
+  - `git.status {workspace}` → `{ahead, behind, dirty, staged, untracked}`
+- [ ] **Phase 14 composability test case**: `todo.start_requested` → `git.checkout_new_branch` (chain via `<action>.completed` event). Branch name derived from todo metadata (linked_jira if present, else `todo-<id>`).
+
+### Phase 18: Claude Code spawn integration
+
+Closes the loop: after a workflow stages a workspace + branch + context, drop the user into Claude Code.
+
+- [ ] **Action `claude.start {workspace, prompt?, resume_session?}`**: opens a new turm tab in the workspace path, runs `claude` (or `claude --resume <session-id>`). If `prompt` is supplied, fed via initial input or a `claude --print "<prompt>"` invocation depending on what works best with claude-code's CLI surface.
+- [ ] Built on existing `tab.new` + `terminal.exec` primitives; new action is mostly a composition + working-dir handling. NO custom IPC with claude-code — the integration is just "spawn it in the right place with the right context."
+- [ ] **Phase 14 composability test case**: full end-to-end flow, all triggers in user's `[[triggers]]`:
+  1. `todo.start_requested` → `git.checkout_new_branch` → publishes `git.checkout_new_branch.completed`
+  2. `git.checkout_new_branch.completed` → `claude.start` with `prompt = "<todo title> + <linked_jira summary>"` (interpolated from prior step's payload via Phase 14's correlation primitive)
 
 ## Pending Cleanup
 
