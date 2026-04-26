@@ -165,7 +165,7 @@ action = "terminal.exec"
 params = { command = "echo {event.text} >> ~/pings.log" }
 ```
 
-Parameter interpolation (`{event.foo}`, `{context.bar}`) is the only logic triggers need for v1. Users who want conditional logic can point at a plugin action that does the filtering.
+Parameter interpolation (`{event.foo}`, `{context.bar}`) handles dynamic action arguments. Conditional firing — "skip if I declined", "skip the weekly 1:1" — is expressed by an optional `condition` clause on each trigger, evaluated AFTER `when` matches. The expression DSL supports `== != < <= > >= && || !` plus parens, references like `event.X.Y` / `context.X`, and string/number/bool/null literals. Conditions are compiled once at config load; a parse failure drops THAT trigger only. See `turm-core/src/condition.rs` for the full grammar and Phase 10.2 in roadmap.md for the rollout history.
 
 ## Mapping to existing code
 
@@ -193,7 +193,7 @@ See [service-plugins.md](./service-plugins.md) Phase 10 for the full plan. This 
 
 ## Non-goals (v1)
 
-- No DSL for trigger conditions beyond equality and time windows. Complex conditions belong in plugins.
+- ~~No DSL for trigger conditions beyond equality and time windows.~~ **Phase 10.2 shipped** a small boolean-expression DSL (`condition` field) for negation, ordering, and AND/OR composition. More complex predicates (function calls, list membership, regex) still belong in plugins.
 - No multi-user / shared state. Single user, single machine.
 - No natural-language trigger authoring. TOML files only for now.
 - Knowledge base semantic search is _later_ — built on top of Context Service, not a parallel system.

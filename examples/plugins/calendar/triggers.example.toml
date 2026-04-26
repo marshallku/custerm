@@ -13,29 +13,28 @@
 # trigger destinations and you compose them however you want.
 #
 # ---------------------------------------------------------------------
-# IMPORTANT — current trigger language limitation
+# Trigger language quick reference (Phase 10.2)
 # ---------------------------------------------------------------------
-# As of Phase 10.1 the trigger engine supports only POSITIVE matches in
-# `[triggers.when]` (event_kind glob + payload-field equality). It does
-# NOT support negation, "skip if X", or attendance-status checks. That
-# means when the same event matches multiple `[[triggers]]` rules,
-# ALL of them fire — there is no built-in way to "disable common for
-# event Y" or "skip if I declined". Phase 10.2 will add a `condition`
-# clause for this.
-#
-# Practical patterns that work today:
-#   - Make per-event overrides idempotent over the common rule
-#     (e.g. the 1:1 override below ALSO triggers `meeting-prep-common`,
-#     but that just `kb.ensure`s a never-opened-by-you file — noise,
-#     not breakage).
-#   - Move conditional logic into the action (a shell trigger that
-#     branches on `{event.recurring_id}` or `{event.my_response_status}`).
+# `[triggers.when]`     — required positive match: `event_kind` glob
+#                          plus key=value payload equality.
+# `condition = "..."`   — optional boolean expression evaluated AFTER
+#                          `when` matches. Lets you negate, combine,
+#                          and reference any payload/context field.
+#                          Operators: == != < <= > >= && || !
+#                          References: event.X.Y / context.X
+#                          Literals: "string", numbers, true/false/null
+#                          Ordering ops require numeric operands;
+#                          mismatched types skip the trigger safely.
+#                          A bad parse drops just THAT trigger with a
+#                          log warning — others still load.
 # ---------------------------------------------------------------------
 
 # ---------------------------------------------------------------------
-# 1. Common pre-meeting prep: ensure a per-event meeting note in KB
-#    exists. Fires for EVERY `calendar.event_imminent` at lead=10
-#    (including events you declined and the 1:1 below — see note above).
+# 1. Common pre-meeting prep: ensure a per-event meeting note in KB.
+#    Skips events you declined AND skips the weekly 1:1 (handled by
+#    rule 2). With Phase 10.2 these exclusions are written directly
+#    in the `condition` field — no longer requires multi-rule
+#    workarounds.
 # ---------------------------------------------------------------------
 [[triggers]]
 name = "meeting-prep-common"
@@ -51,6 +50,10 @@ location: {event.location}
 # {event.title}
 
 """ }
+condition = """
+event.my_response_status != "declined" \
+&& event.recurring_id != "REPLACE_WITH_YOUR_WEEKLY_1ON1_RECURRING_ID"
+"""
 
 [triggers.when]
 event_kind = "calendar.event_imminent"
@@ -58,9 +61,9 @@ event_kind = "calendar.event_imminent"
 lead_minutes = 10
 
 # ---------------------------------------------------------------------
-# 2. Per-recurring-event addition: weekly 1:1 ALSO appends to a single
-#    rolling note. (`meeting-prep-common` above also fires for this
-#    event — see "current trigger language limitation" at the top.)
+# 2. Per-recurring-event override: weekly 1:1 appends to a rolling
+#    note instead of getting its own file. Independent of rule 1
+#    (rule 1 excludes this recurring_id; rule 2 only matches it).
 # ---------------------------------------------------------------------
 [[triggers]]
 name = "weekly-1on1-rolling-note"
@@ -71,6 +74,8 @@ params = { id = "meetings/1on1-rolling.md", content = """
 ## {event.start_time}
 
 """, ensure = true }
+# Same skip-when-declined guard as the common rule.
+condition = """event.my_response_status != "declined""""
 
 [triggers.when]
 event_kind = "calendar.event_imminent"

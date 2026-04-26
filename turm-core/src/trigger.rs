@@ -16,6 +16,7 @@
 //! pumping events into `dispatch()`.
 
 use crate::action_registry::{ActionRegistry, ActionResult};
+use crate::condition;
 use crate::context::Context;
 use crate::event_bus::{Event, pattern_matches};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,15 @@ pub struct Trigger {
     pub action: String,
     #[serde(default)]
     pub params: Value,
+    /// Optional boolean expression evaluated AFTER `when` matches.
+    /// See `crate::condition` for grammar. Compiled once at
+    /// `set_triggers` time; a parse error drops the offending trigger
+    /// (the rest of the set still loads). At evaluation time, an
+    /// `Err` from the evaluator (type mismatch on ordering, etc.)
+    /// is logged and treated as "trigger does not match" — never
+    /// fires the action on a misconfigured condition.
+    #[serde(default)]
+    pub condition: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -57,6 +67,10 @@ pub struct WhenSpec {
 }
 
 impl Trigger {
+    /// Match `when` (event_kind glob + payload-equality) only. The
+    /// `condition` clause is evaluated separately by `TriggerEngine`
+    /// against the pre-compiled AST so we don't re-parse on every
+    /// fired event. Useful as a primitive for tests + diagnostics.
     pub fn matches(&self, event: &Event) -> bool {
         if !pattern_matches(&self.when.event_kind, &event.kind) {
             return false;
@@ -75,8 +89,19 @@ impl Trigger {
     }
 }
 
+/// Engine-internal compiled form. `set_triggers` parses each
+/// `Trigger.condition` string into an AST once so per-event dispatch
+/// stays cheap. Triggers whose condition fails to parse are dropped
+/// at compile time with a `log::warn` — the rest of the set still
+/// loads.
+#[derive(Debug, Clone)]
+struct CompiledTrigger {
+    trigger: Trigger,
+    condition: Option<condition::Expr>,
+}
+
 pub struct TriggerEngine {
-    triggers: RwLock<Vec<Trigger>>,
+    triggers: RwLock<Vec<CompiledTrigger>>,
     sink: Arc<dyn TriggerSink>,
 }
 
@@ -91,8 +116,35 @@ impl TriggerEngine {
     /// Replace the trigger list atomically. Used on startup and on config
     /// hot-reload. Concurrent dispatch sees either the old or the new full
     /// list, never a half-applied state.
+    ///
+    /// Each trigger's `condition` (if present) is compiled here.
+    /// A parse failure drops THAT trigger and is logged; the rest of
+    /// the set still loads so a single typo can't disable the entire
+    /// trigger config.
     pub fn set_triggers(&self, triggers: Vec<Trigger>) {
-        *self.triggers.write().unwrap() = triggers;
+        let compiled: Vec<CompiledTrigger> = triggers
+            .into_iter()
+            .filter_map(|t| {
+                let parsed = match &t.condition {
+                    None => None,
+                    Some(src) => match condition::parse(src) {
+                        Ok(e) => Some(e),
+                        Err(err) => {
+                            log::warn!(
+                                "trigger {:?} condition parse error, dropping trigger: {err}",
+                                t.name
+                            );
+                            return None;
+                        }
+                    },
+                };
+                Some(CompiledTrigger {
+                    trigger: t,
+                    condition: parsed,
+                })
+            })
+            .collect();
+        *self.triggers.write().unwrap() = compiled;
     }
 
     pub fn count(&self) -> usize {
@@ -104,7 +156,7 @@ impl TriggerEngine {
             .read()
             .unwrap()
             .iter()
-            .map(|t| t.name.clone())
+            .map(|t| t.trigger.name.clone())
             .collect()
     }
 
@@ -120,11 +172,31 @@ impl TriggerEngine {
         // Snapshot the trigger list under a short read lock so a concurrent
         // `set_triggers` can't observe partial iteration. Triggers are small
         // and infrequent, so cloning is cheap.
-        let snapshot: Vec<Trigger> = self.triggers.read().unwrap().clone();
+        let snapshot: Vec<CompiledTrigger> = self.triggers.read().unwrap().clone();
         let mut fired = 0;
-        for trigger in &snapshot {
+        for ct in &snapshot {
+            let trigger = &ct.trigger;
             if !trigger.matches(event) {
                 continue;
+            }
+            // Condition check: bail before the action invocation if
+            // the user-supplied predicate is false or evaluation
+            // errored. An eval error is treated as "doesn't match"
+            // rather than firing on a misconfigured condition — the
+            // safer default.
+            if let Some(expr) = &ct.condition {
+                match condition::eval(expr, event, context) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(err) => {
+                        log::warn!(
+                            "trigger {:?} condition eval error for event {:?}, skipping: {err}",
+                            trigger.name,
+                            event.kind
+                        );
+                        continue;
+                    }
+                }
             }
             let params = trigger.interpolate(event, context);
             match self.sink.dispatch_action(&trigger.action, params) {
@@ -310,6 +382,7 @@ mod tests {
             },
             action: "noop".into(),
             params: Value::Null,
+            condition: None,
         };
         assert!(t.matches(&evt("calendar.event_imminent", json!({}))));
         assert!(!t.matches(&evt("calendar.event_started", json!({}))));
@@ -325,6 +398,7 @@ mod tests {
             },
             action: "noop".into(),
             params: Value::Null,
+            condition: None,
         };
         assert!(t.matches(&evt("calendar.event_imminent", json!({}))));
         assert!(t.matches(&evt("calendar.event_created", json!({}))));
@@ -345,6 +419,7 @@ mod tests {
             },
             action: "noop".into(),
             params: Value::Null,
+            condition: None,
         };
         assert!(t.matches(&evt("slack.mention", json!({"channel": "alerts", "text": "hi"}))));
         assert!(!t.matches(&evt("slack.mention", json!({"channel": "general"}))));
@@ -364,6 +439,7 @@ mod tests {
                 "id": "{event.id}",
                 "msg": "got {event.id} from {event.source}",
             }),
+            condition: None,
         };
         let result = t.interpolate(
             &evt("calendar.event_imminent", json!({"id": "abc", "source": "x"})),
@@ -385,6 +461,7 @@ mod tests {
             },
             action: "noop".into(),
             params: json!({"cmd": "echo {context.active_cwd} :: {context.active_panel}"}),
+            condition: None,
         };
         let ctx = Context {
             active_panel: Some("panel-1".into()),
@@ -409,6 +486,7 @@ mod tests {
                 "c": "no braces",
                 "d": "unclosed {brace",
             }),
+            condition: None,
         };
         let result = t.interpolate(&evt("any", json!({})), None);
         assert_eq!(result["a"], json!("{event.missing}"));
@@ -431,6 +509,7 @@ mod tests {
                 "n": 42,
                 "b": true,
             }),
+            condition: None,
         };
         let result = t.interpolate(&evt("any", json!({"a": "A", "b": "B"})), None);
         assert_eq!(result["list"][0], json!("A"));
@@ -459,6 +538,7 @@ mod tests {
             },
             action: "record".into(),
             params: json!({"id": "{event.id}"}),
+            condition: None,
         }]);
         let fired = engine.dispatch(
             &evt("calendar.event_imminent", json!({"id": "evt-9"})),
@@ -489,6 +569,7 @@ mod tests {
             },
             action: "bump".into(),
             params: Value::Null,
+            condition: None,
         }]);
         engine.dispatch(&evt("calendar.event_imminent", json!({})), None);
         engine.dispatch(&evt("terminal.cwd_changed", json!({})), None);
@@ -509,6 +590,7 @@ mod tests {
             },
             action: "fail".into(),
             params: Value::Null,
+            condition: None,
         }]);
         // Should not panic. fired count is 0 because the action returned Err.
         let fired = engine.dispatch(&evt("any", json!({})), None);
@@ -526,9 +608,159 @@ mod tests {
             },
             action: "no_such_action".into(),
             params: Value::Null,
+            condition: None,
         }]);
         let fired = engine.dispatch(&evt("any", json!({})), None);
         assert_eq!(fired, 0);
+    }
+
+    // -- Condition integration --
+
+    fn trig_with_condition(name: &str, condition: Option<&str>) -> Trigger {
+        Trigger {
+            name: name.into(),
+            when: WhenSpec {
+                event_kind: "calendar.event_imminent".into(),
+                payload_match: Map::new(),
+            },
+            action: "fire".into(),
+            params: Value::Null,
+            condition: condition.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn condition_skips_trigger_when_false() {
+        let (reg, engine) = mk_engine();
+        let count = Arc::new(AtomicUsize::new(0));
+        {
+            let c = count.clone();
+            reg.register("fire", move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(json!(null))
+            });
+        }
+        engine.set_triggers(vec![trig_with_condition(
+            "skip-declined",
+            Some(r#"event.my_response_status != "declined""#),
+        )]);
+        // Declined event: trigger should NOT fire.
+        let fired = engine.dispatch(
+            &evt(
+                "calendar.event_imminent",
+                json!({"my_response_status": "declined"}),
+            ),
+            None,
+        );
+        assert_eq!(fired, 0);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        // Accepted event: trigger SHOULD fire.
+        let fired = engine.dispatch(
+            &evt(
+                "calendar.event_imminent",
+                json!({"my_response_status": "accepted"}),
+            ),
+            None,
+        );
+        assert_eq!(fired, 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn condition_eval_error_skips_trigger_safely() {
+        let (reg, engine) = mk_engine();
+        let count = Arc::new(AtomicUsize::new(0));
+        {
+            let c = count.clone();
+            reg.register("fire", move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(json!(null))
+            });
+        }
+        // `>` on a non-numeric payload field — eval errors at runtime.
+        engine.set_triggers(vec![trig_with_condition(
+            "bad-cond",
+            Some(r#"event.title > "5""#),
+        )]);
+        let fired = engine.dispatch(
+            &evt(
+                "calendar.event_imminent",
+                json!({"title": "weekly meeting"}),
+            ),
+            None,
+        );
+        // Eval error → safe default is "doesn't match" — fire count
+        // stays zero rather than firing on a misconfigured condition.
+        assert_eq!(fired, 0);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn condition_parse_error_drops_only_bad_trigger() {
+        let (reg, engine) = mk_engine();
+        let count = Arc::new(AtomicUsize::new(0));
+        {
+            let c = count.clone();
+            reg.register("fire", move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(json!(null))
+            });
+        }
+        engine.set_triggers(vec![
+            trig_with_condition("good", None),
+            trig_with_condition("broken", Some("foo == bar baz")), // garbage
+        ]);
+        // Only the good trigger should be live.
+        assert_eq!(engine.count(), 1);
+        assert_eq!(engine.names(), vec!["good".to_string()]);
+        let fired = engine.dispatch(&evt("calendar.event_imminent", json!({})), None);
+        assert_eq!(fired, 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn condition_with_context_ref() {
+        let (reg, engine) = mk_engine();
+        let count = Arc::new(AtomicUsize::new(0));
+        {
+            let c = count.clone();
+            reg.register("fire", move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(json!(null))
+            });
+        }
+        engine.set_triggers(vec![trig_with_condition(
+            "only-when-panel-1",
+            Some(r#"context.active_panel == "panel-1""#),
+        )]);
+        // Wrong panel → skip
+        let ctx_other = Context {
+            active_panel: Some("panel-9".into()),
+            active_cwd: None,
+        };
+        engine.dispatch(&evt("calendar.event_imminent", json!({})), Some(&ctx_other));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        // Right panel → fire
+        let ctx = Context {
+            active_panel: Some("panel-1".into()),
+            active_cwd: None,
+        };
+        engine.dispatch(&evt("calendar.event_imminent", json!({})), Some(&ctx));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn condition_round_trips_through_toml() {
+        let toml_src = r#"
+            name = "test"
+            action = "fire"
+            condition = "event.x != \"y\""
+
+            [when]
+            event_kind = "k"
+        "#;
+        let t: Trigger = toml::from_str(toml_src).unwrap();
+        assert_eq!(t.condition.as_deref(), Some(r#"event.x != "y""#));
     }
 
     #[test]
@@ -550,6 +782,7 @@ mod tests {
             },
             action: "bump".into(),
             params: Value::Null,
+            condition: None,
         };
         engine.set_triggers(vec![make("a"), make("b")]);
         assert_eq!(engine.count(), 2);

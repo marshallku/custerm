@@ -75,10 +75,10 @@ type Result<T> = std::result::Result<T, TurmError>;
 Config-driven `event → action` automation. Pure primitive — no bus subscription, no config loading; the platform layer pumps events into `dispatch()`. See [workflow-runtime.md](./workflow-runtime.md) for the broader trigger model.
 
 ```rust
-Trigger { name, when: WhenSpec, action, params: Value }
+Trigger { name, when: WhenSpec, action, params: Value, condition: Option<String> }
 WhenSpec { event_kind: String, payload_match: Map<String, Value> }
 TriggerEngine::new(sink: Arc<dyn TriggerSink>)  // ActionRegistry impls TriggerSink
-TriggerEngine::set_triggers(Vec<Trigger>)        // hot-reloadable
+TriggerEngine::set_triggers(Vec<Trigger>)        // hot-reloadable; conditions parsed once here
 TriggerEngine::dispatch(&Event, Option<&Context>) -> usize  // returns # fired
 TriggerEngine::count() / names()
 ```
@@ -86,6 +86,8 @@ TriggerEngine::count() / names()
 **`when` matching:**
 - `event_kind` is a glob — same semantics as `event_bus::pattern_matches` (`*`, `foo.*`, exact).
 - All other keys under `[when]` (TOML `#[serde(flatten)]`) are required payload-field equality matches. Missing field or different value → trigger does not fire.
+
+**`condition` (Phase 10.2):** optional boolean expression evaluated AFTER `when` matches. Grammar lives in `condition.rs`; supports `== != < <= > >= && || !` + parens, `event.X.Y` / `context.X` references, and string/number/bool/null literals. Compiled to AST once at `set_triggers` time; parse failures drop only that trigger (others still load). Eval failures (type mismatch on ordering, etc.) are logged and treated as "trigger does not match" — never fires the action on a misconfigured condition.
 
 **Param interpolation (`{token}` in any string in `params`):**
 - `{event.foo}` → `event.payload["foo"]` value (scalar JSON → string; null → "null"; objects/arrays → `Display` of `serde_json::Value`).
