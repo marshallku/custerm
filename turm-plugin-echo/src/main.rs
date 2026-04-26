@@ -128,6 +128,14 @@ fn handle_frame(value: &Value, tx: &Sender<String>, initialized: &AtomicBool) {
             let action_params = params.get("params").cloned().unwrap_or(Value::Null);
             match name {
                 "echo.ping" => {
+                    // Optional `sleep_ms` lets E2E callers exercise the
+                    // Phase 9.4 GTK-non-blocking guarantee — the plugin
+                    // parks for the requested duration before replying,
+                    // letting the test verify that concurrent dispatches
+                    // on the host side stay live during the wait.
+                    if let Some(ms) = action_params.get("sleep_ms").and_then(Value::as_u64) {
+                        thread::sleep(Duration::from_millis(ms));
+                    }
                     send_response(
                         tx,
                         id,
