@@ -131,7 +131,7 @@ Find documents matching a query. Ranked.
 | `query`  | string | yes      | Free-text. Backends interpret per their capability (literal, FTS, semantic).|
 | `limit`  | int    | no       | Default 20. Max enforced per-plugin (suggested cap 100).                    |
 | `offset` | int    | no       | Default 0. For pagination.                                                  |
-| `folder` | string | no       | Optional folder to scope the search (e.g. `"meetings"`). Same trust-boundary rules as `id`: implementations MUST reject values that escape the KB root (`..` traversal, absolute paths, embedded nul bytes) with `forbidden`. The match is **directory-segment prefix**, not raw string prefix: `"meetings"` matches `meetings/foo.md` and `meetings/2026/foo.md`, but NOT `meetings-archive/foo.md`. Trailing slash on the input is allowed and ignored. |
+| `folder` | string | no       | Optional folder to scope the search (e.g. `"meetings"`). Trust-boundary inputs split into shape vs traversal: shape problems (empty string, embedded nul bytes) → `invalid_params`; trust-boundary violations (`..` traversal, absolute paths) → `forbidden`. The match is **directory-segment prefix**, not raw string prefix: `"meetings"` matches `meetings/foo.md` and `meetings/2026/foo.md`, but NOT `meetings-archive/foo.md`. Trailing slash on the input is allowed and ignored. |
 
 **Response:**
 ```json

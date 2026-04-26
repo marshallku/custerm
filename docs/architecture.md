@@ -11,6 +11,8 @@ turm/
 ├── Cargo.toml              # Workspace root (resolver = "2", edition = "2024")
 ├── turm-plugin-echo/        # Mock service plugin (verifies protocol shape)
 │   └── src/main.rs            # newline-JSON over stdio: echo.ping + system.heartbeat
+├── turm-plugin-kb/          # First-party KB plugin (grep + filename over ~/docs)
+│   └── src/                    # main.rs (RPC loop), kb.rs (4 actions + atomic IO)
 ├── turm-core/            # Shared Rust library
 │   └── src/
 │       ├── lib.rs           # Module declarations
