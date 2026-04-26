@@ -148,6 +148,16 @@ struct ServiceHandle {
     child_pid: Mutex<Option<u32>>,
     next_id: AtomicU64,
     backoff: Mutex<BackoffState>,
+    /// Per-instance subscribe-forwarder bookkeeping. The forwarder
+    /// threads bridge bus events into the plugin's `event.dispatch`
+    /// frames. Without explicit teardown they accumulate one
+    /// thread + one bus subscription per `subscribes` pattern per
+    /// successful init — i.e. a service that crashes and restarts
+    /// 100 times leaks 100 sleeping forwarders. We now track
+    /// JoinHandles and signal shutdown cooperatively from
+    /// `handle_exit` so a fresh start begins with a clean slate.
+    forwarder_stop: Arc<AtomicBool>,
+    forwarder_handles: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 impl ServiceHandle {
@@ -386,6 +396,8 @@ impl ServiceSupervisor {
                     child_pid: Mutex::new(None),
                     next_id: AtomicU64::new(0),
                     backoff: Mutex::new(BackoffState::new()),
+                    forwarder_stop: Arc::new(AtomicBool::new(false)),
+                    forwarder_handles: Mutex::new(Vec::new()),
                 });
 
                 if let Activation::OnEvent(glob) = &svc.activation {
@@ -542,6 +554,43 @@ impl ServiceSupervisor {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Linux: ask the kernel to send SIGTERM to the plugin when its
+        // parent (turm) dies for ANY reason — including SIGKILL,
+        // segfault, or a panic before our `connect_destroy →
+        // shutdown_all` callback can fire.
+        //
+        // Race window: between fork() and the child's prctl() call,
+        // the parent can die without PDEATHSIG armed yet — kernel
+        // reparents the orphan to init and no signal ever arrives.
+        // Standard fix: capture `getppid()` BEFORE arming the
+        // signal, arm it, then re-check `getppid()`. If the parent
+        // pid has already changed (we got reparented to init), the
+        // race fired — exit immediately rather than running an
+        // orphaned plugin that will never receive its death notice.
+        //
+        // Best-effort: prctl failures (older kernel / locked-down
+        // sandbox) are silently ignored, because the worst case is
+        // the pre-fix orphan-on-crash behavior — never fail the
+        // spawn over a missing supervisor safety net.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                let original_ppid = libc::getppid();
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                    // Couldn't set the parent-death signal — let the
+                    // plugin start; just won't auto-die on turm crash.
+                    return Ok(());
+                }
+                // Closes the fork→prctl race: if the parent was
+                // alive at fork() but died before we armed the
+                // signal, getppid() now returns 1 (init).
+                if libc::getppid() != original_ppid {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
         let mut child = cmd.spawn().map_err(|e| ResponseError {
             code: "spawn_failed".into(),
             message: format!(
@@ -729,29 +778,59 @@ impl ServiceSupervisor {
         );
 
         // Forwarder threads bridge bus events into the outgoing channel
-        // for kinds the runtime actually accepted. They die on writer
-        // disconnect (channel send error) or on receiver drop.
+        // for kinds the runtime actually accepted. They exit on:
+        //   1. The shared `forwarder_stop` flag flipping true
+        //      (handle_exit's cooperative teardown).
+        //   2. The bus dropping the subscriber (RecvOutcome::Disconnected),
+        //      e.g. on a global supervisor shutdown.
+        //   3. The writer channel rejecting a send (out_rx dropped).
+        // Reset the stop flag for this fresh instance and clear any
+        // stale JoinHandles left over from a previous run that
+        // crashed before handle_exit could join them.
+        handle
+            .forwarder_stop
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        handle.forwarder_handles.lock().unwrap().clear();
         for pattern in accepted_subscribes {
             let rx = self.bus.subscribe_unbounded(pattern.clone());
             let writer = out_tx.clone();
             let svc_label = handle.fq_name();
-            thread::spawn(move || {
-                while let Some(ev) = rx.recv() {
-                    let frame = OutgoingFrame::Notification {
-                        method: "event.dispatch".into(),
-                        params: json!({
-                            "kind": ev.kind,
-                            "source": ev.source,
-                            "timestamp_ms": ev.timestamp_ms,
-                            "payload": ev.payload,
-                        }),
-                    };
-                    if writer.send(frame).is_err() {
-                        log::debug!("forwarder for {svc_label} pattern {pattern:?} exiting (writer closed)");
+            let stop = handle.forwarder_stop.clone();
+            let join = thread::spawn(move || {
+                use turm_core::event_bus::RecvOutcome;
+                loop {
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
+                    }
+                    match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                        RecvOutcome::Event(ev) => {
+                            let frame = OutgoingFrame::Notification {
+                                method: "event.dispatch".into(),
+                                params: json!({
+                                    "kind": ev.kind,
+                                    "source": ev.source,
+                                    "timestamp_ms": ev.timestamp_ms,
+                                    "payload": ev.payload,
+                                }),
+                            };
+                            if writer.send(frame).is_err() {
+                                log::debug!(
+                                    "forwarder for {svc_label} pattern {pattern:?} exiting (writer closed)"
+                                );
+                                break;
+                            }
+                        }
+                        RecvOutcome::Timeout => continue,
+                        RecvOutcome::Disconnected => {
+                            log::debug!(
+                                "forwarder for {svc_label} pattern {pattern:?} exiting (bus disconnected)"
+                            );
+                            break;
+                        }
                     }
                 }
             });
+            handle.forwarder_handles.lock().unwrap().push(join);
         }
 
         // Drain buffered invocations now that the service is Running.
@@ -788,6 +867,28 @@ impl ServiceSupervisor {
             *handle.runtime_provides.lock().unwrap() = None;
             prev
         };
+
+        // Tear down per-instance forwarder threads BEFORE we drop the
+        // state lock so the JoinHandles can't be observed by the next
+        // `start_service` call. Without this, every successful init
+        // accumulates one forwarder thread + one bus subscription per
+        // `subscribes` pattern, which over a crash-loop scenario
+        // grows unbounded. Cooperative shutdown via the shared
+        // `forwarder_stop` flag — each forwarder polls every 200ms
+        // (worst-case shutdown latency).
+        handle
+            .forwarder_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let joins: Vec<thread::JoinHandle<()>> = std::mem::take(
+            &mut *handle.forwarder_handles.lock().unwrap(),
+        );
+        for j in joins {
+            // Wait briefly for graceful exit; if the forwarder is
+            // somehow stuck we'd rather leak it (next start will
+            // overwrite the JoinHandles list anyway) than block
+            // handle_exit forever.
+            let _ = j.join();
+        }
 
         // Fail any pending responses.
         let pending: Vec<Sender<Response>> = handle

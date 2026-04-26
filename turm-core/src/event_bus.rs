@@ -36,6 +36,18 @@ pub struct EventReceiver {
     inner: Receiver<Event>,
 }
 
+/// Outcome of a `recv_timeout` call. Consumers like
+/// `service_supervisor`'s subscribe-forwarder use this to break out
+/// of a blocking recv periodically without busy-spinning, so an
+/// explicit teardown (e.g. `handle_exit`) can stop the forwarder by
+/// flipping a shared stop flag.
+#[derive(Debug, Clone)]
+pub enum RecvOutcome {
+    Event(Event),
+    Timeout,
+    Disconnected,
+}
+
 impl EventReceiver {
     pub fn try_recv(&self) -> Option<Event> {
         self.inner.try_recv().ok()
@@ -43,6 +55,19 @@ impl EventReceiver {
 
     pub fn recv(&self) -> Option<Event> {
         self.inner.recv().ok()
+    }
+
+    /// Block up to `timeout` for the next event, returning explicit
+    /// outcomes for "no event yet", "got an event", and "the bus has
+    /// dropped this subscriber". Callers spinning on this can check
+    /// an external stop flag between calls without losing events
+    /// that arrived during the wait.
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> RecvOutcome {
+        match self.inner.recv_timeout(timeout) {
+            Ok(e) => RecvOutcome::Event(e),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => RecvOutcome::Timeout,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => RecvOutcome::Disconnected,
+        }
     }
 }
 
@@ -206,6 +231,47 @@ mod tests {
         assert!(!pattern_matches("foo.*", "foo"));
         assert!(!pattern_matches("foo.*", "foobar"));
         assert!(!pattern_matches("foo.*", "bar.foo"));
+    }
+
+    #[test]
+    fn recv_timeout_returns_event_when_available() {
+        let bus = EventBus::new();
+        let rx = bus.subscribe("k");
+        bus.publish(mk("k"));
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            RecvOutcome::Event(e) => assert_eq!(e.kind, "k"),
+            other => panic!("expected Event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recv_timeout_returns_timeout_when_idle() {
+        let bus = EventBus::new();
+        let rx = bus.subscribe("k");
+        match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+            RecvOutcome::Timeout => {}
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        // Bus is still alive; the channel is still connected — sanity check
+        // that another event can still arrive after a timeout.
+        bus.publish(mk("k"));
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            RecvOutcome::Event(_) => {}
+            other => panic!("expected Event after timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recv_timeout_returns_disconnected_when_bus_dropped() {
+        let rx = {
+            let bus = EventBus::new();
+            bus.subscribe("k")
+        };
+        // Bus is dropped; sender side gone.
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            RecvOutcome::Disconnected => {}
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
     }
 
     #[test]
