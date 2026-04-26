@@ -419,7 +419,14 @@ impl ServiceSupervisor {
                 let svc = handle.clone();
                 let sup = supervisor.clone();
                 let captured_name = action_name.clone();
-                supervisor.registry.register(action_name, move |params| {
+                // `register_blocking`: invoke_remote can park the
+                // calling thread for up to the action timeout (30s by
+                // default) waiting on a stdio reply from the plugin
+                // subprocess. Marking the entry blocking lets
+                // `ActionRegistry::try_dispatch` route this onto a
+                // worker thread so the GTK main loop and trigger
+                // pump don't stall while the plugin computes.
+                supervisor.registry.register_blocking(action_name, move |params| {
                     sup.invoke_remote(&svc, &captured_name, params)
                 });
             }

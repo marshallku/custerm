@@ -229,18 +229,34 @@ pub fn dispatch(
 
     // Action Registry: try registered handlers first. New commands register
     // through the registry; legacy commands stay in the match below until
-    // migrated. `try_invoke` returns None on miss so we fall through cleanly.
-    if let Some(result) = actions.try_invoke(&req.method, req.params.clone()) {
-        let resp = match result {
-            Ok(value) => Response::success(req.id.clone(), value),
-            Err(err) => Response {
-                id: req.id.clone(),
-                ok: false,
-                result: None,
-                error: Some(err),
-            },
-        };
-        let _ = cmd.reply.send(resp);
+    // migrated. `try_dispatch` returns false on miss so we fall through.
+    //
+    // `try_dispatch` (vs the old `try_invoke`) is what keeps the GTK main
+    // loop responsive: synchronous handlers (system.ping, context.snapshot,
+    // etc.) still run inline so fast paths pay no scheduling overhead, but
+    // blocking handlers — i.e. service-plugin RPC — are spawned onto a
+    // worker thread by the registry. Either way `cmd.reply.send` lands
+    // exactly once with the response, and the dispatcher returns
+    // immediately for the blocking case so a slow plugin can't stall the
+    // socket-server thread or the GTK timer that pumps it.
+    let req_id_for_reply = req.id.clone();
+    let reply = cmd.reply.clone();
+    if actions.try_dispatch(
+        &req.method,
+        req.params.clone(),
+        Box::new(move |result| {
+            let resp = match result {
+                Ok(value) => Response::success(req_id_for_reply, value),
+                Err(err) => Response {
+                    id: req_id_for_reply,
+                    ok: false,
+                    result: None,
+                    error: Some(err),
+                },
+            };
+            let _ = reply.send(resp);
+        }),
+    ) {
         return;
     }
 
