@@ -1,0 +1,29 @@
+[plugin]
+name = "slack"
+title = "Slack"
+version = "0.1.0"
+description = "Slack Socket Mode plugin: emits slack.mention / slack.dm via WebSocket. Read-only — sending messages is a future slice."
+
+[[services]]
+name = "main"
+exec = "turm-plugin-slack"
+# onStartup: Socket Mode requires a long-lived WebSocket. Lazy
+# (onAction) activation would never connect because there are no
+# slack.* actions that drive demand — events flow inbound.
+activation = "onStartup"
+restart = "on-crash"
+provides = ["slack.auth_status"]
+subscribes = []
+# Required env: TURM_SLACK_BOT_TOKEN (xoxb-...), TURM_SLACK_APP_TOKEN (xapp-...)
+# Optional env: TURM_SLACK_WORKSPACE (default "default" — keyring entry namespace),
+#               TURM_SLACK_REQUIRE_SECURE_STORE (default false — refuse plaintext fallback)
+#
+# One-time setup:
+#   1. Create a Slack App at https://api.slack.com/apps
+#   2. Enable Socket Mode (Settings → Socket Mode); generate an
+#      App-Level Token with `connections:write` scope (xapp-...)
+#   3. Subscribe to bot events (Event Subscriptions): app_mention, message.im
+#   4. Add OAuth scopes (OAuth & Permissions, Bot Token Scopes):
+#      app_mentions:read, im:history, users:read
+#   5. Install to your workspace; copy the Bot User OAuth Token (xoxb-...)
+#   6. Run `TURM_SLACK_BOT_TOKEN=xoxb-... TURM_SLACK_APP_TOKEN=xapp-... turm-plugin-slack auth`

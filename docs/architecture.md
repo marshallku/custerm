@@ -18,6 +18,12 @@ turm/
 │                                # store.rs (keyring + plaintext fallback), oauth.rs
 │                                # (device-code flow + refresh), gcal.rs (events.list),
 │                                # poller.rs (lead-time dedupe), event.rs (payload mapping)
+├── turm-plugin-slack/      # First-party Slack Socket Mode plugin (Unix only)
+│   └── src/                    # main.rs (RPC + auth subcommand), config.rs (env),
+│                                # store.rs (two-token keyring + plaintext fallback),
+│                                # socket_mode.rs (apps.connections.open + tungstenite
+│                                # WebSocket loop + reconnect), events.rs (Slack →
+│                                # slack.mention / slack.dm event mapping with filtering)
 ├── turm-core/            # Shared Rust library
 │   └── src/
 │       ├── lib.rs           # Module declarations
