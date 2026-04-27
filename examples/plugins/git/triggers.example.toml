@@ -13,19 +13,25 @@
 # — uncomment after that lands.
 
 # ---------------------------------------------------------------------
-# 1. Phase 15.2 sketch: when a Todo's start_requested chains into
-#    git.worktree_add and that completes, spawn a Claude session
-#    in the new worktree. Requires Phase 18 (claude.start) and
-#    Phase 14.1 (chained `<action>.completed` events from generic
-#    triggers, so the prompt can be interpolated from the original
-#    todo.start_requested payload via Phase 14.2 async correlation).
+# 1. Phase 15.2 sketch: when git.worktree_add succeeds, drop a
+#    Claude session in the new worktree. Phase 18 ships the
+#    `claude.start` action; this trigger composes git.worktree_add
+#    with it directly. The session_name is derived from the
+#    worktree path so re-running on the same worktree
+#    re-attaches the live tmux session instead of stacking dups.
 #
-# [[triggers]]
-# name = "worktree-then-claude"
-# action = "claude.start"
-# params = { workspace_path = "{event.path}", prompt = "Working on branch {event.branch}\n" }
-# [triggers.when]
-# event_kind = "git.worktree_add.completed"
+#    Note: `prompt` field is rejected by claude.start in slice 1
+#    (Phase 18.1) — it lands in 18.2 once tmux send-keys timing
+#    is designed. The user pastes the prompt into claude after
+#    the tab opens.
+# ---------------------------------------------------------------------
+[[triggers]]
+name = "worktree-then-claude"
+action = "claude.start"
+params = { workspace_path = "{event.path}" }
+
+[triggers.when]
+event_kind = "git.worktree_add.completed"
 
 # ---------------------------------------------------------------------
 # 2. KB log of every worktree creation, for end-of-day review.

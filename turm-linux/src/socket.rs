@@ -14,6 +14,7 @@ use turm_core::protocol::{Event, Request, Response};
 
 use vte4::prelude::*;
 
+use crate::panel::Panel;
 use crate::tabs::TabManager;
 
 const WALLPAPER_CACHE: &str = ".cache/terminal-wallpapers.txt";
@@ -71,6 +72,7 @@ pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
     "terminal.history",
     "terminal.context",
     "agent.approve",
+    "claude.start",
     "theme.list",
     "plugin.list",
     "plugin.open",
@@ -508,6 +510,11 @@ pub fn dispatch(
 
         "agent.approve" => {
             handle_agent_approve(cmd, window);
+        }
+
+        "claude.start" => {
+            let resp = handle_claude_start(req, mgr, window);
+            let _ = cmd.reply.send(resp);
         }
 
         "theme.list" => {
@@ -1428,6 +1435,247 @@ fn handle_terminal_context(req: &Request, mgr: &Rc<TabManager>) -> Response {
     )
 }
 
+/// Spawn a new turm tab with `cwd = workspace_path`, then feed
+/// `tmux new-session -A -s <name> 'claude [...]'` into the
+/// terminal. `-A` attaches to an existing session of the same
+/// name (so re-running on the same worktree re-attaches the live
+/// claude rather than stacking duplicates) or creates one. The
+/// quote-as-command form lets tmux interpret `claude --resume X`
+/// as the initial-window command on session-create; on attach,
+/// tmux ignores the command and we just attach.
+///
+/// Slice 1 limitation: `prompt` seeding is not implemented.
+/// Interactive `claude` consumes its stdin via the TTY, not via
+/// stdin redirect or `--print`, so seeding a conversation
+/// reliably needs `tmux send-keys` after claude is up — that
+/// timing problem deserves its own design (Phase 18.2). Today
+/// the killer demo (Vision Flow 3) lands without prompt
+/// pre-fill: the user sees claude open in the right worktree
+/// with the right session, and pastes the prompt themselves.
+fn handle_claude_start(
+    req: &Request,
+    mgr: &Rc<TabManager>,
+    window: &ApplicationWindow,
+) -> Response {
+    let workspace_path_str = match req.params.get("workspace_path") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+        Some(_) => {
+            return Response::error(
+                req.id.clone(),
+                "invalid_params",
+                "'workspace_path' must be a non-empty string",
+            );
+        }
+        None => {
+            return Response::error(
+                req.id.clone(),
+                "invalid_params",
+                "Missing 'workspace_path' param",
+            );
+        }
+    };
+    let raw_path = std::path::Path::new(&workspace_path_str);
+    let canon = match std::fs::canonicalize(raw_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::error(
+                req.id.clone(),
+                "not_found",
+                &format!("workspace_path {workspace_path_str:?}: {e}"),
+            );
+        }
+    };
+    if !canon.is_dir() {
+        return Response::error(
+            req.id.clone(),
+            "invalid_params",
+            &format!("workspace_path {} is not a directory", canon.display()),
+        );
+    }
+
+    // session_name: explicit or derived. tmux forbids `:` and `.`
+    // in session names; we restrict further to ASCII alphanumeric
+    // + `-_` so the value stays safe to embed in shell commands
+    // without needing further escaping.
+    let session_name = match req.params.get("session_name") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => {
+            if let Err(e) = validate_tmux_session_name(s) {
+                return Response::error(
+                    req.id.clone(),
+                    "invalid_params",
+                    &format!("session_name: {e}"),
+                );
+            }
+            s.clone()
+        }
+        Some(serde_json::Value::Null) | None => derive_session_name(&canon),
+        Some(other) => {
+            return Response::error(
+                req.id.clone(),
+                "invalid_params",
+                &format!("'session_name' must be a string, got {other}"),
+            );
+        }
+    };
+
+    // resume_session: optional claude session id. Validated
+    // permissively (anything non-empty), single-quote-escaped
+    // before embedding in the tmux command.
+    let resume_session = match req.params.get("resume_session") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => {
+            for c in s.chars() {
+                if c.is_control() || c == '\0' {
+                    return Response::error(
+                        req.id.clone(),
+                        "invalid_params",
+                        "resume_session contains control characters",
+                    );
+                }
+            }
+            Some(s.clone())
+        }
+        Some(serde_json::Value::Null) | None => None,
+        Some(other) => {
+            return Response::error(
+                req.id.clone(),
+                "invalid_params",
+                &format!("'resume_session' must be a string, got {other}"),
+            );
+        }
+    };
+
+    // Phase 18 slice 1 doesn't seed claude with a prompt. Reject
+    // explicitly so callers using the future shape don't silently
+    // get a no-prompt session. Phase 18.2 will land tmux
+    // send-keys based seeding.
+    if let Some(p) = req.params.get("prompt")
+        && !matches!(p, serde_json::Value::Null)
+    {
+        return Response::error(
+            req.id.clone(),
+            "not_implemented",
+            "'prompt' seeding is deferred to Phase 18.2; for now, omit the field \
+             and paste the prompt into claude after the tab opens",
+        );
+    }
+
+    let claude_cmd = match &resume_session {
+        Some(id) => format!("claude --resume {}", shell_single_quote(id)),
+        None => "claude".to_string(),
+    };
+    let tmux_command = format!(
+        "tmux new-session -A -s {} {}\n",
+        shell_single_quote(&session_name),
+        shell_single_quote(&claude_cmd),
+    );
+
+    // Pass the tmux command as `initial_input` so it's fed from
+    // inside VTE's spawn_async success callback — eliminates
+    // the race where a feed_input call after add_tab_with_cwd
+    // could write to a PTY whose child shell isn't attached yet.
+    let (panel, tab_index) =
+        mgr.add_tab_with_cwd_and_initial_input(window, Some(&canon), Some(tmux_command));
+    let panel_id = panel.id().to_string();
+    if panel.as_terminal().is_none() {
+        // add_tab_with_cwd_and_initial_input always returns a
+        // terminal panel today. If that ever changes, we want to
+        // know.
+        return Response::error(
+            req.id.clone(),
+            "internal_error",
+            "claude.start expected a terminal panel",
+        );
+    }
+
+    // Return both identifiers — `panel_id` is the UUID consumed by
+    // session.info / session.list, `tab` is the numeric index
+    // consumed by tab-bar UI. Same shape as the `tab.created`
+    // event payload so caller code can be uniform.
+    Response::success(
+        req.id.clone(),
+        json!({
+            "panel_id": panel_id,
+            "tab": tab_index,
+            "tmux_session": session_name,
+            "workspace_path": canon.display().to_string(),
+        }),
+    )
+}
+
+/// Pull the last 1-2 path components and stitch them together
+/// with `-`, lowercased and sanitized. Two components rather
+/// than one because worktree layouts like
+/// `<worktree_root>/feature/foo` would otherwise collapse to
+/// just `foo`, colliding with sibling worktrees on the same
+/// leaf name.
+fn derive_session_name(path: &std::path::Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for comp in path.components().rev() {
+        if let std::path::Component::Normal(seg) = comp
+            && let Some(s) = seg.to_str()
+        {
+            parts.push(s.to_string());
+            if parts.len() == 2 {
+                break;
+            }
+        }
+    }
+    parts.reverse();
+    let joined = parts.join("-");
+    sanitize_session_name(&joined)
+}
+
+fn sanitize_session_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let safe = if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            c.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        out.push(safe);
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "claude".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn validate_tmux_session_name(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("cannot be empty".to_string());
+    }
+    if s.starts_with('-') {
+        return Err("cannot start with '-' (would look like a flag)".to_string());
+    }
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err(format!(
+                "invalid character {c:?} (allowed: ASCII alphanumeric and - _)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// POSIX-safe single-quote escape: wrap in `'…'`, replace any
+/// embedded `'` with `'\''`. Result is a single shell token.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 fn handle_agent_approve(cmd: SocketCommand, window: &ApplicationWindow) {
     let req = &cmd.request;
     let title = req
@@ -1636,4 +1884,74 @@ fn handle_plugin_command(cmd: SocketCommand, mgr: &Rc<TabManager>, socket_path: 
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_tmux_session_name_accepts_normal() {
+        for s in ["main", "feat-foo", "user_team", "release-1-2", "abc123"] {
+            validate_tmux_session_name(s).unwrap_or_else(|e| panic!("rejected {s:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_tmux_session_name_rejects_bad() {
+        for s in [
+            "",
+            "-flag",
+            "feat:foo",
+            "feat.foo",
+            "has space",
+            "foo/bar",
+            "x\0y",
+        ] {
+            assert!(
+                validate_tmux_session_name(s).is_err(),
+                "should reject {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_session_name_lowercases_and_replaces_bad_chars() {
+        assert_eq!(sanitize_session_name("Feature/Foo"), "feature-foo");
+        assert_eq!(sanitize_session_name("v1.2.3"), "v1-2-3");
+        assert_eq!(sanitize_session_name("ALL-CAPS"), "all-caps");
+        assert_eq!(sanitize_session_name("---trim---"), "trim");
+        // Empty-after-sanitize falls back to a non-empty default
+        // so callers always have a usable session name.
+        assert_eq!(sanitize_session_name("///"), "claude");
+    }
+
+    #[test]
+    fn derive_session_name_uses_last_two_path_components() {
+        let p = std::path::Path::new("/home/user/dev/turm-worktrees/feature/foo");
+        assert_eq!(derive_session_name(p), "feature-foo");
+        let p2 = std::path::Path::new("/home/user/dev/myrepo");
+        // Only one path-after-root component left? "dev-myrepo".
+        assert_eq!(derive_session_name(p2), "dev-myrepo");
+    }
+
+    #[test]
+    fn derive_session_name_sanitizes_uppercase_and_dots() {
+        let p = std::path::Path::new("/x/Feature.Branch/PROJ-456");
+        assert_eq!(derive_session_name(p), "feature-branch-proj-456");
+    }
+
+    #[test]
+    fn shell_single_quote_round_trips() {
+        // No special chars: just wrapping.
+        assert_eq!(shell_single_quote("simple"), "'simple'");
+        // Embedded single quote uses '\''.
+        assert_eq!(shell_single_quote("foo'bar"), "'foo'\\''bar'");
+        // Empty string is still quoted (a valid empty shell arg).
+        assert_eq!(shell_single_quote(""), "''");
+        // Whitespace and special chars passed through inside the
+        // quotes — the whole point of single-quoting is shell
+        // doesn't interpret them.
+        assert_eq!(shell_single_quote("a; b $C"), "'a; b $C'");
+    }
 }

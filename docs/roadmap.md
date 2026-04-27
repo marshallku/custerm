@@ -473,11 +473,26 @@ Original spec for reference (kept while slice 2 is pending):
 
 Closes the loop: after a workflow stages a worktree + context, drop the user into Claude Code **inside a tmux session** so the work persists across turm restarts and is reattachable from any terminal.
 
+**Phase 18.1 — `claude.start` action** (slice 1) — **shipped**:
+
+- [x] **Built as a turm-internal socket action** (not a stdio plugin) — composes `tab.new` + `terminal.feed_input` directly against the GTK tab manager, which is the natural home since the action inherently needs window/tab access.
+- [x] **`claude.start {workspace_path, session_name?, resume_session?}`**: validates `workspace_path` exists and is a directory (canonicalized). Two distinct paths for `session_name` to keep the contract predictable: when the caller OMITS the field, we DERIVE one from the path (last-2 components, lowercased, non-`[A-Za-z0-9_-]` replaced with `-`); when the caller supplies it EXPLICITLY, we VALIDATE strictly (refuse empty, leading `-`, anything outside `[A-Za-z0-9_-]`) and return `invalid_params` rather than silently rewriting — silent rewrites would mask user typos and break `re-running on the same name re-attaches the same tmux session`. Spawns a new tab whose terminal cwd is `workspace_path` (`TerminalPanel::new_with_cwd` threads `Option<&Path>` through to VTE's `spawn_async`), then feeds `tmux new-session -A -s <name> 'claude [...]'` into the terminal. `-A` re-attaches existing sessions instead of stacking duplicates. Returns `{panel_id, tab, tmux_session, workspace_path}` (matches the `tab.created` event payload shape — `panel_id` is the UUID consumed by `session.info`, `tab` is the numeric index).
+- [x] **Shell-safe argument escaping**: `shell_single_quote` POSIX-quotes session_name and the inner claude command, including `'\''` escaping for embedded quotes. Caller-supplied `resume_session` ids cannot inject extra arguments.
+- [x] **`prompt` parameter rejected** with `not_implemented` rather than silently ignored. Interactive `claude` reads its REPL via the TTY, not stdin/`--print`, so reliably seeding a conversation needs `tmux send-keys` after claude is up — that timing-sensitive design lands in slice 2 (Phase 18.2). Today the killer demo (Vision Flow 3) lands without prompt pre-fill: claude opens in the right worktree with the right session, user pastes the prompt themselves.
+- [x] **5 unit tests** cover `validate_tmux_session_name` positive/negative, `sanitize_session_name`, `derive_session_name` (single/two-component, sanitization), `shell_single_quote` (incl. embedded-quote escape).
+
+**Phase 18.2 — prompt seeding via `tmux send-keys`** (slice 2, deferred):
+
+- [ ] After spawning the tmux session, send-keys the prompt into claude's running REPL. Timing the send (claude needs to be up and accepting input) is the design problem — options include polling `tmux list-panes -F '#{pane_in_mode}'`, sleeping a fixed delay, or having claude print a sentinel string we grep for.
+- [ ] Mutual exclusion between `prompt` and `resume_session` (resume restores an existing session; prompt seeds a new one).
+
+**Phase 18.X — original spec** (kept while slice 2 is pending):
+
 - [ ] **Action `claude.start {workspace_path, prompt?, session_name?, resume_session?}`**:
   1. Opens a new turm tab with `cwd = workspace_path`.
   2. In that tab, runs `tmux new-session -A -s <session_name>` — `-A` attaches if a session with that name already exists, creates otherwise. Default `session_name` derived from the worktree path (last two components, sanitized) so re-running on the same worktree re-attaches the same tmux session instead of stacking new ones.
   3. Inside the tmux session, runs `claude` (or `claude --resume <id>` if `resume_session` provided). Pre-filled `prompt` fed via stdin pipe (`echo <prompt> | claude`) or via `claude --print` — pick whichever the installed claude-code CLI supports cleanly at impl time.
-  4. Returns `{tab_id, tmux_session, worktree_path}` so the caller (Todo panel, trigger chain) can reference the spawned session later.
+  4. Returns `{panel_id, tab, tmux_session, workspace_path}` (matches `tab.created` event payload shape — `panel_id` UUID for `session.info`, `tab` numeric index for tab-bar UI) so the caller (Todo panel, trigger chain) can reference the spawned session later.
 - [ ] **Persistence wins from tmux**: detach the tab → kill turm → next turm restart → `claude.start` with the same `session_name` reattaches the running claude. Long-running tasks (refactors, multi-step reasoning) survive turm crashes and laptop reboots.
 - [ ] **Built on `tab.new` + `terminal.exec`** primitives. No custom IPC with claude-code — orchestration is "spawn it in the right place with the right context, let it run." If claude-code adds programmatic surfaces later (e.g. `claude --json-events`) that can land as a separate enhancement.
 - [ ] **Phase 14 composability test case**: full end-to-end Vision Flow 3, all triggers in user's `[[triggers]]`:

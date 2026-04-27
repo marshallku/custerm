@@ -136,8 +136,32 @@ impl TabManager {
     }
 
     pub fn add_tab(self: &Rc<Self>, window: &gtk4::ApplicationWindow) {
+        let _ = self.add_tab_with_cwd(window, None);
+    }
+
+    /// Add a new terminal tab whose shell is spawned with `cwd`
+    /// (None = inherit from turm). Returns `(panel, tab_index)`.
+    pub fn add_tab_with_cwd(
+        self: &Rc<Self>,
+        window: &gtk4::ApplicationWindow,
+        cwd: Option<&std::path::Path>,
+    ) -> (Rc<PanelVariant>, u32) {
+        self.add_tab_with_cwd_and_initial_input(window, cwd, None)
+    }
+
+    /// Same as `add_tab_with_cwd` but pipes `initial_input`
+    /// into the new shell AFTER `spawn_async`'s success
+    /// callback fires (so we never write to a PTY that has no
+    /// child attached). Used by `claude.start` to launch
+    /// `tmux new-session` reliably.
+    pub fn add_tab_with_cwd_and_initial_input(
+        self: &Rc<Self>,
+        window: &gtk4::ApplicationWindow,
+        cwd: Option<&std::path::Path>,
+        initial_input: Option<String>,
+    ) -> (Rc<PanelVariant>, u32) {
         let config = self.config.borrow().clone();
-        let panel = self.create_panel(&config, window);
+        let panel = self.create_panel(&config, window, cwd, initial_input);
 
         let tab_content = TabContent::new(panel.clone());
         let tab_label = self.make_tab_label(&panel, &tab_content.container);
@@ -164,6 +188,7 @@ impl TabManager {
                 }),
             ),
         );
+        (panel, page_num)
     }
 
     pub fn add_webview_tab(
@@ -281,7 +306,7 @@ impl TabManager {
         };
 
         let config = self.config.borrow().clone();
-        let new_panel = self.create_panel(&config, window);
+        let new_panel = self.create_panel(&config, window, None, None);
 
         {
             let tabs = self.tabs.borrow();
@@ -674,6 +699,8 @@ impl TabManager {
         self: &Rc<Self>,
         config: &TurmConfig,
         window: &gtk4::ApplicationWindow,
+        cwd: Option<&std::path::Path>,
+        initial_input: Option<String>,
     ) -> Rc<PanelVariant> {
         let mgr = Rc::downgrade(self);
         let win = window.clone();
@@ -681,18 +708,19 @@ impl TabManager {
         let widget_for_exit = widget_holder.clone();
         let event_bus_exit = self.event_bus.clone();
 
-        let terminal_panel = TerminalPanel::new(config, move || {
-            let widget = widget_for_exit.borrow().clone();
-            let mgr = mgr.clone();
-            let win = win.clone();
-            let bus = event_bus_exit.clone();
-            glib::idle_add_local_once(move || {
-                let Some(mgr) = mgr.upgrade() else { return };
-                if let Some(ref w) = widget {
-                    mgr.handle_panel_exit(w, &win, &bus);
-                }
+        let terminal_panel =
+            TerminalPanel::new_with_cwd_and_initial_input(config, cwd, initial_input, move || {
+                let widget = widget_for_exit.borrow().clone();
+                let mgr = mgr.clone();
+                let win = win.clone();
+                let bus = event_bus_exit.clone();
+                glib::idle_add_local_once(move || {
+                    let Some(mgr) = mgr.upgrade() else { return };
+                    if let Some(ref w) = widget {
+                        mgr.handle_panel_exit(w, &win, &bus);
+                    }
+                });
             });
-        });
 
         let panel = Rc::new(PanelVariant::Terminal(terminal_panel));
 

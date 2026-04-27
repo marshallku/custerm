@@ -57,7 +57,21 @@ pub struct TerminalPanel {
 }
 
 impl TerminalPanel {
-    pub fn new(config: &TurmConfig, on_exit: impl Fn() + 'static) -> Self {
+    /// Spawn the shell. `cwd = None` inherits from the turm
+    /// process; `Some(path)` is used by `claude.start` to drop
+    /// straight into a worktree. `initial_input`, when set, is
+    /// fed into the PTY ONLY AFTER `spawn_async`'s success
+    /// callback fires — i.e. only after the shell is actually
+    /// attached. This eliminates the race where writing to the
+    /// PTY too eagerly could land before the child is wired up.
+    /// If the spawn fails, the initial input is dropped (a
+    /// child-less PTY would have nowhere to deliver it).
+    pub fn new_with_cwd_and_initial_input(
+        config: &TurmConfig,
+        cwd: Option<&std::path::Path>,
+        initial_input: Option<String>,
+        on_exit: impl Fn() + 'static,
+    ) -> Self {
         let terminal = Terminal::new();
 
         // Font
@@ -114,9 +128,28 @@ impl TerminalPanel {
         let socket_env = format!("TURM_SOCKET=/tmp/turm-{}.sock", std::process::id());
         let child_pid: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
         let pid_cell = child_pid.clone();
+        // Resolve cwd once upfront. We pass `Option<&str>` to
+        // VTE's spawn_async, which interprets it as the working
+        // directory (None = inherit from turm). On Linux paths
+        // are arbitrary bytes; `to_string_lossy` substitutes
+        // U+FFFD for non-UTF-8 components rather than failing.
+        // In practice every cwd we receive flows through
+        // `std::fs::canonicalize` upstream, which itself
+        // operates on `OsStr` and produces canonical paths the
+        // user already typed somewhere, so non-UTF-8 cwds are a
+        // theoretical concern only.
+        let cwd_str = cwd.map(|p| p.to_string_lossy().into_owned());
+        let cwd_arg: Option<&str> = cwd_str.as_deref();
+        // Clone the VTE Terminal handle (it's a refcounted
+        // GObject) into the spawn callback so we can reach the
+        // child after spawn completes. Then feed the initial
+        // input from THERE — not from the caller — to remove
+        // the race where the caller writes before the child
+        // is actually attached to the PTY.
+        let terminal_for_init = terminal.clone();
         terminal.spawn_async(
             vte4::PtyFlags::DEFAULT,
-            None::<&str>,
+            cwd_arg,
             &[&shell],
             &[&socket_env],
             gtk4::glib::SpawnFlags::DEFAULT,
@@ -127,6 +160,14 @@ impl TerminalPanel {
                 Ok(pid) => {
                     eprintln!("[turm] shell spawned, child_pid={}", pid.0);
                     pid_cell.set(pid.0);
+                    if let Some(text) = &initial_input {
+                        // feed_child writes directly to the PTY
+                        // master — at this point the slave is
+                        // attached to the just-spawned shell, so
+                        // the bytes land in the shell's stdin
+                        // queue without ambiguity.
+                        terminal_for_init.feed_child(text.as_bytes());
+                    }
                 }
                 Err(e) => {
                     eprintln!("[turm] shell spawn error: {e}");

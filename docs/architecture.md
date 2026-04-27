@@ -47,6 +47,12 @@ turm/
 │                                # canonicalization), git.rs (current_branch, list_worktrees
 │                                # porcelain v2 parser, worktree_add/remove, status v2 parser,
 │                                # validate_branch_name)
+# claude.start: turm-internal socket action (lives in turm-linux/src/socket.rs).
+# Spawns a tab whose terminal cwd is the worktree, feeds
+# `tmux new-session -A -s <name> 'claude [--resume <id>]'` into it.
+# Returns {panel_id, tab, tmux_session, workspace_path}.
+# Slice 1 ships without `prompt` seeding (interactive REPL stdin is
+# tricky); pass `prompt` and you'll get not_implemented.
 ├── turm-core/            # Shared Rust library
 │   └── src/
 │       ├── lib.rs           # Module declarations
@@ -150,7 +156,7 @@ turmctl ──Unix socket──► socket server (per-client thread)
                           oneshot response ──► socket thread ──► client
 ```
 
-**Supported commands**: `system.ping`, `system.log`, `context.snapshot`, `background.set`, `background.clear`, `background.set_tint`, `background.next`, `background.toggle`, `tab.new`, `tab.close`, `tab.list`, `tab.info`, `tab.rename`, `tabs.toggle_bar`, `split.horizontal`, `split.vertical`, `session.list`, `session.info`, `event.subscribe`, `terminal.read`, `terminal.state`, `terminal.exec`, `terminal.feed`, `terminal.history`, `terminal.context`, `agent.approve`, `theme.list`, `plugin.list`, `plugin.open`, `plugin.<name>.<cmd>`, `webview.open`, `webview.navigate`, `webview.back`, `webview.forward`, `webview.reload`, `webview.execute_js`, `webview.get_content`, `webview.screenshot`, `webview.query`, `webview.query_all`, `webview.get_styles`, `webview.click`, `webview.fill`, `webview.scroll`, `webview.page_info`, `webview.devtools`, `statusbar.show`, `statusbar.hide`, `statusbar.toggle`. Plus any action declared by a service plugin via `[[services]] provides` (e.g. `echo.ping`, `kb.search`) — registered in the same `ActionRegistry` and reachable through socket dispatch's registry-first lookup.
+**Supported commands**: `system.ping`, `system.log`, `context.snapshot`, `background.set`, `background.clear`, `background.set_tint`, `background.next`, `background.toggle`, `tab.new`, `tab.close`, `tab.list`, `tab.info`, `tab.rename`, `tabs.toggle_bar`, `split.horizontal`, `split.vertical`, `session.list`, `session.info`, `event.subscribe`, `terminal.read`, `terminal.state`, `terminal.exec`, `terminal.feed`, `terminal.history`, `terminal.context`, `agent.approve`, `claude.start`, `theme.list`, `plugin.list`, `plugin.open`, `plugin.<name>.<cmd>`, `webview.open`, `webview.navigate`, `webview.back`, `webview.forward`, `webview.reload`, `webview.execute_js`, `webview.get_content`, `webview.screenshot`, `webview.query`, `webview.query_all`, `webview.get_styles`, `webview.click`, `webview.fill`, `webview.scroll`, `webview.page_info`, `webview.devtools`, `statusbar.show`, `statusbar.hide`, `statusbar.toggle`. Plus any action declared by a service plugin via `[[services]] provides` (e.g. `echo.ping`, `kb.search`) — registered in the same `ActionRegistry` and reachable through socket dispatch's registry-first lookup.
 
 **Cleanup**: Socket file removed on window destroy.
 
@@ -168,7 +174,7 @@ Clients can subscribe to real-time events via `event.subscribe`. The socket stay
 | `panel.focused` | `{panel_id}` | Panel gains focus |
 | `panel.title_changed` | `{panel_id, title}` | Terminal window title changes |
 | `panel.exited` | `{panel_id, tab}` | Shell process exits |
-| `tab.opened` | `{index, panel_id}` | New tab opened |
+| `tab.created` | `{tab, panel_id, panel_type}` | New tab opened |
 | `tab.closed` | `{index}` | Tab closed |
 | `terminal.output` | `{panel_id, text}` | Terminal receives output (high frequency) |
 | `terminal.cwd_changed` | `{panel_id, cwd}` | Terminal CWD changes (OSC 7) |
