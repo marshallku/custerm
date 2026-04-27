@@ -26,8 +26,8 @@ impl Config {
         let client_secret = std::env::var("TURM_CALENDAR_CLIENT_SECRET")
             .map_err(|_| "TURM_CALENDAR_CLIENT_SECRET is required".to_string())?;
 
-        let account_label = std::env::var("TURM_CALENDAR_ACCOUNT")
-            .unwrap_or_else(|_| "default".to_string());
+        let account_label =
+            std::env::var("TURM_CALENDAR_ACCOUNT").unwrap_or_else(|_| "default".to_string());
         validate_account_label(&account_label)?;
 
         let lead_minutes = parse_lead_minutes(
@@ -109,9 +109,7 @@ fn parse_lead_minutes(raw: &str) -> Result<Vec<u32>, String> {
             .parse()
             .map_err(|_| format!("TURM_CALENDAR_LEAD_MINUTES: invalid integer {trimmed:?}"))?;
         if n == 0 {
-            return Err(
-                "TURM_CALENDAR_LEAD_MINUTES: 0 is not a meaningful lead time".to_string(),
-            );
+            return Err("TURM_CALENDAR_LEAD_MINUTES: 0 is not a meaningful lead time".to_string());
         }
         out.push(n);
     }
@@ -156,7 +154,8 @@ fn parse_bool(var: &str, default: bool) -> Result<bool, String> {
 
 fn default_plaintext_path(account: &str) -> std::path::PathBuf {
     let base = dirs_config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("turm").join(format!("calendar-token-{account}.json"))
+    base.join("turm")
+        .join(format!("calendar-token-{account}.json"))
 }
 
 /// Minimal `$XDG_CONFIG_HOME` resolver to avoid pulling in the `dirs`
@@ -237,10 +236,7 @@ mod tests {
             ".",
             "",
         ] {
-            assert!(
-                validate_account_label(s).is_err(),
-                "should reject {s:?}"
-            );
+            assert!(validate_account_label(s).is_err(), "should reject {s:?}");
         }
     }
 

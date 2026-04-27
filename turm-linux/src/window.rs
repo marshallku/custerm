@@ -108,10 +108,8 @@ impl TurmWindow {
         // hot-reload callback can both invoke the same `pump_all` sequence.
         // Exact-match context subscriptions (not `*` and not glob) so high-
         // frequency unrelated kinds cannot flood the bounded ctx queues.
-        let sink: Arc<dyn TriggerSink> = Arc::new(LiveTriggerSink::new(
-            actions.clone(),
-            dispatch_tx.clone(),
-        ));
+        let sink: Arc<dyn TriggerSink> =
+            Arc::new(LiveTriggerSink::new(actions.clone(), dispatch_tx.clone()));
         let triggers = Arc::new(TriggerEngine::new(sink));
         triggers.set_triggers(config.triggers.clone());
         let pump_state = Rc::new(RefCell::new(PumpState {
@@ -216,15 +214,11 @@ impl TurmWindow {
             // applied to ContextService.
             while let Ok(cmd) = socket_rx.try_recv() {
                 socket::dispatch(cmd, &mgr, &win, &sp, &sb, &act);
-                pump_state_timer
-                    .borrow()
-                    .drain_context_only(&ctx_pump);
+                pump_state_timer.borrow().drain_context_only(&ctx_pump);
             }
             while let Ok(cmd) = plugin_dispatch_rx.try_recv() {
                 socket::dispatch(cmd, &mgr, &win, &sp, &sb, &act);
-                pump_state_timer
-                    .borrow()
-                    .drain_context_only(&ctx_pump);
+                pump_state_timer.borrow().drain_context_only(&ctx_pump);
             }
             glib::ControlFlow::Continue
         });
@@ -423,8 +417,7 @@ impl TriggerSubscriptions {
         let raw: Vec<String> = triggers.iter().map(|t| t.when.event_kind.clone()).collect();
         let needed: std::collections::HashSet<String> =
             covering_patterns(raw).into_iter().collect();
-        self.receivers
-            .retain(|pattern, _| needed.contains(pattern));
+        self.receivers.retain(|pattern, _| needed.contains(pattern));
         for pattern in needed {
             self.receivers
                 .entry(pattern.clone())

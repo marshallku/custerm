@@ -62,8 +62,8 @@ impl Config {
                     .to_string(),
             );
         }
-        let workspace_label = std::env::var("TURM_SLACK_WORKSPACE")
-            .unwrap_or_else(|_| "default".to_string());
+        let workspace_label =
+            std::env::var("TURM_SLACK_WORKSPACE").unwrap_or_else(|_| "default".to_string());
         validate_workspace_label(&workspace_label)?;
         let require_secure_store = parse_bool("TURM_SLACK_REQUIRE_SECURE_STORE", false)?;
         let plaintext_path = default_plaintext_path(&workspace_label);
@@ -145,7 +145,8 @@ fn parse_bool(var: &str, default: bool) -> Result<bool, String> {
 
 fn default_plaintext_path(workspace: &str) -> PathBuf {
     let base = config_home().unwrap_or_else(|| PathBuf::from("."));
-    base.join("turm").join(format!("slack-tokens-{workspace}.json"))
+    base.join("turm")
+        .join(format!("slack-tokens-{workspace}.json"))
 }
 
 fn config_home() -> Option<PathBuf> {
@@ -175,11 +176,17 @@ mod tests {
 
     #[test]
     fn workspace_label_rejects_bad() {
-        for s in ["/etc/passwd", "../foo", "a/b", "a\\b", "x\0y", "..", ".", ""] {
-            assert!(
-                validate_workspace_label(s).is_err(),
-                "should reject {s:?}"
-            );
+        for s in [
+            "/etc/passwd",
+            "../foo",
+            "a/b",
+            "a\\b",
+            "x\0y",
+            "..",
+            ".",
+            "",
+        ] {
+            assert!(validate_workspace_label(s).is_err(), "should reject {s:?}");
         }
     }
 }

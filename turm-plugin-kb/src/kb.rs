@@ -150,9 +150,7 @@ impl Kb {
             if !ft.is_file() && !ft.is_dir() {
                 return Err((
                     "invalid_id".into(),
-                    format!(
-                        "id {id} resolves to a non-regular file (FIFO, socket, or device)"
-                    ),
+                    format!("id {id} resolves to a non-regular file (FIFO, socket, or device)"),
                 ));
             }
         }
@@ -197,9 +195,7 @@ impl Kb {
         if !to_check.starts_with(&self.root_canonical) {
             return Err((
                 "forbidden".into(),
-                format!(
-                    "id {id} resolves outside KB root (symlink escape?)"
-                ),
+                format!("id {id} resolves outside KB root (symlink escape?)"),
             ));
         }
         // Return the original (non-canonical) path so kb.read/append
@@ -232,10 +228,7 @@ impl Kb {
                     Ok(md) if md.file_type().is_symlink() => {
                         return Err((
                             "forbidden".into(),
-                            format!(
-                                "{logical} traverses a symlink at {}",
-                                cursor.display()
-                            ),
+                            format!("{logical} traverses a symlink at {}", cursor.display()),
                         ));
                     }
                     Ok(_) => {}
@@ -250,10 +243,7 @@ impl Kb {
                         // check couldn't actually run, rather than
                         // silently passing and tripping a vaguer
                         // error later in the action path.
-                        return Err(io_error(format!(
-                            "stat ancestor {}: {e}",
-                            cursor.display()
-                        )));
+                        return Err(io_error(format!("stat ancestor {}: {e}", cursor.display())));
                     }
                 }
             }
@@ -289,10 +279,7 @@ impl Kb {
             .and_then(Value::as_u64)
             .unwrap_or(SEARCH_LIMIT_DEFAULT as u64)
             .min(SEARCH_LIMIT_CAP as u64) as usize;
-        let offset = params
-            .get("offset")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
+        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
 
         // Folder is the same trust-boundary input as `id` — same
         // validation rules apply, surfaced as `forbidden` on traversal
@@ -338,10 +325,7 @@ impl Kb {
         // occasional unreadable binary or locked file.
         if search_root.exists() {
             std::fs::read_dir(&search_root).map_err(|e| {
-                io_error(format!(
-                    "read search root {}: {e}",
-                    search_root.display()
-                ))
+                io_error(format!("read search root {}: {e}", search_root.display()))
             })?;
         } else {
             return Ok(json!({ "hits": [], "total": 0 }));
@@ -733,10 +717,7 @@ fn validate_id(id: &str) -> Result<(), KbErr> {
             ));
         }
         if raw_segment == "." {
-            return Err((
-                "invalid_id".into(),
-                "id cannot contain `.` segments".into(),
-            ));
+            return Err(("invalid_id".into(), "id cannot contain `.` segments".into()));
         }
     }
     // Component walk catches the trust-boundary cases (`..`, absolute,
@@ -899,12 +880,10 @@ fn create_parents(path: &Path) -> Result<(), KbErr> {
 /// gives exactly-one-creator (losers get EEXIST).
 fn atomic_create_with_content(path: &Path, content: &[u8]) -> Result<bool, KbErr> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let temp_dir = parent.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let temp_name = format!(
-        ".kb-tmp-{}-{}",
-        std::process::id(),
-        next_temp_seq()
-    );
+    let temp_dir = parent
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let temp_name = format!(".kb-tmp-{}-{}", std::process::id(), next_temp_seq());
     let temp_path = temp_dir.join(temp_name);
 
     // Write the temp file. O_CREAT|O_EXCL|O_WRONLY here too — paranoia
@@ -920,12 +899,10 @@ fn atomic_create_with_content(path: &Path, content: &[u8]) -> Result<bool, KbErr
             // readers yet, so multi-syscall writes are fine. (Only
             // the FINAL rename needs to be atomic for readers.)
             use std::io::Write;
-            tmp.write_all(content).map_err(|e| {
-                io_error(format!("write temp {}: {e}", temp_path.display()))
-            })?;
-            tmp.sync_data().map_err(|e| {
-                io_error(format!("fsync temp {}: {e}", temp_path.display()))
-            })?;
+            tmp.write_all(content)
+                .map_err(|e| io_error(format!("write temp {}: {e}", temp_path.display())))?;
+            tmp.sync_data()
+                .map_err(|e| io_error(format!("fsync temp {}: {e}", temp_path.display())))?;
         }
     }
 
@@ -1106,7 +1083,10 @@ fn parse_yaml_value(v: &str) -> Value {
         if inner.trim().is_empty() {
             return Value::Array(Vec::new());
         }
-        let arr: Vec<Value> = inner.split(',').map(|s| parse_yaml_value(s.trim())).collect();
+        let arr: Vec<Value> = inner
+            .split(',')
+            .map(|s| parse_yaml_value(s.trim()))
+            .collect();
         return Value::Array(arr);
     }
     if v == "true" {
@@ -1195,7 +1175,10 @@ mod tests {
 
     #[test]
     fn validate_folder_rejects_dot_segment() {
-        assert_eq!(validate_folder("./meetings").unwrap_err().0, "invalid_params");
+        assert_eq!(
+            validate_folder("./meetings").unwrap_err().0,
+            "invalid_params"
+        );
     }
 
     #[test]

@@ -91,7 +91,12 @@ impl ActionRegistry {
     /// time-sensitive threads (GTK, socket dispatch) should use
     /// `try_dispatch` instead so blocking handlers spawn a worker.
     pub fn try_invoke(&self, name: &str, params: Value) -> Option<ActionResult> {
-        let handler = self.entries.read().unwrap().get(name).map(|e| e.handler.clone())?;
+        let handler = self
+            .entries
+            .read()
+            .unwrap()
+            .get(name)
+            .map(|e| e.handler.clone())?;
         Some(handler(params))
     }
 
@@ -114,12 +119,7 @@ impl ActionRegistry {
     /// extra cost (no thread spawn). For blocking handlers it
     /// keeps the caller's thread alive while the work proceeds in
     /// the background.
-    pub fn try_dispatch(
-        self: &Arc<Self>,
-        name: &str,
-        params: Value,
-        on_done: Responder,
-    ) -> bool {
+    pub fn try_dispatch(self: &Arc<Self>, name: &str, params: Value, on_done: Responder) -> bool {
         let (handler, blocking) = {
             let entries = self.entries.read().unwrap();
             match entries.get(name) {
@@ -262,7 +262,10 @@ mod tests {
         assert!(reg.has("b.thing"));
         assert!(!reg.has("c.thing"));
         assert_eq!(reg.len(), 2);
-        assert_eq!(reg.names(), vec!["a.thing".to_string(), "b.thing".to_string()]);
+        assert_eq!(
+            reg.names(),
+            vec!["a.thing".to_string(), "b.thing".to_string()]
+        );
     }
 
     #[test]
@@ -297,7 +300,9 @@ mod tests {
         {
             let s = shared.clone();
             reg.register("add", move |params| {
-                let n = params.as_u64().ok_or_else(|| invalid_params("expected u64"))?;
+                let n = params
+                    .as_u64()
+                    .ok_or_else(|| invalid_params("expected u64"))?;
                 let mut g = s.lock().unwrap();
                 *g += n;
                 Ok(json!(*g))
@@ -331,10 +336,7 @@ mod tests {
             json!("extended")
         );
         assert!(reg.has("added_later"));
-        assert_eq!(
-            reg.invoke("added_later", json!({})).unwrap(),
-            json!("ok")
-        );
+        assert_eq!(reg.invoke("added_later", json!({})).unwrap(), json!("ok"));
     }
 
     #[test]
@@ -443,7 +445,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let observed_tid = observed.lock().unwrap().unwrap();
-        assert_ne!(observed_tid, caller, "blocking callback should fire on worker thread, not caller");
+        assert_ne!(
+            observed_tid, caller,
+            "blocking callback should fire on worker thread, not caller"
+        );
         assert_eq!(
             captured.lock().unwrap().as_ref().unwrap().as_ref().unwrap(),
             &json!("done")

@@ -175,7 +175,11 @@ impl ServiceHandle {
     }
 
     fn next_request_id(&self) -> String {
-        format!("svc-{}-{}", self.plugin_name, self.next_id.fetch_add(1, Ordering::SeqCst))
+        format!(
+            "svc-{}-{}",
+            self.plugin_name,
+            self.next_id.fetch_add(1, Ordering::SeqCst)
+        )
     }
 
     fn send(&self, frame: OutgoingFrame) -> Result<(), ResponseError> {
@@ -263,13 +267,14 @@ pub fn resolve_provides(plugins: &[LoadedPlugin]) -> (ApprovedProvides, Vec<Prov
                         // choice — we don't try to be smarter than that.)
                     }
                     Some(winner) => {
-                        let entry = conflicts
-                            .entry(action.clone())
-                            .or_insert_with(|| ProvideConflict {
-                                action: action.clone(),
-                                winner: winner.clone(),
-                                losers: Vec::new(),
-                            });
+                        let entry =
+                            conflicts
+                                .entry(action.clone())
+                                .or_insert_with(|| ProvideConflict {
+                                    action: action.clone(),
+                                    winner: winner.clone(),
+                                    losers: Vec::new(),
+                                });
                         if !entry.losers.contains(pname) {
                             entry.losers.push(pname.clone());
                         }
@@ -449,9 +454,11 @@ impl ServiceSupervisor {
                 // `ActionRegistry::try_dispatch` route this onto a
                 // worker thread so the GTK main loop and trigger
                 // pump don't stall while the plugin computes.
-                supervisor.registry.register_blocking(action_name, move |params| {
-                    sup.invoke_remote(&svc, &captured_name, params)
-                });
+                supervisor
+                    .registry
+                    .register_blocking(action_name, move |params| {
+                        sup.invoke_remote(&svc, &captured_name, params)
+                    });
             }
         }
 
@@ -560,7 +567,10 @@ impl ServiceSupervisor {
         cmd.args(&handle.spec.args)
             .current_dir(&handle.plugin_dir)
             .env("TURM_PLUGIN_NAME", &handle.plugin_name)
-            .env("TURM_PLUGIN_DIR", handle.plugin_dir.to_string_lossy().as_ref())
+            .env(
+                "TURM_PLUGIN_DIR",
+                handle.plugin_dir.to_string_lossy().as_ref(),
+            )
             .env("TURM_SERVICE_NAME", &handle.service_name)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -615,9 +625,18 @@ impl ServiceSupervisor {
         let pid = child.id();
         *handle.child_pid.lock().unwrap() = Some(pid);
 
-        let stdin = child.stdin.take().ok_or_else(|| internal_error("no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| internal_error("no stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| internal_error("no stderr"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| internal_error("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| internal_error("no stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| internal_error("no stderr"))?;
 
         let (out_tx, out_rx) = channel::<OutgoingFrame>();
         *handle.outgoing.lock().unwrap() = Some(out_tx.clone());
@@ -715,10 +734,16 @@ impl ServiceSupervisor {
         let runtime_subscribes = string_array(&result, "subscribes");
 
         // Asymmetric validation, applied identically to both fields.
-        let manifest_provides: HashSet<&str> =
-            handle.approved_provides.iter().map(String::as_str).collect();
-        let manifest_subscribes: HashSet<&str> =
-            handle.approved_subscribes.iter().map(String::as_str).collect();
+        let manifest_provides: HashSet<&str> = handle
+            .approved_provides
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let manifest_subscribes: HashSet<&str> = handle
+            .approved_subscribes
+            .iter()
+            .map(String::as_str)
+            .collect();
 
         let mut accepted_provides = Vec::new();
         for entry in &runtime_provides {
@@ -769,10 +794,7 @@ impl ServiceSupervisor {
                 // in init. Roll back: don't transition to Running.
                 return Err(ResponseError {
                     code: "service_unavailable".into(),
-                    message: format!(
-                        "service {} exited during init",
-                        handle.fq_name()
-                    ),
+                    message: format!("service {} exited during init", handle.fq_name()),
                 });
             }
             *handle.runtime_provides.lock().unwrap() =
@@ -860,7 +882,11 @@ impl ServiceSupervisor {
         Ok(())
     }
 
-    fn handle_exit(self: Arc<Self>, handle: Arc<ServiceHandle>, status: std::io::Result<std::process::ExitStatus>) {
+    fn handle_exit(
+        self: Arc<Self>,
+        handle: Arc<ServiceHandle>,
+        status: std::io::Result<std::process::ExitStatus>,
+    ) {
         // Hold state lock for the entire cleanup so a concurrent
         // `start_service` can't observe a partly-cleaned instance and
         // race a replacement. Lock order is state → outgoing → child_pid
@@ -890,9 +916,8 @@ impl ServiceSupervisor {
         handle
             .forwarder_stop
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let joins: Vec<thread::JoinHandle<()>> = std::mem::take(
-            &mut *handle.forwarder_handles.lock().unwrap(),
-        );
+        let joins: Vec<thread::JoinHandle<()>> =
+            std::mem::take(&mut *handle.forwarder_handles.lock().unwrap());
         for j in joins {
             // Wait briefly for graceful exit; if the forwarder is
             // somehow stuck we'd rather leak it (next start will
@@ -1030,10 +1055,7 @@ impl ServiceSupervisor {
                     if buf.len() >= MAX_PENDING_BUFFER {
                         return Err(ResponseError {
                             code: "buffer_full".into(),
-                            message: format!(
-                                "service {} startup buffer full",
-                                handle.fq_name()
-                            ),
+                            message: format!("service {} startup buffer full", handle.fq_name()),
                         });
                     }
                     buf.push_back(pending);
@@ -1098,7 +1120,11 @@ impl ServiceSupervisor {
 
     /// Send the buffered invocation to the running service. The reader
     /// thread will fulfill `pending.reply` when the response arrives.
-    fn dispatch_invocation(self: &Arc<Self>, handle: Arc<ServiceHandle>, pending: PendingInvocation) {
+    fn dispatch_invocation(
+        self: &Arc<Self>,
+        handle: Arc<ServiceHandle>,
+        pending: PendingInvocation,
+    ) {
         let req_id = handle.next_request_id();
         // Send-side of the response channel; reader thread routes here.
         let (resp_tx, resp_rx) = channel::<Response>();
@@ -1197,11 +1223,7 @@ impl ServiceSupervisor {
                         .get("name")
                         .and_then(Value::as_str)
                         .map(str::to_string);
-                    let params = req
-                        .params
-                        .get("params")
-                        .cloned()
-                        .unwrap_or(Value::Null);
+                    let params = req.params.get("params").cloned().unwrap_or(Value::Null);
                     match name {
                         Some(n) => match sup.registry.invoke(&n, params) {
                             Ok(v) => Response::success(req.id.clone(), v),
@@ -1246,10 +1268,7 @@ impl ServiceSupervisor {
                 let kind = match params.get("kind").and_then(Value::as_str) {
                     Some(k) => k.to_string(),
                     None => {
-                        log::warn!(
-                            "service {} event.publish missing 'kind'",
-                            handle.fq_name()
-                        );
+                        log::warn!("service {} event.publish missing 'kind'", handle.fq_name());
                         return;
                     }
                 };
@@ -1262,10 +1281,7 @@ impl ServiceSupervisor {
                     .get("level")
                     .and_then(Value::as_str)
                     .unwrap_or("info");
-                let msg = params
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let msg = params.get("message").and_then(Value::as_str).unwrap_or("");
                 eprintln!("[plugin:{}] {level}: {msg}", handle.plugin_name);
             }
             other => {
@@ -1401,10 +1417,7 @@ fn spawn_reader(
             let frame = match parse_inbound(&line) {
                 Some(f) => f,
                 None => {
-                    log::warn!(
-                        "service {} sent unparseable line: {line}",
-                        handle.fq_name()
-                    );
+                    log::warn!("service {} sent unparseable line: {line}", handle.fq_name());
                     continue;
                 }
             };
@@ -1626,13 +1639,8 @@ mod tests {
             vec![mk_service("main", &["plugin.hello.greet", "rogue.do"])],
         );
 
-        let _sup = ServiceSupervisor::new(
-            bus,
-            registry.clone(),
-            &[cmds_plugin, rogue],
-            "test",
-            &[],
-        );
+        let _sup =
+            ServiceSupervisor::new(bus, registry.clone(), &[cmds_plugin, rogue], "test", &[]);
         // The shell-command name stays unclaimed in the registry so
         // `socket::dispatch` falls through to `handle_plugin_command`.
         assert!(!registry.has("plugin.hello.greet"));
@@ -1644,20 +1652,11 @@ mod tests {
     fn supervisor_skips_provides_that_collide_with_extra_reserved() {
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::new());
-        let plugin = mk_plugin(
-            "rogue",
-            vec![mk_service("main", &["tab.new", "rogue.do"])],
-        );
+        let plugin = mk_plugin("rogue", vec![mk_service("main", &["tab.new", "rogue.do"])]);
         // `tab.new` lives in `socket::dispatch`'s match arm, not in the
         // registry, but must still be reserved so a plugin can't shadow
         // it via the registry-first dispatch lookup.
-        let _sup = ServiceSupervisor::new(
-            bus,
-            registry.clone(),
-            &[plugin],
-            "test",
-            &["tab.new"],
-        );
+        let _sup = ServiceSupervisor::new(bus, registry.clone(), &[plugin], "test", &["tab.new"]);
         assert!(!registry.has("tab.new"));
         assert!(registry.has("rogue.do"));
     }
@@ -1782,8 +1781,7 @@ mod tests {
         // Simulate a successful init that announced ONLY kb.read at
         // runtime — the degraded-mode case the doc describes.
         let svc = sup.services.lock().unwrap()[0].clone();
-        *svc.runtime_provides.lock().unwrap() =
-            Some(["kb.read".to_string()].into_iter().collect());
+        *svc.runtime_provides.lock().unwrap() = Some(["kb.read".to_string()].into_iter().collect());
 
         let err = sup
             .invoke_remote(&svc, "kb.search", json!({}))

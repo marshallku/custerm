@@ -72,8 +72,8 @@ impl Config {
         let mut errors: Vec<String> = Vec::new();
 
         // Account label first — it determines paths.
-        let raw_account = std::env::var("TURM_LLM_ACCOUNT")
-            .unwrap_or_else(|_| "default".to_string());
+        let raw_account =
+            std::env::var("TURM_LLM_ACCOUNT").unwrap_or_else(|_| "default".to_string());
         let (account_label, account_resolved) = match validate_account_label(&raw_account) {
             Ok(_) => (raw_account, true),
             Err(e) => {
@@ -99,8 +99,7 @@ impl Config {
         let default_model = match std::env::var("TURM_LLM_DEFAULT_MODEL") {
             Ok(s) if s.is_empty() => {
                 errors.push(
-                    "TURM_LLM_DEFAULT_MODEL: empty string is not a valid model id"
-                        .to_string(),
+                    "TURM_LLM_DEFAULT_MODEL: empty string is not a valid model id".to_string(),
                 );
                 DEFAULT_MODEL.to_string()
             }

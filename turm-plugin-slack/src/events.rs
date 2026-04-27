@@ -146,10 +146,7 @@ fn build_raw(event: &Value, event_id: Option<String>, team_id: Option<String>) -
         .get("channel")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let ts = event
-        .get("ts")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let ts = event.get("ts").and_then(Value::as_str).map(str::to_string);
     RawEvent {
         event_type,
         channel,
@@ -255,7 +252,10 @@ mod tests {
     /// were emitted. Returns the filtered event.
     fn expect_filtered(out: Vec<SlackEvent>) -> SlackEvent {
         assert_eq!(out.len(), 2, "expected raw + filtered, got {out:?}");
-        assert!(matches!(out[0], SlackEvent::Raw(_)), "first event must be Raw");
+        assert!(
+            matches!(out[0], SlackEvent::Raw(_)),
+            "first event must be Raw"
+        );
         out.into_iter().nth(1).unwrap()
     }
 

@@ -136,14 +136,11 @@ pub fn run_loop<F>(
                 backoff_secs = config.reconnect_initial.as_secs().max(1);
             }
             Err(e) => {
-                eprintln!(
-                    "[slack] socket mode error, reconnecting in {backoff_secs}s: {e}"
-                );
+                eprintln!("[slack] socket mode error, reconnecting in {backoff_secs}s: {e}");
                 if interruptible_sleep(stop, Duration::from_secs(backoff_secs)) {
                     return;
                 }
-                backoff_secs =
-                    (backoff_secs * 2).min(config.reconnect_max.as_secs().max(1));
+                backoff_secs = (backoff_secs * 2).min(config.reconnect_max.as_secs().max(1));
             }
         }
     }

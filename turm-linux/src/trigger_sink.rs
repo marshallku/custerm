@@ -131,7 +131,11 @@ mod tests {
     use super::*;
     use turm_core::action_registry::invalid_params;
 
-    fn mk_sink_with_registry() -> (Arc<ActionRegistry>, LiveTriggerSink, mpsc::Receiver<SocketCommand>) {
+    fn mk_sink_with_registry() -> (
+        Arc<ActionRegistry>,
+        LiveTriggerSink,
+        mpsc::Receiver<SocketCommand>,
+    ) {
         let registry = Arc::new(ActionRegistry::new());
         let (tx, rx) = mpsc::channel::<SocketCommand>();
         let sink = LiveTriggerSink::new(registry.clone(), tx);
@@ -150,9 +154,7 @@ mod tests {
     fn sync_registry_action_propagates_err_so_engine_logs_it() {
         let (registry, sink, _rx) = mk_sink_with_registry();
         registry.register("sync.fail", |_| Err(invalid_params("bad")));
-        let err = sink
-            .dispatch_action("sync.fail", json!({}))
-            .unwrap_err();
+        let err = sink.dispatch_action("sync.fail", json!({})).unwrap_err();
         assert_eq!(err.code, "invalid_params");
         assert_eq!(err.message, "bad");
     }

@@ -47,23 +47,25 @@ fn main() {
     if interval_secs > 0 {
         let hb_tx = tx.clone();
         let init_flag = initialized.clone();
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(interval_secs));
-            if !init_flag.load(Ordering::SeqCst) {
-                continue;
-            }
-            let event = json!({
-                "method": "event.publish",
-                "params": {
-                    "kind": "system.heartbeat",
-                    "payload": {
-                        "source": "turm-plugin-echo",
-                        "timestamp_ms": now_millis(),
-                    }
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(interval_secs));
+                if !init_flag.load(Ordering::SeqCst) {
+                    continue;
                 }
-            });
-            if hb_tx.send(event.to_string()).is_err() {
-                break;
+                let event = json!({
+                    "method": "event.publish",
+                    "params": {
+                        "kind": "system.heartbeat",
+                        "payload": {
+                            "source": "turm-plugin-echo",
+                            "timestamp_ms": now_millis(),
+                        }
+                    }
+                });
+                if hb_tx.send(event.to_string()).is_err() {
+                    break;
+                }
             }
         });
     }
@@ -104,9 +106,7 @@ fn handle_frame(value: &Value, tx: &Sender<String>, initialized: &AtomicBool) {
                     tx,
                     id,
                     "protocol_mismatch",
-                    &format!(
-                        "echo plugin only speaks protocol {PROTOCOL_VERSION}; got {proto:?}"
-                    ),
+                    &format!("echo plugin only speaks protocol {PROTOCOL_VERSION}; got {proto:?}"),
                 );
                 return;
             }

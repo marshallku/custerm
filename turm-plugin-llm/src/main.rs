@@ -323,8 +323,7 @@ fn handle_complete(
 ) -> Result<Value, (String, String)> {
     let api_key = resolve_api_key(config, &**store).ok_or((
         "not_authenticated".to_string(),
-        "no Anthropic API key — set ANTHROPIC_API_KEY or run `turm-plugin-llm auth`"
-            .to_string(),
+        "no Anthropic API key — set ANTHROPIC_API_KEY or run `turm-plugin-llm auth`".to_string(),
     ))?;
     let prompt = params.get("prompt").and_then(Value::as_str).ok_or((
         "invalid_params".to_string(),
@@ -422,17 +421,16 @@ fn handle_complete(
         system,
         temperature,
     };
-    let resp =
-        anthropic::complete(&api_key, &req, config.http_timeout).map_err(|e| {
-            // 401-prefixed errors come back as `auth_error: ...`.
-            // Other errors stay under io_error so the protocol
-            // shape matches calendar/slack.
-            if e.starts_with("auth_error:") {
-                ("not_authenticated".to_string(), e)
-            } else {
-                ("io_error".to_string(), e)
-            }
-        })?;
+    let resp = anthropic::complete(&api_key, &req, config.http_timeout).map_err(|e| {
+        // 401-prefixed errors come back as `auth_error: ...`.
+        // Other errors stay under io_error so the protocol
+        // shape matches calendar/slack.
+        if e.starts_with("auth_error:") {
+            ("not_authenticated".to_string(), e)
+        } else {
+            ("io_error".to_string(), e)
+        }
+    })?;
 
     // Best-effort usage logging — failure to write the log MUST NOT
     // fail the action since the user has already paid for the
@@ -473,18 +471,21 @@ fn handle_usage(params: &Value, config: &Config) -> Result<Value, (String, Strin
         ))?),
         None => None,
     };
-    let (agg, parse_errors) =
-        usage::aggregate(&config.usage_log_path, since, until, model_filter)
-            .map_err(|e| ("io_error".to_string(), e))?;
+    let (agg, parse_errors) = usage::aggregate(&config.usage_log_path, since, until, model_filter)
+        .map_err(|e| ("io_error".to_string(), e))?;
     let mut out = usage::aggregate_to_json(&agg, parse_errors);
     if let Some(obj) = out.as_object_mut() {
         obj.insert(
             "since".to_string(),
-            since.map(|t| Value::String(t.to_rfc3339())).unwrap_or(Value::Null),
+            since
+                .map(|t| Value::String(t.to_rfc3339()))
+                .unwrap_or(Value::Null),
         );
         obj.insert(
             "until".to_string(),
-            until.map(|t| Value::String(t.to_rfc3339())).unwrap_or(Value::Null),
+            until
+                .map(|t| Value::String(t.to_rfc3339()))
+                .unwrap_or(Value::Null),
         );
     }
     Ok(out)
@@ -627,7 +628,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.0, "invalid_params");
-        assert!(err.1.contains("TURM_LLM_ACCOUNT is invalid"), "got {}", err.1);
+        assert!(
+            err.1.contains("TURM_LLM_ACCOUNT is invalid"),
+            "got {}",
+            err.1
+        );
     }
 
     #[test]
@@ -698,12 +703,8 @@ mod tests {
     #[test]
     fn complete_returns_not_authenticated_when_no_key() {
         let store: Arc<dyn TokenStore> = Arc::new(StubStore(None));
-        let err = handle_complete(
-            &json!({"prompt": "hi"}),
-            &cfg_minimal_no_error(),
-            &store,
-        )
-        .unwrap_err();
+        let err =
+            handle_complete(&json!({"prompt": "hi"}), &cfg_minimal_no_error(), &store).unwrap_err();
         assert_eq!(err.0, "not_authenticated");
     }
 

@@ -117,10 +117,7 @@ fn poll_token(config: &Config, device_code: &str) -> Result<Option<TokenSet>, Po
             ("client_id", &config.client_id),
             ("client_secret", &config.client_secret),
             ("device_code", device_code),
-            (
-                "grant_type",
-                "urn:ietf:params:oauth:grant-type:device_code",
-            ),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ]) {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,

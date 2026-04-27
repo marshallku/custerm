@@ -203,11 +203,7 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(
-        ".slack-tokens-{}-{}.tmp",
-        std::process::id(),
-        seq,
-    ));
+    let tmp = parent.join(format!(".slack-tokens-{}-{}.tmp", std::process::id(), seq,));
     {
         let mut f = fs::OpenOptions::new()
             .create_new(true)

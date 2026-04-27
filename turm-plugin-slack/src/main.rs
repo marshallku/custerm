@@ -146,9 +146,7 @@ fn run_rpc() {
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "[slack] FATAL config error — Socket Mode disabled until fixed: {e}"
-            );
+            eprintln!("[slack] FATAL config error — Socket Mode disabled until fixed: {e}");
             Config::minimal_with_error(e)
         }
     };
@@ -231,7 +229,14 @@ fn run_rpc() {
                 continue;
             }
         };
-        handle_frame(&frame, &writer_tx, &initialized, &stop_signal, &config, &store);
+        handle_frame(
+            &frame,
+            &writer_tx,
+            &initialized,
+            &stop_signal,
+            &config,
+            &store,
+        );
     }
 }
 
@@ -255,9 +260,7 @@ fn handle_frame(
                     tx,
                     id,
                     "protocol_mismatch",
-                    &format!(
-                        "slack plugin speaks protocol {PROTOCOL_VERSION}; got {proto:?}"
-                    ),
+                    &format!("slack plugin speaks protocol {PROTOCOL_VERSION}; got {proto:?}"),
                 );
                 return;
             }
@@ -341,10 +344,7 @@ fn handle_action(
         // which is the round-2 cross-review concern.
         let resolved = socket_mode::current_credentials(config, &**store);
         let stored = store.load();
-        let credentials_source = resolved
-            .as_ref()
-            .map(|c| c.source)
-            .unwrap_or("none");
+        let credentials_source = resolved.as_ref().map(|c| c.source).unwrap_or("none");
         let authenticated = resolved.is_some();
         // Identity (team_id, user_id) only meaningful when the live
         // source is the store — that's the only path where we
@@ -399,13 +399,10 @@ fn handle_post_message(
         "no Slack credentials available — run `turm-plugin-slack auth` or set env tokens"
             .to_string(),
     ))?;
-    let channel = params
-        .get("channel")
-        .and_then(Value::as_str)
-        .ok_or((
-            "invalid_params".to_string(),
-            "missing 'channel' (string)".to_string(),
-        ))?;
+    let channel = params.get("channel").and_then(Value::as_str).ok_or((
+        "invalid_params".to_string(),
+        "missing 'channel' (string)".to_string(),
+    ))?;
     let text = params.get("text").and_then(Value::as_str).ok_or((
         "invalid_params".to_string(),
         "missing 'text' (string)".to_string(),

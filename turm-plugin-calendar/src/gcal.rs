@@ -143,7 +143,10 @@ impl Client {
 
     fn get_raw(&self, url: &str) -> Result<Value, GcalError> {
         let resp = match ureq::get(url)
-            .set("Authorization", &format!("Bearer {}", self.tokens.access_token))
+            .set(
+                "Authorization",
+                &format!("Bearer {}", self.tokens.access_token),
+            )
             .set("Accept", "application/json")
             .timeout(std::time::Duration::from_secs(15))
             .call()
@@ -206,7 +209,10 @@ mod tests {
     #[test]
     fn urlencode_escapes_reserved_and_unicode() {
         assert_eq!(urlencode(":+ "), "%3A%2B%20");
-        assert_eq!(urlencode("2026-04-26T10:00:00+09:00"), "2026-04-26T10%3A00%3A00%2B09%3A00");
+        assert_eq!(
+            urlencode("2026-04-26T10:00:00+09:00"),
+            "2026-04-26T10%3A00%3A00%2B09%3A00"
+        );
         // Non-ASCII byte sequences encode each byte.
         assert_eq!(urlencode("é"), "%C3%A9");
     }

@@ -35,7 +35,6 @@ pub(crate) fn normalize_osc7_uri(uri: &str) -> String {
     }
 }
 
-
 const DEFAULT_FONT_SCALE: f64 = 1.0;
 const FONT_SCALE_STEP: f64 = 0.1;
 const MIN_FONT_SCALE: f64 = 0.3;

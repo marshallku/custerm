@@ -158,7 +158,10 @@ fn parse_event_time(node: &Value) -> Option<(DateTime<Utc>, bool)> {
 
 fn parse_attendee(node: &Value) -> Option<Attendee> {
     Some(Attendee {
-        email: node.get("email").and_then(Value::as_str).map(str::to_string),
+        email: node
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         name: node
             .get("displayName")
             .and_then(Value::as_str)
@@ -176,7 +179,10 @@ fn parse_attendee(node: &Value) -> Option<Attendee> {
 }
 
 fn parse_person(node: &Value) -> Option<Person> {
-    let email = node.get("email").and_then(Value::as_str).map(str::to_string);
+    let email = node
+        .get("email")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let name = node
         .get("displayName")
         .and_then(Value::as_str)

@@ -92,8 +92,7 @@ pub fn parse(src: &str) -> Result<Expr, String> {
     if p.pos < p.tokens.len() {
         return Err(format!(
             "unexpected trailing input at position {}: {:?}",
-            p.pos,
-            p.tokens[p.pos]
+            p.pos, p.tokens[p.pos]
         ));
     }
     Ok(expr)
@@ -122,16 +121,16 @@ enum Token {
     True,
     False,
     Null,
-    Eq,    // ==
-    Neq,   // !=
-    Lt,    // <
-    Le,    // <=
-    Gt,    // >
-    Ge,    // >=
-    And,   // &&
-    Or,    // ||
-    Not,   // !
-    Dot,   // .
+    Eq,  // ==
+    Neq, // !=
+    Lt,  // <
+    Le,  // <=
+    Gt,  // >
+    Ge,  // >=
+    And, // &&
+    Or,  // ||
+    Not, // !
+    Dot, // .
     LParen,
     RParen,
 }
@@ -216,8 +215,8 @@ fn lex(src: &str) -> Result<Vec<Token>, String> {
                 i += consumed;
             }
             b'-' | b'0'..=b'9' => {
-                let (n, consumed) = lex_number(&bytes[i..])
-                    .map_err(|e| format!("number at position {i}: {e}"))?;
+                let (n, consumed) =
+                    lex_number(&bytes[i..]).map_err(|e| format!("number at position {i}: {e}"))?;
                 tokens.push(Token::Num(n));
                 i += consumed;
             }
@@ -231,7 +230,12 @@ fn lex(src: &str) -> Result<Vec<Token>, String> {
                 });
                 i += consumed;
             }
-            _ => return Err(format!("unexpected character `{}` at position {i}", c as char)),
+            _ => {
+                return Err(format!(
+                    "unexpected character `{}` at position {i}",
+                    c as char
+                ));
+            }
         }
     }
     Ok(tokens)
@@ -288,7 +292,9 @@ fn lex_number(bytes: &[u8]) -> Result<(f64, usize), String> {
         return Err("no digits".into());
     }
     let s = std::str::from_utf8(&bytes[..i]).map_err(|e| e.to_string())?;
-    let n: f64 = s.parse().map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    let n: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     Ok((n, i))
 }
 
@@ -405,9 +411,7 @@ impl Parser {
                     match self.bump() {
                         Some(Token::Ident(s)) => path.push(s),
                         other => {
-                            return Err(format!(
-                                "expected identifier after `.`, got {other:?}"
-                            ));
+                            return Err(format!("expected identifier after `.`, got {other:?}"));
                         }
                     }
                 }
@@ -499,7 +503,9 @@ fn resolve_ref(path: &[String], event: &Event, context: Option<&Context>) -> Val
             cur.clone()
         }
         "context" => {
-            let Some(ctx) = context else { return Value::Null };
+            let Some(ctx) = context else {
+                return Value::Null;
+            };
             // We keep the surface narrow — only the existing
             // `{context.X}` interpolation fields are supported.
             // Nesting is not — `context.active_panel.something`
@@ -530,12 +536,10 @@ fn eval_cmp(op: CmpOp, lhs: &Value, rhs: &Value) -> Result<bool, String> {
         CmpOp::Eq => Ok(values_eq(lhs, rhs)),
         CmpOp::Neq => Ok(!values_eq(lhs, rhs)),
         CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
-            let ln = as_f64(lhs).ok_or_else(|| {
-                format!("ordering op requires numeric operands, got lhs={lhs}")
-            })?;
-            let rn = as_f64(rhs).ok_or_else(|| {
-                format!("ordering op requires numeric operands, got rhs={rhs}")
-            })?;
+            let ln = as_f64(lhs)
+                .ok_or_else(|| format!("ordering op requires numeric operands, got lhs={lhs}"))?;
+            let rn = as_f64(rhs)
+                .ok_or_else(|| format!("ordering op requires numeric operands, got rhs={rhs}"))?;
             Ok(match op {
                 CmpOp::Lt => ln < rn,
                 CmpOp::Le => ln <= rn,
@@ -798,27 +802,34 @@ mod tests {
 
     #[test]
     fn combined_skip_declined_and_skip_1on1() {
-        let cond = r#"event.my_response_status != "declined" && event.recurring_id != "weekly-1on1""#;
+        let cond =
+            r#"event.my_response_status != "declined" && event.recurring_id != "weekly-1on1""#;
         // accepted, not 1on1 → fire
-        assert!(p_eval(
-            cond,
-            &evt(json!({"my_response_status": "accepted", "recurring_id": "team-sync"})),
-            None
-        )
-        .unwrap());
+        assert!(
+            p_eval(
+                cond,
+                &evt(json!({"my_response_status": "accepted", "recurring_id": "team-sync"})),
+                None
+            )
+            .unwrap()
+        );
         // declined, not 1on1 → skip
-        assert!(!p_eval(
-            cond,
-            &evt(json!({"my_response_status": "declined", "recurring_id": "team-sync"})),
-            None
-        )
-        .unwrap());
+        assert!(
+            !p_eval(
+                cond,
+                &evt(json!({"my_response_status": "declined", "recurring_id": "team-sync"})),
+                None
+            )
+            .unwrap()
+        );
         // accepted, IS 1on1 → skip
-        assert!(!p_eval(
-            cond,
-            &evt(json!({"my_response_status": "accepted", "recurring_id": "weekly-1on1"})),
-            None
-        )
-        .unwrap());
+        assert!(
+            !p_eval(
+                cond,
+                &evt(json!({"my_response_status": "accepted", "recurring_id": "weekly-1on1"})),
+                None
+            )
+            .unwrap()
+        );
     }
 }

@@ -121,13 +121,7 @@ impl Poller {
         // at `now + 5m` with a 10m lead would never enter the
         // returned set (timeMin defaults to now), and the catchup
         // logic in should_fire couldn't see it.
-        let max_lead = self
-            .config
-            .lead_minutes
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
+        let max_lead = self.config.lead_minutes.iter().copied().max().unwrap_or(0);
         let lookback = chrono::Duration::minutes(max_lead as i64);
         let max = now + chrono::Duration::hours(self.config.lookahead_hours as i64);
         let events = client.list_events(now - lookback, max)?;
@@ -153,12 +147,7 @@ impl Poller {
     /// useful reminder. The dedupe set enforces exactly-once across
     /// the consecutive ticks where `now` sits inside the firing
     /// band.
-    fn should_fire(
-        &self,
-        event: &CalendarEvent,
-        lead_minutes: u32,
-        now: DateTime<Utc>,
-    ) -> bool {
+    fn should_fire(&self, event: &CalendarEvent, lead_minutes: u32, now: DateTime<Utc>) -> bool {
         let lead = chrono::Duration::minutes(lead_minutes as i64);
         let firing_time = event.start_time - lead;
         if now < firing_time {
@@ -169,8 +158,7 @@ impl Poller {
         }
         let poll = chrono::Duration::from_std(self.config.poll_interval)
             .unwrap_or(chrono::Duration::seconds(60));
-        let catchup_end = firing_time
-            + std::cmp::max(poll * 2, chrono::Duration::seconds(120));
+        let catchup_end = firing_time + std::cmp::max(poll * 2, chrono::Duration::seconds(120));
         if now > catchup_end {
             return false; // stale — firing_time was too long ago for this reminder to be useful
         }
@@ -315,10 +303,7 @@ mod tests {
         // before event start. Must fire.
         let p = mk_poller(vec![10], 60);
         let now = Utc.with_ymd_and_hms(2026, 4, 26, 9, 50, 30).unwrap();
-        let evt = fake_event(
-            "e1",
-            Utc.with_ymd_and_hms(2026, 4, 26, 10, 0, 0).unwrap(),
-        );
+        let evt = fake_event("e1", Utc.with_ymd_and_hms(2026, 4, 26, 10, 0, 0).unwrap());
         assert!(p.should_fire(&evt, 10, now));
     }
 

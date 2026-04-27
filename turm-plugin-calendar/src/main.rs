@@ -183,9 +183,7 @@ fn handle_frame(
                     tx,
                     id,
                     "protocol_mismatch",
-                    &format!(
-                        "calendar plugin speaks protocol {PROTOCOL_VERSION}; got {proto:?}"
-                    ),
+                    &format!("calendar plugin speaks protocol {PROTOCOL_VERSION}; got {proto:?}"),
                 );
                 return;
             }
@@ -307,9 +305,10 @@ fn parse_lookahead_param(params: &Value, default: u64) -> Result<u64, (String, S
     let Some(v) = params.get("lookahead_hours") else {
         return Ok(default);
     };
-    let n = v
-        .as_u64()
-        .ok_or(("invalid_params".to_string(), "lookahead_hours must be a positive integer".to_string()))?;
+    let n = v.as_u64().ok_or((
+        "invalid_params".to_string(),
+        "lookahead_hours must be a positive integer".to_string(),
+    ))?;
     if n == 0 {
         return Err((
             "invalid_params".to_string(),
@@ -367,9 +366,13 @@ mod tests {
     #[test]
     fn auth_status_reports_not_configured_when_env_missing() {
         let store = minimal_arc();
-        let result =
-            handle_action("calendar.auth_status", &Value::Null, &Config::minimal(), &store)
-                .unwrap();
+        let result = handle_action(
+            "calendar.auth_status",
+            &Value::Null,
+            &Config::minimal(),
+            &store,
+        )
+        .unwrap();
         assert_eq!(result["configured"], false);
         assert_eq!(result["authenticated"], false);
     }

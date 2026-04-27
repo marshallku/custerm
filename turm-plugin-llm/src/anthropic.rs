@@ -61,8 +61,8 @@ pub fn complete(
     req: &CompleteRequest<'_>,
     http_timeout: Duration,
 ) -> Result<CompleteResponse, String> {
-    let body = serde_json::to_string(req)
-        .map_err(|e| format!("complete request serialize: {e}"))?;
+    let body =
+        serde_json::to_string(req).map_err(|e| format!("complete request serialize: {e}"))?;
     let resp = match ureq::post(MESSAGES_URL)
         .set("x-api-key", api_key)
         .set("anthropic-version", ANTHROPIC_VERSION)
@@ -91,7 +91,10 @@ pub fn complete(
         }
         Err(e) => return Err(format!("messages transport: {e}")),
     };
-    parse_response(resp.into_json::<Value>().map_err(|e| format!("messages parse: {e}"))?)
+    parse_response(
+        resp.into_json::<Value>()
+            .map_err(|e| format!("messages parse: {e}"))?,
+    )
 }
 
 fn parse_response(body: Value) -> Result<CompleteResponse, String> {

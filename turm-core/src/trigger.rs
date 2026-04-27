@@ -251,7 +251,9 @@ where
     }
     let mut result = Vec::new();
     for p in &set {
-        let covered = set.iter().any(|other| other != p && pattern_covers(other, p));
+        let covered = set
+            .iter()
+            .any(|other| other != p && pattern_covers(other, p));
         if !covered {
             result.push(p.clone());
         }
@@ -421,7 +423,10 @@ mod tests {
             params: Value::Null,
             condition: None,
         };
-        assert!(t.matches(&evt("slack.mention", json!({"channel": "alerts", "text": "hi"}))));
+        assert!(t.matches(&evt(
+            "slack.mention",
+            json!({"channel": "alerts", "text": "hi"})
+        )));
         assert!(!t.matches(&evt("slack.mention", json!({"channel": "general"}))));
         assert!(!t.matches(&evt("slack.mention", json!({})))); // missing field
     }
@@ -442,7 +447,10 @@ mod tests {
             condition: None,
         };
         let result = t.interpolate(
-            &evt("calendar.event_imminent", json!({"id": "abc", "source": "x"})),
+            &evt(
+                "calendar.event_imminent",
+                json!({"id": "abc", "source": "x"}),
+            ),
             None,
         );
         // event.source resolves from payload (we publish "test" as source but
@@ -828,8 +836,7 @@ mod tests {
 
     #[test]
     fn covering_keeps_disjoint_patterns() {
-        let mut out =
-            covering_patterns(vec!["panel.*", "calendar.*", "terminal.cwd_changed"]);
+        let mut out = covering_patterns(vec!["panel.*", "calendar.*", "terminal.cwd_changed"]);
         out.sort();
         assert_eq!(
             out,

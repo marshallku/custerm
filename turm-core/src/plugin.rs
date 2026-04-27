@@ -93,7 +93,10 @@ pub struct PluginServiceDef {
     pub args: Vec<String>,
     /// When the supervisor should spawn the process. Parsed from a string
     /// like `"onStartup"`, `"onAction:kb.*"`, `"onEvent:slack.*"`.
-    #[serde(default = "default_activation", deserialize_with = "deserialize_activation")]
+    #[serde(
+        default = "default_activation",
+        deserialize_with = "deserialize_activation"
+    )]
     pub activation: Activation,
     /// Restart behavior for unexpected exits. Defaults to `on-crash`.
     #[serde(default = "default_restart", deserialize_with = "deserialize_restart")]
@@ -237,7 +240,10 @@ mod tests {
 
     #[test]
     fn parse_activation_onstartup() {
-        assert_eq!(parse_activation("onStartup").unwrap(), Activation::OnStartup);
+        assert_eq!(
+            parse_activation("onStartup").unwrap(),
+            Activation::OnStartup
+        );
     }
 
     #[test]
