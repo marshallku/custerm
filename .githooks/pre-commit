@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Auto-format Rust files that are staged for commit, then re-stage them.
+# If formatting fails (syntax error), abort.
+#
+# Implementation note: rustfmt runs on the WORKING-TREE copy, not the staged
+# snapshot. If a file is partially staged (git add -p), unstaged edits in
+# that same file will be pulled into the commit. Acceptable for the common
+# "stage whole file -> commit" workflow used here; bypass with --no-verify
+# for partial-stage workflows.
+#
+# Uses rustfmt directly (not `cargo fmt --all`) so new files not yet wired
+# into the module tree still get formatted.
+
+set -euo pipefail
+
+mapfile -t staged_rs < <(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
+
+if [ ${#staged_rs[@]} -eq 0 ]; then
+    exit 0
+fi
+
+if ! command -v rustfmt >/dev/null 2>&1; then
+    echo "pre-commit: rustfmt not found in PATH; skipping fmt." >&2
+    exit 0
+fi
+
+# Workspace uses edition 2024 (see Cargo.toml).
+if ! rustfmt --edition 2024 --quiet "${staged_rs[@]}"; then
+    echo "pre-commit: rustfmt failed (syntax error?). Fix and retry." >&2
+    exit 1
+fi
+
+# Re-stage only the files that were already staged.
+for file in "${staged_rs[@]}"; do
+    [ -f "$file" ] && git add -- "$file"
+done

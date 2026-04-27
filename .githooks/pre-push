@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Block push when clippy reports warnings. Stricter than CI's clippy step
+# (adds --all-targets so tests/examples/benches are linted too). Does NOT
+# duplicate CI's fmt-check/test/build steps — those can still fail in CI.
+
+set -euo pipefail
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-push: cargo not found in PATH; skipping clippy." >&2
+    exit 0
+fi
+
+echo "pre-push: running cargo clippy --workspace --all-targets -- -D warnings" >&2
+
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    echo "" >&2
+    echo "pre-push: clippy failed. Fix the warnings above before pushing." >&2
+    echo "          (bypass with 'git push --no-verify' if you really must.)" >&2
+    exit 1
+fi

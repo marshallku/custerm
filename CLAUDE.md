@@ -34,6 +34,17 @@ cargo run -p turm-linux
 cargo run -p turm-cli -- <command>
 ```
 
+## Git Hooks
+
+After cloning, enable the repo-tracked hooks once:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+- `pre-commit` — runs `rustfmt --edition 2024` on the working-tree copy of every staged `.rs` file and re-stages each one. Aborts on syntax errors. Caveat: this does not honor partial staging — if you used `git add -p` on a `.rs` file, the formatted full file (including your unstaged edits) will be pulled into the commit. Stage the whole file or skip the hook (`git commit --no-verify`) for partial-stage workflows.
+- `pre-push` — runs `cargo clippy --workspace --all-targets -- -D warnings`; blocks push on warnings. Stricter than CI's clippy step (CI omits `--all-targets`), but does **not** run CI's `fmt-check`/`test`/`build` steps — those can still fail in CI.
+
 ## Key Conventions
 
 - Rust edition 2024, Cargo workspace with `resolver = "2"`
