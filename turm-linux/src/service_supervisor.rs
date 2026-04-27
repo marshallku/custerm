@@ -575,43 +575,33 @@ impl ServiceSupervisor {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Linux: ask the kernel to send SIGTERM to the plugin when its
-        // parent (turm) dies for ANY reason — including SIGKILL,
-        // segfault, or a panic before our `connect_destroy →
-        // shutdown_all` callback can fire.
+        // Phase 9.5 originally armed `PR_SET_PDEATHSIG` here so a
+        // turm crash (SIGKILL / segfault / unrecoverable panic
+        // before `connect_destroy → shutdown_all` can fire) would
+        // also reap every supervised plugin. Removed at Phase
+        // 18.x because of a Linux quirk that's well-documented
+        // but easy to miss: the kernel signal fires when the
+        // **THREAD** that called fork() exits, not when the
+        // parent process exits. `spawn_service_async` runs each
+        // spawn on a fresh worker thread that returns as soon as
+        // `start_service` finishes — so every onStartup plugin
+        // received SIGTERM moments after init succeeded, looped
+        // through the supervisor's restart=on-crash policy, and
+        // crash-looped indefinitely.
         //
-        // Race window: between fork() and the child's prctl() call,
-        // the parent can die without PDEATHSIG armed yet — kernel
-        // reparents the orphan to init and no signal ever arrives.
-        // Standard fix: capture `getppid()` BEFORE arming the
-        // signal, arm it, then re-check `getppid()`. If the parent
-        // pid has already changed (we got reparented to init), the
-        // race fired — exit immediately rather than running an
-        // orphaned plugin that will never receive its death notice.
+        // Acceptable trade-off without it: on turm SIGKILL /
+        // segfault, plugin children become init-reparented orphans
+        // until `shutdown_all` fires (normal exit) or the user
+        // notices stray turm-plugin-* processes. For our threat
+        // model (single-user desktop, infrequent crashes), this is
+        // strictly better than the working-but-broken pdeathsig
+        // race.
         //
-        // Best-effort: prctl failures (older kernel / locked-down
-        // sandbox) are silently ignored, because the worst case is
-        // the pre-fix orphan-on-crash behavior — never fail the
-        // spawn over a missing supervisor safety net.
-        #[cfg(target_os = "linux")]
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
-                let original_ppid = libc::getppid();
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                    // Couldn't set the parent-death signal — let the
-                    // plugin start; just won't auto-die on turm crash.
-                    return Ok(());
-                }
-                // Closes the fork→prctl race: if the parent was
-                // alive at fork() but died before we armed the
-                // signal, getppid() now returns 1 (init).
-                if libc::getppid() != original_ppid {
-                    libc::_exit(1);
-                }
-                Ok(())
-            });
-        }
+        // To re-introduce crash-safe child reaping cleanly: spawn
+        // every plugin from a dedicated long-lived "spawner"
+        // thread that never exits, OR use a `pidfd_open` /
+        // self-pipe pattern instead of pdeathsig. Tracked as
+        // a follow-up on the supervisor.
         let mut child = cmd.spawn().map_err(|e| ResponseError {
             code: "spawn_failed".into(),
             message: format!(

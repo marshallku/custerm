@@ -29,8 +29,20 @@ pub fn run() {
         // subprocesses orphaned to init. Handle SIGTERM and SIGINT
         // by closing all windows — that fires connect_destroy →
         // ServiceSupervisor::shutdown_all() through the existing
-        // graceful path. PR_SET_PDEATHSIG covers the SIGKILL /
-        // segfault case where we never get a chance to run user code.
+        // graceful path.
+        //
+        // Caveat: the SIGKILL / segfault case is NOT covered. We
+        // originally armed `PR_SET_PDEATHSIG(SIGTERM)` in each
+        // plugin's spawn `pre_exec` to reap orphans on
+        // unrecoverable parent crashes, but the kernel signal
+        // fires on fork-thread exit (not parent-process exit), so
+        // every plugin spawned from `spawn_service_async`'s
+        // worker thread received SIGTERM moments after init
+        // succeeded. The pdeathsig path was removed; on
+        // unrecoverable turm crash, plugin children become
+        // init-reparented orphans. See `service_supervisor.rs`
+        // for the path back to crash-safe reaping (long-lived
+        // spawner thread or `pidfd_open`).
         let signal_app = app.downgrade();
         glib::unix_signal_add_local(libc::SIGTERM, move || {
             if let Some(app) = signal_app.upgrade() {
