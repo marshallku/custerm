@@ -8,7 +8,7 @@ Concretely the user wants flows like:
 
 1. **Calendar event imminent** → KB note auto-created with title / start / location interpolated into the frontmatter; the calendar event payload also exposes `event.attendees`, `event.description`, `event.recurring_id`, etc. for users who want a richer template. *(Building blocks shipped — Phase 9.3 KB plugin + Phase 10.1 Calendar plugin; example trigger config at `examples/plugins/calendar/triggers.example.toml`.)*
 2. **Slack mention/DM** → archived to KB with full fidelity, optionally summarized via LLM. *(Archive shipped — Phase 11.2; LLM-summarize step blocked on chained-trigger work — Phase 14.)*
-3. **Todo with `start` action** → optional Slack message asking for context → wait for reply containing Jira ticket # → branch created in the matching git workspace using the Jira id as the branch name → Claude Code spawned in the new branch with context. *(Not yet expressible — needs Phases 14–18. Branch naming happens once at creation; no rename step needed.)*
+3. **Todo with `start` action** → optional Slack message asking for context → wait for reply containing Jira ticket # → **git worktree** created (`~/dev/<workspace>-worktrees/<jira-id>/`) → tmux session opened in the worktree path (attach-or-create so it persists across turm restarts) → Claude Code spawned **inside the tmux session with a pre-filled prompt** built from the Todo body + Jira summary + linked KB notes. Worktree (not plain branch) so the original repo stays clean and the user can have parallel branches concurrently in different turm tabs. *(Not yet expressible — needs Phases 15.1, 17, 18, 16, 14.1, 15.2, 14.2 in that order — see "Recommended execution order" below.)*
 4. **Jira ticket assigned** → Todo auto-created, frontmatter `linked_jira` populated with the ticket key. *(Not yet expressible — needs Phases 15 + 16. Cross-linking back to related Slack threads is a future enhancement that depends on Phase 11.3's derived ingestion landing first.)*
 
 Flows 1–2 are end-to-end working today (with the LLM step in 2 deferred). Flows 3–4 require composite/chained workflows + Todo + Jira + git plugins, all currently missing — see Phases 14–18.
@@ -311,9 +311,26 @@ Plugin-first foundation. See [service-plugins.md](./service-plugins.md) for full
 
 - [ ] SQLite FTS5 sidecar index, fs-watcher rebuild — KB plugin internal change only, protocol unchanged
 
-### Phase 14: Composite / chained workflow primitive 🎯 next
+### Recommended execution order (Phases 14–18)
 
-The biggest unresolved architectural item. Currently the trigger engine is `event → 1 action → done` — every multi-step flow the vision describes ("Todo start → branch → Slack ask → wait for reply → Jira lookup → Claude Code spawn") collapses against this. It's the same root cause as: Phase 11.3's deferred derived markdown ingestion, Phase 12.1's "trigger-fired `llm.complete` result is discarded", and the long-deferred Open Question at the end of [service-plugins.md](./service-plugins.md). Resolving this unblocks every other phase below.
+The phase numbers below reflect topical organization. Inter-system connectivity analysis (which phase actually unblocks which user flow) shows that **most new plugins are useful as single-action triggers without Phase 14** — `calendar → todo`, `jira.ticket_assigned → todo`, `git.list_worktrees`, `claude.start` all work today's trigger engine just fine. Only the multi-step flows (todo.start → worktree → claude, slack → llm summary → kb) need composite chaining.
+
+So Phase 14 lands AFTER its real consumers exist:
+
+1. **Phase 15.1 — Todo plugin basics (UI panel, `todo.create` / `list`)**. Daily-use surface, single-action triggers cover `calendar → todo` and `jira.ticket_assigned → todo` (when 16 ships). Highest user-visible impact for first-shippable phase. ETA: ~3 days.
+2. **Phase 17 — Git worktree plugin** (lightweight, no external API). Single-action `git.worktree_add` already useful via `turmctl call`. ETA: ~1-2 days.
+3. **Phase 18 — `claude.start` + tmux session integration**. Tiny — wraps `tab.new` + `tmux new-session -A` + `claude`. Manual invocation works without 14.
+4. **Phase 16 — Jira plugin** (Slack pattern reused). Single-action `jira.ticket_assigned → todo.create` flow lands.
+5. **Phase 14.1 — chained `<action>.completed` events**. By this point we have 4 concrete consumers (Todo / Git / Claude / Jira) so the chained-trigger primitive is informed by real composition needs, not abstract sketches.
+6. **Phase 15.2 — Todo `start` workflow chain**. `todo.start_requested → git.worktree_add.completed → claude.start` end-to-end demo of Flow G from the Vision section.
+7. **Phase 14.2 — async correlation primitive** (Slack ask → wait for reply with Jira id). Enables Flow H.
+8. **Backfill** — Phase 11.3 derived slack markdown, Phase 12.3 LLM ingestion, Phase 10's deferred meeting-note auto-open all unblock here.
+
+Throughout the sequence each step ships visible value; Phase 14 design lands with concrete consumers ready to dogfood it.
+
+### Phase 14: Composite / chained workflow primitive
+
+The biggest architectural item — but **scheduled mid-stream, not first** (see "Recommended execution order" above). Currently the trigger engine is `event → 1 action → done`. Multi-step flows from the Vision section ("Todo start → worktree → tmux → Claude") collapse against this. Same root cause as Phase 11.3's deferred derived markdown ingestion, Phase 12.1's discarded trigger-fired `llm.complete` results, and Phase 10's deferred meeting-note auto-open. Resolving this unblocks all derived workflows.
 
 **14.1 — design decision** ([service-plugins.md](./service-plugins.md) Open Q reopened)
 
@@ -338,13 +355,15 @@ Recommendation: **(a) primary + selective (b) for hand-rolled wrappers** when th
 
 ### Phase 15: Todo system
 
-User explicit requirement. Todos are first-class workflow entry points (Todo `start` action drives branch-creation flow in Phase 17/18) and need a UI panel (turm already has `PanelVariant`).
+User explicit requirement. Todos are first-class workflow entry points (Todo `start` action drives the worktree+tmux+Claude flow in 17/18) AND a daily-use UI surface (turm already has `PanelVariant`).
 
 **Packaging**: standalone `turm-plugin-todo` plugin (its own manifest, its own actions, its own UI panel). The plugin SHARES the markdown-with-frontmatter file format with the KB plugin's filesystem layout — todos under `~/docs/todos/...` are just KB documents with a known schema — but the actions, the file-watcher, and the UI all live in `turm-plugin-todo` for clean separation. KB plugin keeps its current surface unchanged. This is what makes `turmctl plugin open todo` (standard `plugin.open` activation surface) work.
 
-**15.1 — file format**
+**Phase 15 ships in two slices**, with Phase 14.1 (chained triggers) sandwiched between them. **Phase 15.1** is the basics + UI (single-action triggers, usable today with current engine). **Phase 15.2** is the composite "start" workflow chain (depends on Phase 14.1). The slice-1 subsections below are bullet-organized rather than numbered to keep the slice numbering unambiguous.
 
-- [ ] Markdown checkbox files at `~/docs/todos/<workspace>/<id>.md` with frontmatter:
+**Phase 15.1 — Todo basics + UI** (slice 1, current trigger engine):
+
+- **File format** — Markdown checkbox files at `~/docs/todos/<workspace>/<id>.md` with frontmatter:
   ```yaml
   ---
   id: T-123
@@ -356,33 +375,30 @@ User explicit requirement. Todos are first-class workflow entry points (Todo `st
   linked_jira: PROJ-456
   linked_slack:
     - { team: T0, channel: D123, ts: 1700.000 }
+  linked_kb:
+    - meetings/abc.md
+    - threads/q2-roadmap.md
   tags: [feature, api]
   ---
   body markdown with `- [ ]` subtasks
   ```
-- [ ] `turm-plugin-todo` file-watcher: on changes under `~/docs/todos/`, parse frontmatter and emit `todo.created` / `todo.changed` / `todo.completed` / `todo.deleted` events with the parsed payload. The file is the source of truth — vim-edit + git-version compatible.
-- [ ] Existing `kb.search` (KB plugin) works on todo files with no extension needed (frontmatter `tags:` filterable via search-in-text); `turm-plugin-todo` doesn't reimplement search.
+- **File-watcher events** — `turm-plugin-todo` parses frontmatter on changes under `~/docs/todos/` and emits `todo.created` / `todo.changed` / `todo.completed` / `todo.deleted`. File is source of truth — vim-edit + git-version compatible.
+- **Search delegation** — `kb.search` works on todo files unchanged (frontmatter `tags:` filterable via search-in-text); `turm-plugin-todo` doesn't reimplement search.
+- **Actions** — `todo.create {workspace, title, body?, priority?, due?, linked_jira?, linked_slack?, linked_kb?}` (returns `{id, path}`, internally `kb.ensure`); `todo.set_status {id, status}` (read-modify-write of frontmatter `status` field; atomicity via full-file rewrite + `renameat2(RENAME_EXCHANGE)` OR a Phase 9 extension `kb.replace` — decision at impl time); `todo.list {status?, workspace?, due_before?, tag?}`; `todo.start {id}` (emits `todo.start_requested` with full payload for slice-2 chained triggers).
+- **UI panel** — Plugin Panel route (HTML/JS via existing `plugin_panel.rs`). `panel.html` lists todos via `turm.call("todo.list")`, renders markdown, exposes click-to-trigger-action. Native GTK fallback if WebView UX proves insufficient. Default activation through the existing `plugin.open` action (`turmctl plugin open todo`); keybinding configurable via `[keybindings]` since `Ctrl+Shift+T` is already "new tab" — `Ctrl+Shift+K` (checklist) or `Ctrl+Shift+G` (agenda) are candidates.
+- **Initial single-action example triggers** (work with current engine, no Phase 14 needed):
+  - `calendar.event_imminent` → `todo.create` for prep tasks (with link back to event id)
+  - `slack.mention` matching specific patterns (e.g. text contains "todo:") → `todo.create`
+  - `jira.ticket_assigned` (Phase 16) → `todo.create` linked to the ticket
 
-**15.2 — actions** (registered by `turm-plugin-todo`)
+**Phase 15.2 — composite "start" workflow chain** (slice 2, depends on Phase 14.1):
 
-- [ ] `todo.create {workspace, title, body?, priority?, due?, linked_jira?, linked_slack?}` → returns `{id, path}`. Internally calls `kb.ensure` (cross-plugin) with the rendered template.
-- [ ] `todo.set_status {id, status}` — read-modify-write of the frontmatter `status` field. Implementation owned by `turm-plugin-todo`'s file I/O (single-syscall O_APPEND won't work here — need a full rewrite of the file with `renameat2(RENAME_EXCHANGE)` for atomicity, OR add a `kb.replace` action in a Phase 9 extension. Decision deferred to Phase 15 implementation.)
-- [ ] `todo.list {status?, workspace?, due_before?, tag?}` — file-system walk over `~/docs/todos/` parsing frontmatter; or delegates to `kb.search` for the text filter. Pick at impl time.
-- [ ] `todo.start {id}` — convenience action that emits `todo.start_requested` event with full todo payload, intended for Phase 14 chained triggers to pick up (branch creation, Claude spawn).
-
-**15.3 — UI panel** (turm-linux side, uses existing `PanelVariant` infra)
-
-Two implementation paths:
-- **(a) Plugin Panel (HTML/JS)** — same surface as the existing `plugin_panel.rs` WebView wrapper. Plugin ships a `panel.html` that lists todos via `turm.call("todo.list")`, renders markdown, exposes click-to-trigger-action UI. Cheaper to build (no GTK widget code), themeable, follows the existing webview-plugin pattern.
-- **(b) Native GTK widget** (new `TodoPanel` variant) — list view + inline actions. Heavier but native feel.
-
-Recommendation: **(a) first — Plugin Panel route**. Native widget can come if the WebView path proves insufficient. Default activation goes through the existing `plugin.open` action (`turmctl plugin open todo`); keybinding is configurable via `[keybindings]` since `Ctrl+Shift+T` is already "new tab" — pick a free chord (`Ctrl+Shift+K` checklist or `Ctrl+Shift+G` agenda are candidates) at implementation time.
-
-**15.4 — initial example triggers**
-
-- [ ] `calendar.event_imminent` → `todo.create` for prep tasks (with link back to event id)
-- [ ] `slack.mention` matching specific patterns (e.g. text contains "todo:") → `todo.create`
-- [ ] `jira.ticket_assigned` (Phase 16) → `todo.create` linked to the ticket
+- `todo.start_requested` (emitted by `todo.start` action in 15.1) chains via `<action>.completed` events:
+  1. `git.worktree_add {workspace, branch = linked_jira ? sanitize(linked_jira) : "todo-<id>"}` → emits `git.worktree_add.completed {path, branch}`
+  2. `claude.start {workspace_path = path, prompt = build_prompt(todo)}` — opens tmux session inside the worktree, starts claude with the pre-filled prompt.
+- **`build_prompt(todo)` composes**: the Todo title + body, the Jira summary fetched via `jira.get_ticket {key=linked_jira}` if present, and the contents of every file path in the Todo's `linked_kb` frontmatter array (read via `kb.read`). The fan-in step is also expressed as chained triggers — the prompt is built incrementally as each enrichment action's `.completed` event arrives. Phase 14.2 async correlation joins the original `todo.start_requested` payload with these later enrichments.
+- **Result**: clicking "start" on a Todo in the panel pops up a new turm tab with claude-code already running inside a tmux session in a fresh worktree, prompt pre-filled with the full context (Todo body + Jira summary + linked KB notes). This is Vision Flow 3 (the "killer demo") working end-to-end.
+- **Optional further chain** (also lands with Phase 14.2): if the Todo doesn't yet have `linked_jira`, post Slack message asking → wait for reply → extract Jira id → use it for the worktree branch name.
 
 ### Phase 16: Jira plugin
 
@@ -399,9 +415,9 @@ Same shape as Slack plugin — REST + auth + events + actions.
   - `jira.get_ticket {key}` — returns full ticket json
 - [ ] **Cross-plugin trigger example** (in `examples/plugins/jira/triggers.example.toml`): `jira.ticket_assigned` → `todo.create` with `linked_jira` field populated.
 
-### Phase 17: Git workspace plugin
+### Phase 17: Git workspace plugin (worktree-first)
 
-Lightweight — no external API, just local git operations. Could be built into core but lives as a plugin for uniformity (and so the `current_credentials` / supervisor patterns don't need an exception).
+Lightweight — no external API, just local git operations. **Worktrees, not plain branches**: keeps the original repo dir clean, supports concurrent parallel branches in different turm tabs (one tab per worktree), and `git worktree remove` cleanly tears them down when work is done. Branch-only workflows would force the user to stash/switch and lose the parallel-tabs property.
 
 - [ ] **Workspace concept**: configured via `~/.config/turm/workspaces.toml`:
   ```toml
@@ -409,29 +425,38 @@ Lightweight — no external API, just local git operations. Could be built into 
   name = "turm"
   path = "/home/marshall/dev/turm"
   default_base = "master"
+  worktree_root = "/home/marshall/dev/turm-worktrees"  # optional; default = "<path>-worktrees"
 
   [[workspace]]
   name = "site"
   path = "/home/marshall/dev/site"
   default_base = "main"
   ```
-- [ ] **Events** (file-watcher on `.git/HEAD` + `.git/refs/heads/`): `git.branch_created`, `git.branch_deleted`, `git.checkout`. Per-workspace event payload.
+- [ ] **Events** (file-watcher on `.git/HEAD`, `.git/refs/heads/`, `.git/worktrees/`): `git.worktree_created`, `git.worktree_removed`, `git.branch_created`, `git.branch_deleted`, `git.checkout`. Per-workspace event payload.
 - [ ] **Actions**:
-  - `git.list_workspaces` → returns names + paths + current branch each
-  - `git.checkout_new_branch {workspace, base?, name}` — runs `git -C <path> checkout -b <name> <base>`. Returns `{workspace, branch, sha}`.
+  - `git.list_workspaces` → `[{name, path, current_branch, worktree_count}, ...]`
+  - `git.list_worktrees {workspace}` → `[{path, branch, head_sha, locked, prunable}, ...]`
+  - `git.worktree_add {workspace, branch, base?}` → returns `{path, branch}`. Path is `<worktree_root>/<branch>` by default, sanitized for filesystem safety. Runs `git -C <path> worktree add <worktree_root>/<branch> -b <branch> <base>` (or `<base>` defaults to `default_base`).
+  - `git.worktree_remove {path}` → runs `git worktree remove <path>` (and `--force` if user explicitly requests). Refuses if the worktree has uncommitted changes unless `force=true`.
   - `git.current_branch {workspace}` → string
-  - `git.status {workspace}` → `{ahead, behind, dirty, staged, untracked}`
-- [ ] **Phase 14 composability test case**: `todo.start_requested` → `git.checkout_new_branch` (chain via `<action>.completed` event). Branch name derived from todo metadata (linked_jira if present, else `todo-<id>`).
+  - `git.status {workspace_or_worktree_path}` → `{ahead, behind, dirty, staged, untracked}`
+- [ ] **Branch name sanitization**: `linked_jira` like `PROJ-456` becomes `proj-456` (lowercase). Slashes from Jira hierarchies (`epic/PROJ-456`) become directory components in the worktree path so `git.worktree_add {branch="feat/PROJ-456"}` lands at `<worktree_root>/feat/PROJ-456/`.
+- [ ] **Phase 14 composability test case**: `todo.start_requested` → `git.worktree_add` (chain via `<action>.completed` event). Branch name derived from todo metadata (`linked_jira` if present, else `todo-<id>`).
 
-### Phase 18: Claude Code spawn integration
+### Phase 18: Claude Code spawn (with tmux session)
 
-Closes the loop: after a workflow stages a workspace + branch + context, drop the user into Claude Code.
+Closes the loop: after a workflow stages a worktree + context, drop the user into Claude Code **inside a tmux session** so the work persists across turm restarts and is reattachable from any terminal.
 
-- [ ] **Action `claude.start {workspace, prompt?, resume_session?}`**: opens a new turm tab in the workspace path, runs `claude` (or `claude --resume <session-id>`). If `prompt` is supplied, fed via initial input or a `claude --print "<prompt>"` invocation depending on what works best with claude-code's CLI surface.
-- [ ] Built on existing `tab.new` + `terminal.exec` primitives; new action is mostly a composition + working-dir handling. NO custom IPC with claude-code — the integration is just "spawn it in the right place with the right context."
-- [ ] **Phase 14 composability test case**: full end-to-end flow, all triggers in user's `[[triggers]]`:
-  1. `todo.start_requested` → `git.checkout_new_branch` → publishes `git.checkout_new_branch.completed`
-  2. `git.checkout_new_branch.completed` → `claude.start` with `prompt = "<todo title> + <linked_jira summary>"` (interpolated from prior step's payload via Phase 14's correlation primitive)
+- [ ] **Action `claude.start {workspace_path, prompt?, session_name?, resume_session?}`**:
+  1. Opens a new turm tab with `cwd = workspace_path`.
+  2. In that tab, runs `tmux new-session -A -s <session_name>` — `-A` attaches if a session with that name already exists, creates otherwise. Default `session_name` derived from the worktree path (last two components, sanitized) so re-running on the same worktree re-attaches the same tmux session instead of stacking new ones.
+  3. Inside the tmux session, runs `claude` (or `claude --resume <id>` if `resume_session` provided). Pre-filled `prompt` fed via stdin pipe (`echo <prompt> | claude`) or via `claude --print` — pick whichever the installed claude-code CLI supports cleanly at impl time.
+  4. Returns `{tab_id, tmux_session, worktree_path}` so the caller (Todo panel, trigger chain) can reference the spawned session later.
+- [ ] **Persistence wins from tmux**: detach the tab → kill turm → next turm restart → `claude.start` with the same `session_name` reattaches the running claude. Long-running tasks (refactors, multi-step reasoning) survive turm crashes and laptop reboots.
+- [ ] **Built on `tab.new` + `terminal.exec`** primitives. No custom IPC with claude-code — orchestration is "spawn it in the right place with the right context, let it run." If claude-code adds programmatic surfaces later (e.g. `claude --json-events`) that can land as a separate enhancement.
+- [ ] **Phase 14 composability test case**: full end-to-end Vision Flow 3, all triggers in user's `[[triggers]]`:
+  1. `todo.start_requested` → `git.worktree_add` → publishes `git.worktree_add.completed {path, branch}`
+  2. `git.worktree_add.completed` → `claude.start {workspace_path, prompt}` where prompt is interpolated from the original `todo.start_requested` payload (via Phase 14.2 async correlation that joins the chain's earlier event with the latest one).
 
 ## Pending Cleanup
 
