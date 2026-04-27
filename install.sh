@@ -5,9 +5,11 @@
 #
 # For LOCAL DEVELOPMENT iteration on the working tree, use
 # scripts/install-dev.sh instead — that one builds from source
-# AND keeps system + user binaries from drifting against each
-# other (a stale system binary silently shadowing a working-tree
-# fix is a real failure mode this script can't avoid).
+# AND warns (loudly, in stderr) when ~/.local/bin/turm and
+# /usr/local/bin/turm differ, so a stale system binary silently
+# shadowing a working-tree fix at least becomes visible. (It
+# can't auto-resolve the drift; remediation is one of the
+# documented sudo rm or overwrite options the warning prints.)
 #
 # Plugin binaries (turm-plugin-*) are NOT in the release tarball
 # yet; if you want plugins, install them separately via

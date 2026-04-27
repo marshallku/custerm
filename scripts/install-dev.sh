@@ -84,15 +84,21 @@ fi
 
 # Sanity: user might have BOTH ~/.local/bin/turm and
 # /usr/local/bin/turm. PATH typically prefers /usr/local/bin, so
-# if they're out of sync the user gets the wrong one. Warn loudly
-# when we detect a drift between the two so the next "why isn't
-# my fix applied?" debug session is shorter.
+# if they're out of sync the user gets the wrong one. We can't
+# auto-fix without making policy decisions about which copy to
+# trust, but we can flag the drift so the next "why isn't my fix
+# applied?" debug session is shorter. Concrete remedies the user
+# can pick from are listed in the warning.
 if [ -x "$HOME/.local/bin/turm" ] && [ -x "/usr/local/bin/turm" ]; then
     if ! cmp -s "$HOME/.local/bin/turm" "/usr/local/bin/turm"; then
         echo
         echo "warn: ~/.local/bin/turm and /usr/local/bin/turm differ." >&2
-        echo "warn: PATH lookup typically picks /usr/local/bin first; the user-local copy is shadowed." >&2
-        echo "warn: re-run with --user OR delete one to avoid silent version drift." >&2
+        echo "warn: PATH lookup typically picks /usr/local/bin first;" >&2
+        echo "warn: a desktop-entry-launched turm will use the system copy." >&2
+        echo "warn: to resolve, pick one of:" >&2
+        echo "warn:   - re-run WITHOUT --user (overwrites the system copy with the same build)" >&2
+        echo "warn:   - sudo rm /usr/local/bin/turm (let the user-local copy win)" >&2
+        echo "warn:   - sudo rm $HOME/.local/bin/turm (drop the user-local copy entirely)" >&2
         echo
     fi
 fi
