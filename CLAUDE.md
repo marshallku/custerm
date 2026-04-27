@@ -34,6 +34,17 @@ cargo run -p turm-linux
 cargo run -p turm-cli -- <command>
 ```
 
+## Install first-party plugins
+
+Plugins live in `examples/plugins/<name>/`; turm's runtime discovers them from `~/.config/turm/plugins/<name>/` at startup. After `cargo build --release --workspace`, run:
+
+```bash
+./scripts/install-plugins.sh           # all plugins with a manifest
+./scripts/install-plugins.sh todo git  # just these two
+```
+
+The script copies the manifest + assets and symlinks the built binary into the plugin dir. `<plugin_dir>/<exec>` takes precedence over `PATH`, which matters because turm is often launched from a desktop entry whose env doesn't include `~/.local/bin`. After installing, **restart turm** — `discover_plugins()` only runs at startup. Symptom of an outdated install: `service X is not running and X.action cannot trigger its activation (OnStartup)` from the supervisor.
+
 ## Git Hooks
 
 After cloning, enable the repo-tracked hooks once:
