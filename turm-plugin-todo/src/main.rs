@@ -254,15 +254,13 @@ fn handle_frame(
             // exits naturally when main returns.
             shutdown.store(true, Ordering::SeqCst);
         }
-        other if !other.is_empty() => {
-            if !id.is_empty() {
-                send_error(
-                    writer,
-                    id,
-                    "unknown_method",
-                    &format!("todo plugin: unknown method {other}"),
-                );
-            }
+        other if !other.is_empty() && !id.is_empty() => {
+            send_error(
+                writer,
+                id,
+                "unknown_method",
+                &format!("todo plugin: unknown method {other}"),
+            );
         }
         _ => {}
     }

@@ -297,15 +297,13 @@ fn handle_frame(
             stop_signal.store(true, Ordering::SeqCst);
             std::process::exit(0);
         }
-        other if !other.is_empty() => {
-            if !id.is_empty() {
-                send_error(
-                    tx,
-                    id,
-                    "unknown_method",
-                    &format!("slack plugin: unknown method {other}"),
-                );
-            }
+        other if !other.is_empty() && !id.is_empty() => {
+            send_error(
+                tx,
+                id,
+                "unknown_method",
+                &format!("slack plugin: unknown method {other}"),
+            );
         }
         _ => {}
     }

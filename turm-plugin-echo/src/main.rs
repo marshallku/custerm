@@ -160,17 +160,15 @@ fn handle_frame(value: &Value, tx: &Sender<String>, initialized: &AtomicBool) {
         "shutdown" => {
             std::process::exit(0);
         }
-        other if !other.is_empty() => {
-            // Unknown request: only reply if it had an id (otherwise
-            // it was a notification — quietly ignored).
-            if !id.is_empty() {
-                send_error(
-                    tx,
-                    id,
-                    "unknown_method",
-                    &format!("echo plugin: unknown method {other}"),
-                );
-            }
+        // Unknown request: only reply if it had an id (otherwise
+        // it was a notification — quietly ignored).
+        other if !other.is_empty() && !id.is_empty() => {
+            send_error(
+                tx,
+                id,
+                "unknown_method",
+                &format!("echo plugin: unknown method {other}"),
+            );
         }
         _ => {}
     }

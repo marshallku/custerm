@@ -1265,12 +1265,12 @@ fn handle_terminal_read(req: &Request, mgr: &Rc<TabManager>) -> Response {
             .params
             .get("end_row")
             .and_then(|v| v.as_i64())
-            .unwrap_or_else(|| term.terminal.row_count() as i64 - 1);
+            .unwrap_or_else(|| term.terminal.row_count() - 1);
         let end_col = req
             .params
             .get("end_col")
             .and_then(|v| v.as_i64())
-            .unwrap_or_else(|| term.terminal.column_count() as i64 - 1);
+            .unwrap_or_else(|| term.terminal.column_count() - 1);
         term.read_range(start_row, start_col, end_row, end_col)
     } else {
         term.read_screen()
@@ -1343,8 +1343,8 @@ fn handle_terminal_history(req: &Request, mgr: &Rc<TabManager>) -> Response {
         .and_then(|v| v.as_i64())
         .unwrap_or(100);
 
-    let row_count = term.terminal.row_count() as i64;
-    let col_count = term.terminal.column_count() as i64;
+    let row_count = term.terminal.row_count();
+    let col_count = term.terminal.column_count();
 
     // Negative rows access scrollback in VTE
     let start_row = -lines;
@@ -1378,7 +1378,7 @@ fn handle_terminal_context(req: &Request, mgr: &Rc<TabManager>) -> Response {
         .get("history_lines")
         .and_then(|v| v.as_i64())
         .unwrap_or(50);
-    let col_count = term.terminal.column_count() as i64;
+    let col_count = term.terminal.column_count();
     let history = term.read_range(-history_lines, 0, -1, col_count - 1);
 
     Response::success(

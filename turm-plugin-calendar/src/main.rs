@@ -217,15 +217,13 @@ fn handle_frame(
             // calendar plugin doesn't subscribe — quietly ignore.
         }
         "shutdown" => std::process::exit(0),
-        other if !other.is_empty() => {
-            if !id.is_empty() {
-                send_error(
-                    tx,
-                    id,
-                    "unknown_method",
-                    &format!("calendar plugin: unknown method {other}"),
-                );
-            }
+        other if !other.is_empty() && !id.is_empty() => {
+            send_error(
+                tx,
+                id,
+                "unknown_method",
+                &format!("calendar plugin: unknown method {other}"),
+            );
         }
         _ => {}
     }

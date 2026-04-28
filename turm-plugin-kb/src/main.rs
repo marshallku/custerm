@@ -127,15 +127,13 @@ fn handle_frame(kb: &Kb, frame: &Value, tx: &Sender<String>) {
         "shutdown" => {
             std::process::exit(0);
         }
-        other if !other.is_empty() => {
-            if !id.is_empty() {
-                send_error(
-                    tx,
-                    id,
-                    "unknown_method",
-                    &format!("kb plugin: unknown method {other}"),
-                );
-            }
+        other if !other.is_empty() && !id.is_empty() => {
+            send_error(
+                tx,
+                id,
+                "unknown_method",
+                &format!("kb plugin: unknown method {other}"),
+            );
         }
         _ => {}
     }
