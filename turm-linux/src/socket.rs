@@ -1756,7 +1756,19 @@ fn spawn_claude_prompt_seeder(session_name: String, prompt: String) {
             eprintln!("[claude.start] tmux paste-buffer failed: {paste:?}");
             return;
         }
-        // Submit. claude's REPL needs an explicit Enter after paste.
+        // Submit. claude's REPL needs TWO Enters for long pastes:
+        // bracketed-paste-collapse mode renders the input as
+        // `[Pasted text #1 +N lines]` once a paste exceeds claude's
+        // inline threshold, so the first Enter commits/expands the
+        // paste placeholder and the second sends it to the model.
+        // Short pastes that don't collapse get submitted by the
+        // first Enter; the second hits an already-empty input and
+        // claude no-ops on it. Two-Enter covers both cases without
+        // inspecting claude's UI state.
+        let _ = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &session_name, "Enter"])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(200));
         let _ = std::process::Command::new("tmux")
             .args(["send-keys", "-t", &session_name, "Enter"])
             .status();
