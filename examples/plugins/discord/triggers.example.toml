@@ -16,8 +16,16 @@
 #                          intended for the archive trigger below).
 #
 # Filtered payload shape (mention / dm / message):
-#   { message_id, channel_id, guild_id, author_id, author_username,
-#     content, mention_everyone, mentions_bot }
+#   { message_id, channel_id, guild_id, message_url, author_id,
+#     author_username, content, mention_everyone, mentions_bot }
+# Reaction payload shape:
+#   { message_id, channel_id, guild_id, message_url, user_id,
+#     message_author_id, emoji_name, emoji_id, emoji_animated }
+# `message_url` is `https://discord.com/channels/{guild_id|@me}/{channel_id}/{message_id}`
+# pre-built so triggers can embed the link in a captured Todo body
+# (the interpolation DSL has no string-concat). Designed for the
+# claude-fetches-from-link workflow: turm captures the link, claude
+# in a downstream session resolves the body.
 #
 # Raw payload shape:
 #   { event_type, channel_id, guild_id, message_id, event_json }
@@ -172,9 +180,20 @@ event_kind = "discord.mention"
 # [[triggers]]
 # name = "discord-memo-capture-create"
 # action = "todo.create"
-# params = { title = "{event.await.content}", workspace = "default" }
+# params = { title = "{event.await.content}", body = """
+# Source: {event.message_url}
+#
+# {event.await.content}
+# """, workspace = "default" }
 # [triggers.when]
 # event_kind = "discord-memo-capture-fetch.awaited"
+#
+# Note: `event.message_url` is the original reaction event's URL
+# (top-level after build_awaited_payload nests the get_message reply
+# under `await:`), so it points to the message the user reacted on,
+# not to the bot's API call. Embedding it in the body lets the user
+# (or claude in a downstream session) re-open the source thread for
+# context that doesn't fit in the captured snapshot.
 
 # ---------------------------------------------------------------------
 # 7. Star-react → archive a message

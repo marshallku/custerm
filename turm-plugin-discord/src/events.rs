@@ -60,6 +60,11 @@ pub struct MessageFields {
     pub channel_id: String,
     /// `None` for DM channels (the absence is the DM signal).
     pub guild_id: Option<String>,
+    /// Direct deep-link to the message — built from `guild_id` (or
+    /// `@me` for DMs), `channel_id`, `message_id`. Surfaced in the
+    /// payload so trigger-driven Todos can embed the link without
+    /// needing string-concat in the interpolation DSL.
+    pub message_url: String,
     pub author_id: String,
     /// Discord exposes both legacy `username` (handle, ASCII-ish) and
     /// the newer `global_name` (display name, may be unset). We
@@ -82,6 +87,11 @@ pub struct ReactionFields {
     pub channel_id: String,
     /// `None` for DM channels.
     pub guild_id: Option<String>,
+    /// Deep-link to the reacted-on message. Same format as
+    /// `MessageFields::message_url`. Lets reaction-driven triggers
+    /// embed the link in a captured Todo body so the user (or claude
+    /// in a downstream session) can re-open the source thread.
+    pub message_url: String,
     /// User who added the reaction.
     pub user_id: String,
     /// Author of the underlying message, if Discord supplies it
@@ -130,6 +140,7 @@ impl DiscordEvent {
                 "message_id": f.message_id,
                 "channel_id": f.channel_id,
                 "guild_id": f.guild_id,
+                "message_url": f.message_url,
                 "author_id": f.author_id,
                 "author_username": f.author_username,
                 "content": f.content,
@@ -140,6 +151,7 @@ impl DiscordEvent {
                 "message_id": r.message_id,
                 "channel_id": r.channel_id,
                 "guild_id": r.guild_id,
+                "message_url": r.message_url,
                 "user_id": r.user_id,
                 "message_author_id": r.message_author_id,
                 "emoji_name": r.emoji_name,
@@ -185,6 +197,16 @@ pub fn from_dispatch(
         }
         _ => Vec::new(),
     }
+}
+
+/// Build the canonical Discord deep-link for a message.
+/// Format: `https://discord.com/channels/{guild_id|@me}/{channel_id}/{message_id}`.
+/// `@me` is what Discord's web client uses for DM-channel deep-links;
+/// guild messages get the actual guild snowflake. Both forms open
+/// directly in the user's Discord client when clicked.
+fn build_message_url(guild_id: Option<&str>, channel_id: &str, message_id: &str) -> String {
+    let guild_segment = guild_id.unwrap_or("@me");
+    format!("https://discord.com/channels/{guild_segment}/{channel_id}/{message_id}")
 }
 
 fn build_raw(event_name: &str, data: &Value) -> RawEvent {
@@ -255,10 +277,12 @@ fn classify_message(data: &Value, bot_user_id: Option<&str>) -> Option<DiscordEv
                     .unwrap_or(false)
             })
             .unwrap_or(false);
+    let message_url = build_message_url(guild_id.as_deref(), &channel_id, &message_id);
     let fields = MessageFields {
         message_id,
         channel_id,
         guild_id: guild_id.clone(),
+        message_url,
         author_id,
         author_username,
         content,
@@ -313,10 +337,12 @@ fn classify_reaction(data: &Value, bot_user_id: Option<&str>) -> Option<DiscordE
         .get("animated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let message_url = build_message_url(guild_id.as_deref(), &channel_id, &message_id);
     Some(DiscordEvent::Reaction(ReactionFields {
         message_id,
         channel_id,
         guild_id,
+        message_url,
         user_id,
         message_author_id,
         emoji_name,
@@ -370,6 +396,7 @@ mod tests {
                 assert_eq!(f.message_id, "MSG_1");
                 assert_eq!(f.channel_id, "CH_1");
                 assert_eq!(f.guild_id.as_deref(), Some("G_1"));
+                assert_eq!(f.message_url, "https://discord.com/channels/G_1/CH_1/MSG_1");
                 assert_eq!(f.author_id, "U_1");
                 assert_eq!(f.author_username, "Alice");
                 assert_eq!(f.content, "hello");
@@ -390,6 +417,8 @@ mod tests {
             DiscordEvent::Dm(f) => {
                 assert_eq!(f.guild_id, None);
                 assert_eq!(f.channel_id, "CH_1");
+                // DMs use Discord's `@me` URL convention.
+                assert_eq!(f.message_url, "https://discord.com/channels/@me/CH_1/MSG_1");
             }
             other => panic!("expected Dm, got {other:?}"),
         }
@@ -573,6 +602,7 @@ mod tests {
             message_id: "M".into(),
             channel_id: "C".into(),
             guild_id: Some("G".into()),
+            message_url: "https://discord.com/channels/G/C/M".into(),
             author_id: "A".into(),
             author_username: "name".into(),
             content: "c".into(),
@@ -583,6 +613,7 @@ mod tests {
         assert_eq!(v["message_id"], "M");
         assert_eq!(v["channel_id"], "C");
         assert_eq!(v["guild_id"], "G");
+        assert_eq!(v["message_url"], "https://discord.com/channels/G/C/M");
         assert_eq!(v["author_id"], "A");
         assert_eq!(v["mentions_bot"], true);
     }
@@ -614,6 +645,7 @@ mod tests {
                 assert_eq!(r.message_id, "MSG_1");
                 assert_eq!(r.channel_id, "CH_1");
                 assert_eq!(r.guild_id.as_deref(), Some("G_1"));
+                assert_eq!(r.message_url, "https://discord.com/channels/G_1/CH_1/MSG_1");
                 assert_eq!(r.message_author_id.as_deref(), Some("U_AUTHOR"));
                 assert_eq!(r.emoji_name, "📝");
                 assert!(r.emoji_id.is_none(), "unicode emoji has no id");
@@ -621,6 +653,32 @@ mod tests {
             }
             other => panic!("expected Reaction, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dm_reaction_url_uses_at_me_segment() {
+        let out = dispatch(
+            "MESSAGE_REACTION_ADD",
+            reaction_data(json!({"guild_id": Value::Null})),
+        );
+        match &out[0] {
+            DiscordEvent::Reaction(r) => {
+                assert_eq!(r.message_url, "https://discord.com/channels/@me/CH_1/MSG_1");
+            }
+            other => panic!("expected Reaction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_message_url_handles_guild_and_dm() {
+        assert_eq!(
+            build_message_url(Some("999"), "888", "777"),
+            "https://discord.com/channels/999/888/777"
+        );
+        assert_eq!(
+            build_message_url(None, "888", "777"),
+            "https://discord.com/channels/@me/888/777"
+        );
     }
 
     #[test]
@@ -695,6 +753,7 @@ mod tests {
             message_id: "M".into(),
             channel_id: "C".into(),
             guild_id: None,
+            message_url: "https://discord.com/channels/@me/C/M".into(),
             user_id: "U".into(),
             message_author_id: Some("A".into()),
             emoji_name: "🔥".into(),
@@ -705,6 +764,7 @@ mod tests {
         assert_eq!(v["message_id"], "M");
         assert_eq!(v["channel_id"], "C");
         assert_eq!(v["guild_id"], Value::Null);
+        assert_eq!(v["message_url"], "https://discord.com/channels/@me/C/M");
         assert_eq!(v["user_id"], "U");
         assert_eq!(v["message_author_id"], "A");
         assert_eq!(v["emoji_name"], "🔥");
