@@ -153,6 +153,15 @@ impl BackgroundLayer {
                 let path = Path::new(image);
                 if path.exists() {
                     self.set_image(path);
+                } else {
+                    // Don't silently ignore a config typo; surface it
+                    // and keep the previously rendered image so the
+                    // user can fix the path without flicker.
+                    eprintln!(
+                        "[turm] background.image points at {} which does not exist; \
+                         keeping previously rendered image",
+                        path.display()
+                    );
                 }
             }
             None => {

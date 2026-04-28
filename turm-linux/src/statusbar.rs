@@ -82,12 +82,24 @@ fn run_module_exec(
 }
 
 /// Apply theme CSS to the status bar widget tree.
-fn apply_theme_css(theme: &Theme, height: u32) {
+///
+/// `position` is the configured statusbar position (`"top"` or `"bottom"`).
+/// The 1-px separator goes on whichever edge faces the notebook content;
+/// before the window-level transparency change this looked OK either way
+/// because the bar painted its own opaque `surface0` strip, but with a
+/// transparent bg the border would otherwise float against the window
+/// edge instead of dividing the bar from the rest of the UI.
+fn apply_theme_css(theme: &Theme, height: u32, position: &str) {
+    let border_edge = if position == "top" {
+        "border-bottom"
+    } else {
+        "border-top"
+    };
     let css = format!(
         r#"
         .turm-statusbar {{
             background-color: transparent;
-            border-top: 1px solid {overlay0};
+            {border_edge}: 1px solid {overlay0};
             min-height: {height}px;
             padding: 0 10px;
         }}
@@ -132,7 +144,7 @@ impl StatusBar {
         let height = config.statusbar.height;
         let socket_path = format!("/tmp/turm-{}.sock", std::process::id());
 
-        apply_theme_css(&theme, height);
+        apply_theme_css(&theme, height, &config.statusbar.position);
 
         let mut left_entries: Vec<ModuleEntry> = Vec::new();
         let mut center_entries: Vec<ModuleEntry> = Vec::new();
@@ -237,7 +249,7 @@ impl StatusBar {
 
     pub fn reload(&self, config: &TurmConfig, plugins: &[LoadedPlugin]) {
         let theme = Theme::by_name(&config.theme.name).unwrap_or_default();
-        apply_theme_css(&theme, config.statusbar.height);
+        apply_theme_css(&theme, config.statusbar.height, &config.statusbar.position);
 
         // Re-collect modules with updated socket/plugin info
         let socket_path = format!("/tmp/turm-{}.sock", std::process::id());

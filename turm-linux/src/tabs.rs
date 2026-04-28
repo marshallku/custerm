@@ -440,17 +440,75 @@ impl TabManager {
             }
         }
 
-        // Show/hide add button in action widget (only for vertical tabs)
-        if self.is_vertical_tabs()
-            && let Some(action) = self.notebook.action_widget(gtk4::PackType::End)
-            && let Some(hbox) = action.downcast_ref::<gtk4::Box>()
-            && let Some(toggle_btn) = hbox.first_child()
-            && let Some(add_btn) = toggle_btn.next_sibling()
-        {
-            add_btn.set_visible(!collapsed);
-        }
+        // Reorient/reorder the action widget (toggle + add) so the add
+        // button stays reachable even when a vertical tab column is too
+        // narrow to host both buttons side-by-side.
+        self.update_action_box_layout(collapsed);
 
         self.notebook.set_show_tabs(true);
+    }
+
+    /// Lay out the tab-bar action widget (toggle + add buttons) for the
+    /// current (`is_vertical_tabs()`, `collapsed`) combination.
+    ///
+    /// - **Vertical + collapsed**: orientation = Vertical, halign = Center,
+    ///   order = `[add, toggle]` so the `+` button sits above the toggle
+    ///   button. Without this, the narrow column hides the add button
+    ///   entirely (the original behavior).
+    /// - **Otherwise**: orientation = Horizontal, halign = Start,
+    ///   order = `[toggle, add]` (the construction default).
+    ///
+    /// Both buttons are always made visible — stacking gives the add
+    /// button room even when the column is tight.
+    fn update_action_box_layout(&self, collapsed: bool) {
+        let Some(action) = self.notebook.action_widget(gtk4::PackType::End) else {
+            return;
+        };
+        let Some(hbox) = action.downcast_ref::<gtk4::Box>() else {
+            return;
+        };
+
+        // Identify the two buttons by widget name (set in setup_tab_actions).
+        // Walking siblings instead of indexing because reorder_child_after
+        // changes positions on each call.
+        let mut toggle: Option<gtk4::Widget> = None;
+        let mut add: Option<gtk4::Widget> = None;
+        let mut child = hbox.first_child();
+        while let Some(w) = child {
+            child = w.next_sibling();
+            match w.widget_name().as_str() {
+                "turm-tab-toggle" => toggle = Some(w),
+                "turm-tab-add" => add = Some(w),
+                _ => {}
+            }
+        }
+        let (Some(toggle), Some(add)) = (toggle, add) else {
+            return;
+        };
+
+        let stacked = self.is_vertical_tabs() && collapsed;
+
+        hbox.set_orientation(if stacked {
+            gtk4::Orientation::Vertical
+        } else {
+            gtk4::Orientation::Horizontal
+        });
+        hbox.set_halign(if stacked {
+            gtk4::Align::Center
+        } else {
+            gtk4::Align::Start
+        });
+
+        toggle.set_visible(true);
+        add.set_visible(true);
+
+        if stacked {
+            // [add, toggle] — `+` sits above the toggle button.
+            hbox.reorder_child_after(&toggle, Some(&add));
+        } else {
+            // [toggle, add] — original horizontal layout.
+            hbox.reorder_child_after(&add, Some(&toggle));
+        }
     }
 
     // -- Tab rename --
@@ -519,6 +577,12 @@ impl TabManager {
         if !*self.user_toggled.borrow() {
             *self.tab_bar_collapsed.borrow_mut() = config.tabs.collapsed;
             self.apply_collapsed_state(config.tabs.collapsed);
+        } else {
+            // Position may have flipped between vertical and horizontal
+            // even if collapsed state didn't change — re-lay out the
+            // action widget so a manually-collapsed user keeps the add
+            // button visible (stacked) on left/right tabs.
+            self.update_action_box_layout(*self.tab_bar_collapsed.borrow());
         }
 
         for tab in self.tabs.borrow().iter() {
@@ -1480,7 +1544,6 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
 }
 
 fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
-    let vertical = manager.is_vertical_tabs();
     let action_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
     action_box.add_css_class("turm-tab-actions");
     action_box.set_halign(gtk4::Align::Start);
@@ -1490,6 +1553,9 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
     toggle_btn.add_css_class("flat");
     toggle_btn.add_css_class("turm-action-btn");
     toggle_btn.set_tooltip_text(Some("Toggle tab bar (Ctrl+Shift+B)"));
+    // Names let `update_action_box_layout` identify the two buttons
+    // back from the action widget after GTK adopts the box.
+    toggle_btn.set_widget_name("turm-tab-toggle");
 
     let mgr = manager.clone();
     toggle_btn.connect_clicked(move |_| {
@@ -1502,6 +1568,7 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
     add_btn.add_css_class("flat");
     add_btn.add_css_class("turm-action-btn");
     add_btn.set_tooltip_text(Some("New tab"));
+    add_btn.set_widget_name("turm-tab-add");
 
     let popover = gtk4::Popover::new();
     let pop_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
@@ -1642,18 +1709,18 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
         mgr.split_focused_webview("about:blank", gtk4::Orientation::Vertical, &win);
     });
 
-    // For vertical tabs: hide add button when collapsed. For horizontal: always show.
-    let initially_collapsed = *manager.tab_bar_collapsed.borrow();
-    if vertical && initially_collapsed {
-        add_btn.set_visible(false);
-    }
-
     action_box.append(&toggle_btn);
     action_box.append(&add_btn);
 
     manager
         .notebook
         .set_action_widget(&action_box, gtk4::PackType::End);
+
+    // Apply orientation/order for the current (vertical, collapsed) combo.
+    // For vertical+collapsed the column is too narrow to fit both buttons
+    // side-by-side, so we stack them with the add button on top of the
+    // toggle button. Keeps both reachable in collapsed mode.
+    manager.update_action_box_layout(*manager.tab_bar_collapsed.borrow());
 }
 
 fn build_tab_css(tab_width: u32, theme: &turm_core::theme::Theme) -> String {

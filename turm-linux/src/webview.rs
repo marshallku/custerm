@@ -7,7 +7,7 @@ fn build_webview_css(theme: &turm_core::theme::Theme) -> String {
     format!(
         r#"
 .turm-url-bar {{
-    background-color: {surface2};
+    background-color: transparent;
     padding: 4px 8px;
 }}
 .turm-url-entry {{
@@ -32,7 +32,6 @@ fn build_webview_css(theme: &turm_core::theme::Theme) -> String {
     background-color: {overlay0};
 }}
 "#,
-        surface2 = theme.surface2,
         bg = theme.background,
         text = theme.text,
         overlay0 = theme.overlay0,

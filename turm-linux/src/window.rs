@@ -50,15 +50,17 @@ impl TurmWindow {
             .default_height(800)
             .build();
 
+        // Window-level fallback bg: visible whenever no `BackgroundLayer`
+        // image is loaded. The provider handle is reused on hot reload so a
+        // theme switch updates this color in lockstep with the rest of the
+        // UI; without that the fallback bg sticks at the old theme color
+        // because terminals are permanently transparent now.
+        let window_css = gtk4::CssProvider::new();
         let theme = turm_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
-        let css_provider = gtk4::CssProvider::new();
-        css_provider.load_from_string(&format!(
-            "window {{ background-color: {}; }}",
-            theme.background
-        ));
+        update_window_bg_css(&window_css, &theme);
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().unwrap(),
-            &css_provider,
+            &window_css,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
@@ -215,6 +217,7 @@ impl TurmWindow {
             &tab_manager,
             &statusbar,
             &background,
+            &window_css,
             &plugins,
             &triggers,
             &event_bus,
@@ -287,11 +290,22 @@ impl TurmWindow {
     }
 }
 
+/// Rebuild the window-level fallback bg CSS for the given theme. Called
+/// at startup and on every config hot reload so a theme change updates
+/// this color in lockstep with the rest of the UI.
+fn update_window_bg_css(provider: &gtk4::CssProvider, theme: &turm_core::theme::Theme) {
+    provider.load_from_string(&format!(
+        "window {{ background-color: {}; }}",
+        theme.background
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn watch_config(
     tab_manager: &Rc<TabManager>,
     statusbar: &Rc<StatusBar>,
     background: &Rc<BackgroundLayer>,
+    window_css: &gtk4::CssProvider,
     plugins: &[turm_core::plugin::LoadedPlugin],
     triggers: &Arc<TriggerEngine>,
     event_bus: &Arc<CoreEventBus>,
@@ -312,6 +326,7 @@ fn watch_config(
     let mgr = tab_manager.clone();
     let sb = statusbar.clone();
     let bg = background.clone();
+    let win_css = window_css.clone();
     let pl = plugins.to_vec();
     let trg = triggers.clone();
     let bus = event_bus.clone();
@@ -334,6 +349,8 @@ fn watch_config(
         };
 
         eprintln!("[turm] config reloaded");
+        let theme = turm_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
+        update_window_bg_css(&win_css, &theme);
         mgr.update_config(&config);
         sb.reload(&config, &pl);
         bg.apply_config(&config);
