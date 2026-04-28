@@ -256,13 +256,24 @@ impl PluginPanel {
         let uri = format!("file://{}", file_path.display());
 
         // Diagnostic instrumentation — without these, a stuck panel
-        // (the "first turm shows blank, second turm spawn unsticks
-        // it" symptom users have hit) leaves no log trace because
-        // WebKit's load failures and WebProcess crashes go silent
-        // by default. Each handler eprintlns a one-line tag with
-        // the panel's id + plugin so we can correlate against the
-        // WebProcess pids in lsof / journalctl when reproduction
-        // happens. Cost: three signal connections per panel.
+        // (the "fresh-boot shows blank panel, second turm process
+        // unsticks it" symptom users have hit on cold-boot only —
+        // hot reboots reproduce reliably, hot turm restarts don't)
+        // leaves no log trace because WebKit's load failures and
+        // WebProcess crashes go silent by default. Each handler
+        // eprintlns a one-line tag with the panel's id + plugin so
+        // we can correlate against the WebProcess pids in lsof /
+        // journalctl when reproduction happens. Cost: three signal
+        // connections per panel.
+        //
+        // No auto-reload here. Plugin panels carry side effects on
+        // load (`terminal.exec`, action invocations from `<script>`
+        // top-level), so a host-injected reload could duplicate
+        // those. Idempotent retries belong in the panel's own JS —
+        // see todo/panel.html's `loadGen` retry budget for the
+        // canonical pattern. The host's job is just to surface the
+        // failure mode loud enough that an authoring plugin knows
+        // when to retry.
         let panel_label = format!("{plugin_name}/{panel_name}");
         {
             let label = panel_label.clone();
