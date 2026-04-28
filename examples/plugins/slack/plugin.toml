@@ -1,8 +1,8 @@
 [plugin]
 name = "slack"
 title = "Slack"
-version = "0.1.0"
-description = "Slack Socket Mode plugin: emits slack.mention / slack.dm / slack.raw and provides slack.post_message for replies."
+version = "0.2.0"
+description = "Slack Socket Mode plugin: emits slack.mention / slack.dm / slack.reaction / slack.raw events; provides slack.post_message + slack.get_message for replies and reaction-driven body fetch."
 
 [[services]]
 name = "main"
@@ -10,11 +10,15 @@ exec = "turm-plugin-slack"
 # onStartup: Socket Mode requires a long-lived WebSocket connection
 # that needs to be alive whenever turm is, so events flow inbound at
 # arrival time. Lazy (onAction) activation works for slack.post_message
-# alone but would lose mention/DM events between turm starts and the
-# first action call — which defeats the point.
+# alone but would lose mention/DM/reaction events between turm starts
+# and the first action call — which defeats the point.
 activation = "onStartup"
 restart = "on-crash"
-provides = ["slack.auth_status", "slack.post_message"]
+provides = [
+    "slack.auth_status",
+    "slack.post_message",
+    "slack.get_message",
+]
 subscribes = []
 # Required env: TURM_SLACK_BOT_TOKEN (xoxb-...), TURM_SLACK_APP_TOKEN (xapp-...)
 # Optional env: TURM_SLACK_WORKSPACE (default "default" — keyring entry namespace),
@@ -24,9 +28,16 @@ subscribes = []
 #   1. Create a Slack App at https://api.slack.com/apps
 #   2. Enable Socket Mode (Settings → Socket Mode); generate an
 #      App-Level Token with `connections:write` scope (xapp-...)
-#   3. Subscribe to bot events (Event Subscriptions): app_mention, message.im
+#   3. Subscribe to bot events (Event Subscriptions):
+#        app_mention, message.im, reaction_added
+#      ← `reaction_added` REQUIRED for slack.reaction events.
 #   4. Add OAuth scopes (OAuth & Permissions, Bot Token Scopes):
-#      app_mentions:read, im:history, users:read,
-#      chat:write    ← REQUIRED for slack.post_message (Phase 11.2)
+#        app_mentions:read, im:history, users:read,
+#        chat:write          ← required for slack.post_message
+#        reactions:read      ← required for slack.reaction events
+#        channels:history    ← required for slack.get_message in
+#                              public channels (use groups:history /
+#                              im:history / mpim:history for the
+#                              respective conversation kinds)
 #   5. Install to your workspace; copy the Bot User OAuth Token (xoxb-...)
 #   6. Run `TURM_SLACK_BOT_TOKEN=xoxb-... TURM_SLACK_APP_TOKEN=xapp-... turm-plugin-slack auth`

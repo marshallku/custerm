@@ -1,12 +1,21 @@
 //! Map raw Slack `events_api` payloads to `slack.mention` /
-//! `slack.dm` turm events.
+//! `slack.dm` / `slack.reaction` turm events.
 //!
 //! Slack delivers a wide variety of message types over Socket Mode:
 //! channel messages, DMs, edits, deletions, joins, bot messages,
 //! thread replies, channel-renames, app_home, etc. The plugin filters
 //! aggressively so triggers only fire on signal — actual human
-//! mentions and direct messages — without each user having to
-//! handle the full diversity in their `[[triggers]]` config.
+//! mentions, direct messages, and message reactions — without each
+//! user having to handle the full diversity in their
+//! `[[triggers]]` config.
+//!
+//! Reaction events (`reaction_added` / `slack.reaction`) mirror the
+//! Discord 2.5 capture pattern: emit the reaction metadata only
+//! (no message body), trigger chains call `slack.get_message` to
+//! fetch the body when capture fires. Self-reactions (bot adding
+//! its own emoji) are filtered out via `bot_user_id` so the
+//! "react with 📝 → capture to Todo" recipe doesn't loop on a
+//! starter-emoji-adding bot.
 
 use serde_json::{Value, json};
 
@@ -14,6 +23,13 @@ use serde_json::{Value, json};
 pub enum SlackEvent {
     Mention(MessageFields),
     Dm(MessageFields),
+    /// Reaction added to a message (`reaction_added` event with
+    /// `item.type == "message"`). Mirrors Discord 2.5's
+    /// `discord.reaction` for symmetric "react with 📝 → capture
+    /// to Todo" workflows. File reactions (`item.type == "file"`)
+    /// are dropped at classify time — message reactions are the
+    /// load-bearing case.
+    Reaction(ReactionFields),
     /// Full-fidelity firehose: emitted for EVERY events_api frame
     /// regardless of filtering. Carries the raw inner `event` object
     /// (blocks, files, attachments, edits, joins — everything Slack
@@ -32,6 +48,32 @@ pub struct MessageFields {
     pub text: String,
     pub ts: String,
     pub thread_ts: Option<String>,
+    pub team_id: Option<String>,
+    pub event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionFields {
+    pub channel: String,
+    /// Timestamp of the reacted-on message — Slack uses (channel, ts)
+    /// as the message identity. Pair this with `slack.get_message`
+    /// to fetch the body for a Todo capture flow.
+    pub ts: String,
+    /// User who added the reaction.
+    pub user: String,
+    /// Emoji name without colons (e.g. `"memo"` for :memo:). Custom
+    /// emoji come through under their installed name.
+    pub reaction: String,
+    /// Author of the reacted-on message, if Slack supplies it
+    /// (`item_user` field on the event). Useful as a guard so
+    /// triggers don't capture the bot's own posts.
+    pub item_user: Option<String>,
+    /// Best-effort permalink to the message, fetched at event time
+    /// via `chat.getPermalink` — None if the call fails or the
+    /// channel is otherwise inaccessible. Carries the workspace
+    /// subdomain (which we don't know locally), which is why we
+    /// don't construct it ourselves like Discord does.
+    pub permalink: Option<String>,
     pub team_id: Option<String>,
     pub event_id: Option<String>,
 }
@@ -69,6 +111,7 @@ impl SlackEvent {
         match self {
             SlackEvent::Mention(_) => "slack.mention",
             SlackEvent::Dm(_) => "slack.dm",
+            SlackEvent::Reaction(_) => "slack.reaction",
             SlackEvent::Raw(_) => "slack.raw",
         }
     }
@@ -83,6 +126,16 @@ impl SlackEvent {
                 "thread_ts": f.thread_ts,
                 "team_id": f.team_id,
                 "event_id": f.event_id,
+            }),
+            SlackEvent::Reaction(r) => json!({
+                "channel": r.channel,
+                "ts": r.ts,
+                "user": r.user,
+                "reaction": r.reaction,
+                "item_user": r.item_user,
+                "permalink": r.permalink,
+                "team_id": r.team_id,
+                "event_id": r.event_id,
             }),
             SlackEvent::Raw(r) => json!({
                 "event_type": r.event_type,
@@ -102,13 +155,20 @@ impl SlackEvent {
 /// Returns BOTH:
 /// - The `slack.raw` event (always emitted — full firehose for
 ///   archive triggers).
-/// - Optionally one of `slack.mention` / `slack.dm` if the payload
-///   passes the aggressive filter (real human mention or DM).
+/// - Optionally one of `slack.mention` / `slack.dm` / `slack.reaction`
+///   if the payload passes the filter.
 ///
 /// `payload` is the value of the outer frame's `payload` key, which
 /// itself contains `event_id`, `team_id`, `event`, etc. (Slack's
 /// "Events API outer wrapper.")
-pub fn from_events_api_payload(payload: &Value) -> Vec<SlackEvent> {
+///
+/// `bot_user_id` is the Slack user id of the bot — used to filter
+/// the bot's own reactions out of `slack.reaction` (the canonical
+/// "react with 📝 → capture" workflow would otherwise self-loop
+/// when the bot adds a starter emoji). Pass `None` if unknown
+/// (env-only credentials skip the runtime `auth.test` step); the
+/// non-reaction filters don't depend on this.
+pub fn from_events_api_payload(payload: &Value, bot_user_id: Option<&str>) -> Vec<SlackEvent> {
     let Some(event) = payload.get("event") else {
         return Vec::new();
     };
@@ -130,7 +190,7 @@ pub fn from_events_api_payload(payload: &Value) -> Vec<SlackEvent> {
         event_id.clone(),
         team_id.clone(),
     )));
-    if let Some(filtered) = classify_event(event, event_id, team_id) {
+    if let Some(filtered) = classify_event(event, event_id, team_id, bot_user_id) {
         out.push(filtered);
     }
     out
@@ -161,9 +221,56 @@ fn classify_event(
     event: &Value,
     event_id: Option<String>,
     team_id: Option<String>,
+    bot_user_id: Option<&str>,
 ) -> Option<SlackEvent> {
     let event_type = event.get("type")?.as_str()?;
     match event_type {
+        "reaction_added" => {
+            // Only message reactions reach turm. File-level reactions
+            // (`item.type == "file"`) go nowhere — there's no
+            // canonical "fetch the body" symmetry for files in the
+            // current trigger DSL, and surfacing them would just
+            // pollute downstream rules. If file-reaction capture
+            // becomes load-bearing, add a separate `slack.file_reaction`
+            // event rather than overloading this one.
+            let item = event.get("item")?;
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+            if item_type != "message" {
+                return None;
+            }
+            let user = event.get("user").and_then(Value::as_str)?.to_string();
+            // Self-reaction guard: bot's own reactions arrive here
+            // when the bot is configured to add a starter emoji.
+            // Without this filter the starter reaction triggers the
+            // capture pipeline against the original message.
+            if let Some(bot_id) = bot_user_id
+                && bot_id == user
+            {
+                return None;
+            }
+            let channel = item.get("channel").and_then(Value::as_str)?.to_string();
+            let ts = item.get("ts").and_then(Value::as_str)?.to_string();
+            let reaction = event.get("reaction").and_then(Value::as_str)?.to_string();
+            let item_user = event
+                .get("item_user")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(SlackEvent::Reaction(ReactionFields {
+                channel,
+                ts,
+                user,
+                reaction,
+                item_user,
+                // Permalink is filled in by the socket_mode layer
+                // after classify, via a best-effort
+                // `chat.getPermalink` call — keeps events.rs pure
+                // (no HTTP) and lets the network failure stay
+                // log-only without dropping the whole event.
+                permalink: None,
+                team_id,
+                event_id,
+            }))
+        }
         "app_mention" => {
             // Defensive: skip bot-originated mentions and edits.
             // Slack normally won't send these for app_mention but
@@ -278,7 +385,7 @@ mod tests {
             "text": "<@U800> ping?",
             "ts": "1700000000.000100",
         }));
-        match expect_filtered(from_events_api_payload(&p)) {
+        match expect_filtered(from_events_api_payload(&p, None)) {
             SlackEvent::Mention(f) => {
                 assert_eq!(f.user, "U999");
                 assert_eq!(f.channel, "C123");
@@ -300,7 +407,7 @@ mod tests {
             "text": "hi there",
             "ts": "1700000000.000200",
         }));
-        match expect_filtered(from_events_api_payload(&p)) {
+        match expect_filtered(from_events_api_payload(&p, None)) {
             SlackEvent::Dm(f) => {
                 assert_eq!(f.user, "U999");
                 assert_eq!(f.channel, "D123");
@@ -323,7 +430,7 @@ mod tests {
             "text": "team standup",
             "ts": "1700000000.000300",
         }));
-        let raw = expect_raw_only(from_events_api_payload(&p));
+        let raw = expect_raw_only(from_events_api_payload(&p, None));
         assert_eq!(raw.event_type, "message");
         assert_eq!(raw.channel.as_deref(), Some("C123"));
     }
@@ -339,7 +446,7 @@ mod tests {
             "text": "edited",
             "ts": "1700000000.000400",
         }));
-        let raw = expect_raw_only(from_events_api_payload(&p));
+        let raw = expect_raw_only(from_events_api_payload(&p, None));
         assert_eq!(raw.event_json["subtype"], "message_changed");
     }
 
@@ -354,7 +461,7 @@ mod tests {
             "ts": "1700000000.000500",
             "user": "U999",
         }));
-        expect_raw_only(from_events_api_payload(&p));
+        expect_raw_only(from_events_api_payload(&p, None));
     }
 
     #[test]
@@ -367,7 +474,7 @@ mod tests {
             "text": "<@U800>",
             "ts": "1700000000.000700",
         }));
-        expect_raw_only(from_events_api_payload(&p));
+        expect_raw_only(from_events_api_payload(&p, None));
     }
 
     #[test]
@@ -380,7 +487,7 @@ mod tests {
             "text": "<@U800>",
             "ts": "1700000000.000800",
         }));
-        expect_raw_only(from_events_api_payload(&p));
+        expect_raw_only(from_events_api_payload(&p, None));
     }
 
     #[test]
@@ -391,7 +498,7 @@ mod tests {
             "type": "channel_rename",
             "channel": "C123",
         }));
-        let raw = expect_raw_only(from_events_api_payload(&p));
+        let raw = expect_raw_only(from_events_api_payload(&p, None));
         assert_eq!(raw.event_type, "channel_rename");
         assert_eq!(raw.channel.as_deref(), Some("C123"));
         assert!(raw.ts.is_none());
@@ -409,7 +516,7 @@ mod tests {
             "blocks": [{"type": "rich_text", "elements": []}],
             "files": [{"id": "F123", "name": "diagram.png"}],
         }));
-        let out = from_events_api_payload(&p);
+        let out = from_events_api_payload(&p, None);
         let raw = match &out[0] {
             SlackEvent::Raw(r) => r.clone(),
             other => panic!("expected Raw first, got {other:?}"),
@@ -428,7 +535,7 @@ mod tests {
     fn missing_event_field_returns_empty() {
         // Truly malformed payload (no `event` key) → no events at all.
         let p = json!({"event_id": "x", "team_id": "T0"});
-        assert!(from_events_api_payload(&p).is_empty());
+        assert!(from_events_api_payload(&p, None).is_empty());
     }
 
     #[test]
@@ -441,7 +548,7 @@ mod tests {
             "ts": "1700000000.000600",
             "thread_ts": "1700000000.000500",
         }));
-        match expect_filtered(from_events_api_payload(&p)) {
+        match expect_filtered(from_events_api_payload(&p, None)) {
             SlackEvent::Mention(f) => {
                 assert_eq!(f.thread_ts.as_deref(), Some("1700000000.000500"));
             }
@@ -479,6 +586,122 @@ mod tests {
             "text": "hi",
             "ts": "1700.000",
         }));
-        expect_raw_only(from_events_api_payload(&p));
+        expect_raw_only(from_events_api_payload(&p, None));
+    }
+
+    // -- Reaction events (slice parity with Discord 2.5) --
+
+    fn reaction_payload(overrides: Value) -> Value {
+        let mut base = json!({
+            "type": "reaction_added",
+            "user": "U_REACTOR",
+            "reaction": "memo",
+            "item_user": "U_AUTHOR",
+            "item": {
+                "type": "message",
+                "channel": "C123",
+                "ts": "1700000000.000100",
+            },
+            "event_ts": "1700000000.000200",
+        });
+        if let (Some(b), Some(o)) = (base.as_object_mut(), overrides.as_object()) {
+            for (k, v) in o {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        base
+    }
+
+    #[test]
+    fn reaction_added_emits_slack_reaction_and_raw() {
+        let p = payload_with(reaction_payload(json!({})));
+        let out = from_events_api_payload(&p, Some("BOT_USER_ID"));
+        assert_eq!(out.len(), 2);
+        let raw = match &out[0] {
+            SlackEvent::Raw(r) => r,
+            other => panic!("expected Raw first, got {other:?}"),
+        };
+        assert_eq!(raw.event_type, "reaction_added");
+        // Outer envelope's channel/ts is None for reactions —
+        // Slack's reaction_added doesn't have top-level
+        // `channel`/`ts` (those live under `item`). The Raw
+        // variant just reads the top-level fields, so they're
+        // null. That's a documented quirk; trigger conditions
+        // wanting the channel should use `event.event_json.item.channel`.
+        match &out[1] {
+            SlackEvent::Reaction(r) => {
+                assert_eq!(r.channel, "C123");
+                assert_eq!(r.ts, "1700000000.000100");
+                assert_eq!(r.user, "U_REACTOR");
+                assert_eq!(r.reaction, "memo");
+                assert_eq!(r.item_user.as_deref(), Some("U_AUTHOR"));
+                assert!(
+                    r.permalink.is_none(),
+                    "permalink filled in by socket_mode layer"
+                );
+                assert_eq!(r.team_id.as_deref(), Some("T0123"));
+            }
+            other => panic!("expected Reaction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_reaction_emits_raw_only() {
+        let p = payload_with(reaction_payload(json!({"user": "BOT_USER_ID"})));
+        let out = from_events_api_payload(&p, Some("BOT_USER_ID"));
+        assert_eq!(out.len(), 1, "self-reaction must be raw-only");
+        assert!(matches!(out[0], SlackEvent::Raw(_)));
+    }
+
+    #[test]
+    fn file_reaction_emits_raw_only() {
+        let p = payload_with(reaction_payload(json!({
+            "item": {"type": "file", "file": "F123"},
+        })));
+        let out = from_events_api_payload(&p, Some("BOT_USER_ID"));
+        assert_eq!(out.len(), 1, "file reactions don't fan out");
+        assert!(matches!(out[0], SlackEvent::Raw(_)));
+    }
+
+    #[test]
+    fn reaction_with_unknown_bot_user_id_still_emits() {
+        // `auth.test` not yet run / env-only credentials → bot_user_id
+        // unknown. Self-filter is skipped; reaction still emitted.
+        // Documented gap — eventually we should fetch via auth.test
+        // on first connect, but for now env users get no self-filter.
+        let p = payload_with(reaction_payload(json!({"user": "U_REACTOR"})));
+        let out = from_events_api_payload(&p, None);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[1], SlackEvent::Reaction(_)));
+    }
+
+    #[test]
+    fn reaction_payload_json_includes_all_fields() {
+        let r = ReactionFields {
+            channel: "C".into(),
+            ts: "1700.000".into(),
+            user: "U".into(),
+            reaction: "memo".into(),
+            item_user: Some("A".into()),
+            permalink: Some("https://acme.slack.com/archives/C/p1700000".into()),
+            team_id: Some("T0".into()),
+            event_id: Some("Ev0".into()),
+        };
+        let v = SlackEvent::Reaction(r).payload_json();
+        assert_eq!(v["channel"], "C");
+        assert_eq!(v["ts"], "1700.000");
+        assert_eq!(v["user"], "U");
+        assert_eq!(v["reaction"], "memo");
+        assert_eq!(v["item_user"], "A");
+        assert_eq!(v["permalink"], "https://acme.slack.com/archives/C/p1700000");
+    }
+
+    #[test]
+    fn missing_item_drops_reaction() {
+        let mut event = reaction_payload(json!({}));
+        event.as_object_mut().unwrap().remove("item");
+        let p = payload_with(event);
+        let out = from_events_api_payload(&p, Some("BOT_USER_ID"));
+        assert_eq!(out.len(), 1, "no item → raw-only");
     }
 }

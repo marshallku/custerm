@@ -48,6 +48,13 @@ const NO_CREDS_RECHECK: Duration = Duration::from_secs(30);
 pub struct ResolvedCredentials {
     pub bot_token: String,
     pub app_token: String,
+    /// Bot's Slack user_id, captured at `auth` time and persisted
+    /// in the store. None when credentials come from env (no
+    /// auth.test step at runtime). Used by the events layer to
+    /// filter the bot's own `reaction_added` events out of
+    /// `slack.reaction` so a starter-emoji bot doesn't trigger
+    /// the capture pipeline against the message it's marking.
+    pub bot_user_id: Option<String>,
     pub source: &'static str, // "env" | "store"
 }
 
@@ -60,9 +67,20 @@ pub struct ResolvedCredentials {
 /// single coherent source for the live pair.
 pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<ResolvedCredentials> {
     if !config.bot_token.is_empty() && !config.app_token.is_empty() {
+        // Best-effort: if the store ALSO has tokens AND its bot_token
+        // matches the env one, lift the stored bot_user_id so the
+        // self-reaction filter still works. Strict-equality check
+        // avoids attributing the wrong identity to env-overridden
+        // credentials. When the env token differs (cross-workspace
+        // testing), bot_user_id stays None and the filter no-ops.
+        let stored_bot_user_id = store
+            .load()
+            .filter(|t| t.bot_token == config.bot_token)
+            .and_then(|t| t.user_id);
         return Some(ResolvedCredentials {
             bot_token: config.bot_token.clone(),
             app_token: config.app_token.clone(),
+            bot_user_id: stored_bot_user_id,
             source: "env",
         });
     }
@@ -73,6 +91,7 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
     Some(ResolvedCredentials {
         bot_token: stored.bot_token,
         app_token: stored.app_token,
+        bot_user_id: stored.user_id,
         source: "store",
     })
 }
@@ -129,8 +148,7 @@ pub fn run_loop<F>(
             continue;
         };
         eprintln!("[slack] connecting (credentials_source={})", creds.source);
-        let _ = creds.bot_token; // bot_token is reserved for future write actions
-        match connect_and_serve(&creds.app_token, stop, &mut on_event) {
+        match connect_and_serve(&creds, stop, &mut on_event) {
             Ok(reason) => {
                 eprintln!("[slack] socket mode disconnected ({reason}); reconnecting");
                 backoff_secs = config.reconnect_initial.as_secs().max(1);
@@ -169,14 +187,14 @@ fn interruptible_sleep(stop: &std::sync::atomic::AtomicBool, total: Duration) ->
 /// without backoff penalty. Returns `Err(msg)` for any error worth
 /// backing off from.
 fn connect_and_serve<F>(
-    app_token: &str,
+    creds: &ResolvedCredentials,
     stop: &std::sync::atomic::AtomicBool,
     on_event: &mut F,
 ) -> Result<&'static str, String>
 where
     F: FnMut(SlackEvent),
 {
-    let wss_url = bootstrap_url(app_token)?;
+    let wss_url = bootstrap_url(&creds.app_token)?;
     let uri: Uri = wss_url
         .parse()
         .map_err(|e| format!("invalid wss url returned by Slack: {e}"))?;
@@ -203,7 +221,7 @@ where
         };
         match msg {
             Message::Text(s) => {
-                if let Some(reason) = handle_text_frame(&s, &mut ws, on_event)? {
+                if let Some(reason) = handle_text_frame(&s, &mut ws, creds, on_event)? {
                     return Ok(reason);
                 }
             }
@@ -236,6 +254,7 @@ where
 fn handle_text_frame<F>(
     s: &str,
     ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    creds: &ResolvedCredentials,
     on_event: &mut F,
 ) -> Result<Option<&'static str>, String>
 where
@@ -263,8 +282,34 @@ where
                 .map_err(|e| format!("ack send: {e}"))?;
             // One frame can produce two events: a `slack.raw`
             // firehose entry plus an optional filtered
-            // mention/dm. Caller is expected to handle each.
-            for slack_event in from_events_api_payload(&payload) {
+            // mention/dm/reaction. Caller is expected to handle each.
+            // Reaction events get permalink-enriched in-flight here
+            // — the events.rs layer stays HTTP-free. Failure is
+            // logged but doesn't drop the event; permalink stays
+            // None and downstream triggers see `event.permalink ==
+            // null` in the params/condition.
+            //
+            // Trade-off: the `chat.getPermalink` call runs on the
+            // reader thread, behind the events_api ACK we already
+            // sent. So a burst of reactions serializes through one
+            // ~50-200ms RTT each before the next frame is read.
+            // Acceptable for the canonical "user reacts with 📝 to
+            // capture" cadence (single-digit per minute), and the
+            // ACK-first ordering means Slack doesn't retry. If a
+            // workflow needs higher reaction throughput, push the
+            // permalink fetch off this thread (channel + worker
+            // pool) or cache by (channel, ts) — both sketched but
+            // not implemented because the use case isn't yet here.
+            for mut slack_event in from_events_api_payload(&payload, creds.bot_user_id.as_deref()) {
+                if let SlackEvent::Reaction(ref mut r) = slack_event {
+                    match get_permalink(&creds.bot_token, &r.channel, &r.ts) {
+                        Ok(link) => r.permalink = Some(link),
+                        Err(e) => eprintln!(
+                            "[slack] permalink fetch failed for {}/{}: {e}",
+                            r.channel, r.ts
+                        ),
+                    }
+                }
                 on_event(slack_event);
             }
         }
@@ -396,6 +441,110 @@ pub fn post_message(
         .unwrap_or(channel)
         .to_string();
     Ok((ts, posted_channel))
+}
+
+/// Best-effort `chat.getPermalink` — returns the canonical
+/// workspace URL for a (channel, ts) pair. Slack's reaction events
+/// don't carry a URL and constructing one locally would need the
+/// workspace subdomain (only obtainable via `team.info` /
+/// `auth.test` plus caching). The permalink endpoint resolves both
+/// in one cheap call so reaction-driven Todo capture can embed a
+/// click-to-open link in the body.
+pub fn get_permalink(bot_token: &str, channel: &str, ts: &str) -> Result<String, String> {
+    // ureq returns Err(Status(..)) for any non-2xx, so a `resp.status()
+    // != 200` branch on the Ok arm is dead code. Handle the error
+    // arm explicitly so HTTP-level failures (429s, 5xx) carry their
+    // body through to the caller's log.
+    let resp = match ureq::get(&format!(
+        "https://slack.com/api/chat.getPermalink?channel={channel}&message_ts={ts}"
+    ))
+    .set("Authorization", &format!("Bearer {bot_token}"))
+    .timeout(Duration::from_secs(10))
+    .call()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            return Err(format!("chat.getPermalink HTTP {code}: {body}"));
+        }
+        Err(e) => return Err(format!("chat.getPermalink: {e}")),
+    };
+    let body: Value = resp
+        .into_json()
+        .map_err(|e| format!("chat.getPermalink response parse: {e}"))?;
+    if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let err = body.get("error").and_then(Value::as_str).unwrap_or("?");
+        return Err(format!("chat.getPermalink error: {err}"));
+    }
+    body.get("permalink")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "chat.getPermalink response missing permalink".to_string())
+}
+
+/// `conversations.history` with `latest=oldest=ts, inclusive=true,
+/// limit=1` — Slack's idiomatic single-message fetch (there's no
+/// dedicated "get message by id" endpoint). Returns the full
+/// message object on success so trigger interpolation reaches
+/// fields like `event.await.text` / `event.await.user`.
+///
+/// Channel must be one the bot is in (or a public channel where the
+/// bot has `channels:history`). Failure surfaces Slack's `error`
+/// code verbatim (`channel_not_found`, `not_in_channel`,
+/// `missing_scope`, `message_not_found`) so triggers can branch
+/// without re-parsing strings.
+pub fn get_message(bot_token: &str, channel: &str, ts: &str) -> Result<Value, String> {
+    let resp = match ureq::get(&format!(
+        "https://slack.com/api/conversations.history?channel={channel}&latest={ts}&oldest={ts}&inclusive=true&limit=1"
+    ))
+    .set("Authorization", &format!("Bearer {bot_token}"))
+    .timeout(Duration::from_secs(15))
+    .call()
+    {
+        Ok(r) => r,
+        // 429 carries Retry-After; surface it specifically so the
+        // caller's error → action error code mapping can branch on
+        // `rate_limited` (matching the post_message convention).
+        Err(ureq::Error::Status(429, r)) => {
+            let retry = r
+                .header("Retry-After")
+                .map(str::to_string)
+                .unwrap_or_default();
+            return Err(format!(
+                "rate_limited (Retry-After: {})",
+                if retry.is_empty() { "unknown" } else { &retry }
+            ));
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            return Err(format!("conversations.history HTTP {code}: {body}"));
+        }
+        Err(e) => return Err(format!("conversations.history: {e}")),
+    };
+    let body: Value = resp
+        .into_json()
+        .map_err(|e| format!("conversations.history response parse: {e}"))?;
+    if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let err = body.get("error").and_then(Value::as_str).unwrap_or("?");
+        return Err(err.to_string());
+    }
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "conversations.history response missing messages array".to_string())?;
+    let msg = messages
+        .first()
+        .ok_or_else(|| "message_not_found".to_string())?
+        .clone();
+    // Defensive: the inclusive=oldest=latest query CAN return adjacent
+    // messages on Slack's side if the ts isn't an exact match (e.g.
+    // a Slack-edited copy with a slightly different ts). Verify the
+    // returned ts matches.
+    let returned_ts = msg.get("ts").and_then(Value::as_str).unwrap_or("");
+    if returned_ts != ts {
+        return Err("message_not_found".to_string());
+    }
+    Ok(msg)
 }
 
 /// Validate a Bot User OAuth Token against `auth.test`. Returns the

@@ -269,7 +269,11 @@ fn handle_frame(
                 id,
                 json!({
                     "service_version": env!("CARGO_PKG_VERSION"),
-                    "provides": ["slack.auth_status", "slack.post_message"],
+                    "provides": [
+                        "slack.auth_status",
+                        "slack.post_message",
+                        "slack.get_message",
+                    ],
                     "subscribes": [],
                 }),
             );
@@ -371,10 +375,103 @@ fn handle_action(
     if name == "slack.post_message" {
         return handle_post_message(params, config, store);
     }
+    if name == "slack.get_message" {
+        return handle_get_message(params, config, store);
+    }
     Err((
         "action_not_found".to_string(),
         format!("slack plugin does not handle {name}"),
     ))
+}
+
+fn handle_get_message(
+    params: &Value,
+    config: &Config,
+    store: &Arc<dyn TokenStore>,
+) -> Result<Value, (String, String)> {
+    if config.fatal_error.is_some() {
+        return Err((
+            "not_authenticated".to_string(),
+            "slack plugin is in fatal-config state — see slack.auth_status".to_string(),
+        ));
+    }
+    let creds = socket_mode::current_credentials(config, &**store).ok_or((
+        "not_authenticated".to_string(),
+        "no Slack credentials available — run `turm-plugin-slack auth` or set env tokens"
+            .to_string(),
+    ))?;
+    let channel = params.get("channel").and_then(Value::as_str).ok_or((
+        "invalid_params".to_string(),
+        "missing 'channel' (string)".to_string(),
+    ))?;
+    let ts = params.get("ts").and_then(Value::as_str).ok_or((
+        "invalid_params".to_string(),
+        "missing 'ts' (string)".to_string(),
+    ))?;
+    // Slack channel ids start with C/D/G/U and are uppercase
+    // alphanumeric. ts looks like "1700000000.000100" — digits and
+    // exactly one dot. Validate to close the same trust-boundary
+    // gap Discord's send_message guards against (a malicious
+    // trigger pushing `../auth.test` into the URL position would
+    // re-route the authenticated request).
+    if !is_valid_slack_id(channel) {
+        return Err((
+            "invalid_params".to_string(),
+            format!("'channel' must be a Slack id (alphanumeric); got {channel:?}"),
+        ));
+    }
+    if !is_valid_slack_ts(ts) {
+        return Err((
+            "invalid_params".to_string(),
+            format!("'ts' must be a Slack timestamp (digits.digits); got {ts:?}"),
+        ));
+    }
+    match socket_mode::get_message(&creds.bot_token, channel, ts) {
+        Ok(value) => Ok(value),
+        // Slack errors come through in two shapes:
+        //   - bare error code (`channel_not_found`, `not_in_channel`,
+        //     `missing_scope`, `message_not_found`)
+        //   - prefix + suffix (`rate_limited (Retry-After: 30)`,
+        //     `conversations.history HTTP 503: <body>`)
+        // Promote the bare-code prefix to the top-level error code
+        // when it parses as Slack-shaped (lowercase + underscore
+        // only — every documented Slack error code is in that
+        // charset). Transport-shaped messages (with `.`, digits,
+        // mixed case in the prefix) stay under `io_error` with the
+        // full body preserved in the message field.
+        Err(err) => {
+            let bare = err
+                .split(|c: char| c.is_whitespace() || c == '(')
+                .next()
+                .unwrap_or("");
+            if !bare.is_empty() && bare.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+                Err((bare.to_string(), err))
+            } else {
+                Err(("io_error".to_string(), err))
+            }
+        }
+    }
+}
+
+/// Slack object ids: `[A-Z0-9]+`. Channels start with C/D/G; users
+/// with U/W; teams with T. We don't enforce the prefix because
+/// `slack.get_message` is also useful for DM channels (D…) and
+/// shared-channel mirrors. Just enforce the charset.
+fn is_valid_slack_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// Slack timestamps are `<seconds>.<microseconds>` — two decimal
+/// segments separated by exactly one `.`. Both segments are digits
+/// only.
+fn is_valid_slack_ts(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 2
+        && !parts[0].is_empty()
+        && !parts[1].is_empty()
+        && parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn handle_post_message(

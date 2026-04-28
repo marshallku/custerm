@@ -1,27 +1,46 @@
-# Example triggers driven by the Slack plugin (Phase 11.1 events +
-# Phase 11.2 raw firehose).
+# Example triggers driven by the Slack plugin (Phase 11 + reaction
+# parity with Discord 2.5).
 #
-# The plugin emits THREE event kinds:
-#   - `slack.mention` — `app_mention` events (real human mentions).
-#   - `slack.dm`      — direct messages from real humans.
-#   - `slack.raw`     — every events_api frame (unfiltered firehose,
-#                       includes mention/dm/edits/joins/channel_renames/...)
-#                       intended for the archive trigger below.
+# The plugin emits FOUR event kinds:
+#   - `slack.mention`  — `app_mention` events (real human mentions).
+#   - `slack.dm`       — direct messages from real humans.
+#   - `slack.reaction` — `reaction_added` for message reactions
+#                        (file reactions filtered out). Self-reactions
+#                        guarded by bot_user_id from the store.
+#   - `slack.raw`      — every events_api frame (unfiltered firehose,
+#                        intended for the archive trigger below).
 #
-# Mention/DM payload shape (Phase 11.1):
+# Mention/DM payload shape:
 #   { user, channel, text, ts, thread_ts, team_id, event_id }
 #
-# Raw payload shape (Phase 11.2):
+# Reaction payload shape:
+#   { channel, ts, user, reaction, item_user, permalink, team_id, event_id }
+#   where `permalink` is fetched via chat.getPermalink at event time
+#   (best-effort, may be null on API failure). Use `permalink` to
+#   embed a click-to-open link in a captured Todo body.
+#
+# Raw payload shape:
 #   { event_type, channel, ts, team_id, event_id, event_json }
 #   where `event_json` is the verbatim Slack event object (blocks,
 #   files, attachments, edit-history, all of it).
 #
-# slack.post_message action (also Phase 11.2):
+# slack.post_message action:
 #   turmctl call slack.post_message --params \
 #     '{"channel":"C123","text":"hello","thread_ts":"1700000000.000100"}'
 #   Returns {ts, channel} on success; surfaces Slack error codes
 #   (missing_scope / not_in_channel / channel_not_found / etc.)
 #   verbatim as `io_error`.
+#
+# slack.get_message action:
+#   turmctl call slack.get_message --params \
+#     '{"channel":"C123","ts":"1700000000.000100"}'
+#   Returns the full Slack message object on success. Failure codes
+#   surface STRUCTURALLY at the action's top-level error code so
+#   triggers can payload-match: `channel_not_found`, `not_in_channel`,
+#   `missing_scope`, `message_not_found` (when ts doesn't resolve).
+#   Channel id and ts are validated as Slack-shaped before
+#   interpolation to close the same trust-boundary path-injection
+#   gap the Discord helpers guard against.
 
 # ---------------------------------------------------------------------
 # 1. Raw archive — capture EVERY Slack frame to .raw/slack/<team>/<event_id>.json
@@ -99,3 +118,57 @@ event_kind = "slack.mention"
 #    action (Phase 11.3 candidate). Kept here as a "future composable"
 #    sketch.
 # ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# 5. Emoji-react → Todo capture (parity with Discord 2.5)
+#
+# Use case: see something in Slack, react with :memo:, turm captures
+# the message as a Todo with the permalink + body. Uses Phase 14.2
+# `await` to correlate the get_message reply with THIS specific
+# trigger instance — without correlation every successful
+# get_message would trigger every reaction-driven todo.
+#
+# Two-trigger chain:
+#   - `slack-memo-capture-fetch` fires on `slack.reaction`,
+#     filtered to reaction="memo", and dispatches `slack.get_message`.
+#     The await waits for `slack.get_message.completed` and
+#     synthesizes `slack-memo-capture-fetch.awaited` carrying the
+#     reaction event's fields at top level + the Slack message
+#     object nested under `event.await:`.
+#   - `slack-memo-capture-create` listens for that synthesized
+#     event (unique per trigger), so other unrelated get_message
+#     calls don't trigger Todo creation.
+#
+# Reaction names in Slack don't include colons — `event.reaction ==
+# "memo"` matches the `:memo:` reaction. The condition lexer
+# supports unicode strings as well, so `event.reaction == "📝"`
+# would work for actual unicode emoji reactions.
+# ---------------------------------------------------------------------
+# [[triggers]]
+# name = "slack-memo-capture-fetch"
+# action = "slack.get_message"
+# params = { channel = "{event.channel}", ts = "{event.ts}" }
+# condition = """event.reaction == "memo" """
+# [triggers.when]
+# event_kind = "slack.reaction"
+# [triggers.await]
+# event_kind = "slack.get_message.completed"
+# timeout_seconds = 10
+# on_timeout = "abort"
+#
+# [[triggers]]
+# name = "slack-memo-capture-create"
+# action = "todo.create"
+# params = { title = "Slack capture {event.ts}", body = """
+# {event.await.text}
+#
+# Source: {event.permalink}
+# """, workspace = "default" }
+# [triggers.when]
+# event_kind = "slack-memo-capture-fetch.awaited"
+#
+# `event.permalink` reads the original reaction event's permalink
+# (top-level after build_awaited_payload nests the get_message reply
+# under `await:`), so the link points to the user's reacted-on
+# message rather than to the bot's API call. May be null if
+# chat.getPermalink failed at event time.
