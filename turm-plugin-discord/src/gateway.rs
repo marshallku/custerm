@@ -38,10 +38,10 @@
 //! `heartbeat_interval / 4` so we wake up at least four times per
 //! interval to check for due heartbeats and the zombie deadline.
 //!
-//! Intents (37376 = 0x9200): GUILD_MESSAGES (1<<9) | DIRECT_MESSAGES
-//! (1<<12) | MESSAGE_CONTENT (1<<15). Privileged MESSAGE_CONTENT must
-//! be enabled on the application's Bot tab; we surface a clear error
-//! if Discord rejects IDENTIFY due to it (close code 4014).
+//! Intents bitfield: see `GATEWAY_INTENTS` constant below for the
+//! current value and per-bit purpose. Privileged MESSAGE_CONTENT
+//! must be enabled on the application's Bot tab; we surface a clear
+//! error if Discord rejects IDENTIFY due to it (close code 4014).
 
 use std::io::ErrorKind;
 use std::sync::Arc;
