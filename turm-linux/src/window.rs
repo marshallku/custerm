@@ -40,16 +40,18 @@ pub struct TurmWindow {
     /// by a refcount drop.
     #[allow(dead_code)]
     service_supervisor: Arc<ServiceSupervisor>,
-    /// Hidden 1x1 zero-opacity `WebView` loaded with `about:blank` at
-    /// window construction time so WebKit's auxiliary services
-    /// (NetworkProcess, GPU process, xdg-portal D-Bus connections)
-    /// are already warm by the time the user opens their first
-    /// plugin panel. Without this, on cold boot the first plugin
-    /// panel's `load_uri()` hangs in WebProcess startup until
-    /// something else (e.g. spawning a second turm) wakes the
-    /// underlying daemons — see commit 78ebdb1 for the diagnostic
+    /// Hidden 1x1 zero-opacity `WebView` loaded with a tiny
+    /// `file://$TMPDIR/turm-prewarm-<pid>.html` stub at window
+    /// construction time so WebKit's host-side auxiliary services
+    /// (xdg-desktop-portal lazy systemd activation, bubblewrap
+    /// sandbox setup, document-portal D-Bus handshake) are already
+    /// warm by the time the user opens their first plugin panel.
+    /// Without this, on cold boot the first plugin panel's
+    /// `load_uri()` hangs in WebProcess startup until something
+    /// else (e.g. spawning a second turm) wakes the underlying
+    /// daemons — see commit 78ebdb1 for the diagnostic
     /// instrumentation that surfaced the symptom. Stored on the
-    /// struct so the WebContext stays live for the window's
+    /// struct so the `WebContext` stays live for the window's
     /// lifetime; dropping it would let WebKit reap the warmed
     /// auxiliary processes.
     #[allow(dead_code)]
