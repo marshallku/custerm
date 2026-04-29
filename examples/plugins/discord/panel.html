@@ -1007,9 +1007,20 @@ function renderCard(ev) {
     rxnBody = `<div class="discord-card__rxn-body" data-rxn-body="${esc(key)}">${cached === undefined ? 'fetching…' : esc(cached || '(empty)')}</div>`;
   }
 
-  // Reply composer — applies to mention/dm/message; skip for reaction
+  // Per-card composer — applies to mention/dm/message; skip for reaction
   // since "replying to a reaction" is conceptually wrong (reply to the
-  // reacted-on message instead, via the open link).
+  // reacted-on message via the open link instead).
+  //
+  // IMPORTANT: this is NOT a true Discord reply. `discord.send_message`
+  // doesn't accept `message_reference` today — it only takes
+  // `{channel_id, content}` — so the post lands as a plain channel
+  // message with no inline-reply pointer to the source. The
+  // affordance value is "channel id pre-filled, you don't have to
+  // copy-paste it"; not "Discord client renders this with a reply
+  // arrow." Button text and hint say SEND, not REPLY, to keep that
+  // honest. A future enhancement would extend `discord.send_message`
+  // with `message_reference`; until then users who want true replies
+  // use Discord's own client via the `open` link.
   const replyComposer = expanded && ev.kind !== 'reaction' ? `
     <form class="discord-composer discord-composer--reply" data-reply="${esc(ev.id)}">
       <div class="discord-composer__row">
@@ -1017,11 +1028,11 @@ function renderCard(ev) {
                value="${esc(p.channel_id || '')}" readonly />
         <div class="discord-composer__divider"></div>
         <textarea class="discord-composer__textarea" name="content"
-                  placeholder="reply…" rows="1" maxlength="2000"
+                  placeholder="send to #${esc(p.channel_id || '')}…" rows="1"
                   spellcheck="false"></textarea>
-        <button class="discord-composer__send" type="submit">REPLY</button>
+        <button class="discord-composer__send" type="submit">SEND</button>
       </div>
-      <div class="discord-composer__hint">⌘+enter / esc · 2000 char limit</div>
+      <div class="discord-composer__hint">posts as plain channel message (no reply ref) · ⌘+enter / esc · 2000 char limit</div>
     </form>` : '';
 
   const openLink = p.message_url

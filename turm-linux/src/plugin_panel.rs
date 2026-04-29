@@ -84,7 +84,18 @@ fn build_bridge_js(plugin_name: &str, panel_name: &str, panel_id: &str) -> Strin
                 JSON.stringify({{ method, params }})
             );
             const parsed = JSON.parse(resp);
-            if (!parsed.ok) throw new Error(parsed.error?.message || "Unknown error");
+            if (!parsed.ok) {{
+                // Preserve the structured error code on the thrown
+                // Error so panel-side branches (e.g. routing
+                // `service_unavailable` to a transport-error view
+                // vs `not_authenticated` to a setup view) can
+                // discriminate. Without this, every failure
+                // collapses into a single message string and
+                // panels lose the ability to react meaningfully.
+                const err = new Error(parsed.error?.message || "Unknown error");
+                err.code = parsed.error?.code;
+                throw err;
+            }}
             return parsed.result;
         }},
         on(type, callback) {{
