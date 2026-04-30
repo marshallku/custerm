@@ -16,6 +16,7 @@ turmctl [--socket <path>] [--json] <command>
 ### System
 
 - `turmctl ping` — ping running instance
+- `turmctl context [--full]` — workflow context. **Default (human mode)** aggregates: active panel + cwd, resolved workspace + git status (branch, ahead/behind, dirty), open + in-progress todos for that workspace, calendar events in the next 2h, slack/discord auth state. Each section degrades to `(unavailable)` independently when its action call fails. **`--json`** (without `--full`) returns the raw `context.snapshot` shape (`{active_panel, active_cwd}`) verbatim, for backward compatibility with scripts already piping it. **`--json --full`** emits the aggregate as a single JSON object — useful for scripting "what's the user's current cross-plugin state?" without N round-trips. Workspace resolution mirrors the `turmctl git` cwd-derive (longest-prefix match against `path` or `worktree_root`, both canonicalized); when cwd doesn't match any workspace, workspace-bound sections (git, todos) are simply skipped — the CLI doesn't pretend the user is in a workspace they're not.
 
 ### Session
 

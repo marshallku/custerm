@@ -15,5 +15,6 @@
 //! prefix-resolution rules, output formats — without bloating
 //! `commands.rs`.
 
+pub mod context;
 pub mod git;
 pub mod todo;

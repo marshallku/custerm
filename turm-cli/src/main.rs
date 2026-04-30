@@ -46,6 +46,16 @@ fn main() {
     if let Command::Git(cmd) = &cli.command {
         std::process::exit(plugin_cmds::git::dispatch(cmd, &socket_path, cli.json));
     }
+    // Phase 19.2 context aggregator. Bypass to the new dispatcher
+    // unless the user is explicitly asking for the raw legacy shape
+    // (`--json` without `--full`) — that path stays on the generic
+    // `cli.method() / cli.params()` flow so any script piping the
+    // bare snapshot keeps working.
+    if let Command::Context { full } = &cli.command
+        && (!cli.json || *full)
+    {
+        std::process::exit(plugin_cmds::context::dispatch(&socket_path, cli.json));
+    }
 
     let result = client::send_command(&socket_path, &cli.method(), cli.params());
 

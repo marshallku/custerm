@@ -24,8 +24,18 @@ pub enum Command {
     /// Ping the running turm instance
     Ping,
 
-    /// Show the current workflow context (active panel, cwd, …)
-    Context,
+    /// Show the current workflow context. Default mode (or with
+    /// `--full`) aggregates panel + cwd + git status + todos +
+    /// calendar (next 2h) + messenger auth into one view.
+    /// `--json` (without `--full`) keeps the raw `context.snapshot`
+    /// shape for backward compatibility with scripts piping it;
+    /// `--json --full` emits the aggregate as a single object.
+    Context {
+        /// Aggregate cross-plugin context (default in human mode;
+        /// opt-in for `--json`).
+        #[arg(long)]
+        full: bool,
+    },
 
     /// Panel management
     #[command(subcommand)]
@@ -430,7 +440,7 @@ impl Cli {
     pub fn method(&self) -> String {
         match &self.command {
             Command::Ping => "system.ping".to_string(),
-            Command::Context => "context.snapshot".to_string(),
+            Command::Context { .. } => "context.snapshot".to_string(),
             Command::Session(cmd) => match cmd {
                 SessionCommand::List => "session.list",
                 SessionCommand::Info { .. } => "session.info",
@@ -523,7 +533,7 @@ impl Cli {
     pub fn params(&self) -> serde_json::Value {
         match &self.command {
             Command::Ping => json!({}),
-            Command::Context => json!({}),
+            Command::Context { .. } => json!({}),
             Command::Session(cmd) => match cmd {
                 SessionCommand::List => json!({}),
                 SessionCommand::Info { id } => json!({ "id": id }),
