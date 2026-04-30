@@ -99,31 +99,40 @@ WebProcess CRASHED
 **Cause:** gio 0.20 uses builder pattern, not positional args.
 **Fix:** Use `connection.register_object(path, &interface_info).method_call(closure).build()`.
 
-### Plugin/webview panel frozen on last frame after Hyprland workspace switch
+### Plugin/webview panel frozen on last frame after Hyprland workspace switch — known upstream limitation
 
-**Symptom:** Plugin panel (or any `webkit6::WebView`) renders fine on first show. User switches to a different Hyprland workspace, then comes back. Panel is stuck on the last frame — appears alive but doesn't repaint, doesn't respond to bus events visually. Right-clicking → "Inspect Element" instantly revives the panel; OR focusing another window and coming back also revives it.
+**Symptom:** Plugin panel (or any `webkit6::WebView`) renders fine on first show. User switches to a different Hyprland workspace, then comes back. Panel is stuck on the last frame — appears alive (backend healthy, WebProcess alive, IPC responsive) but doesn't repaint. Right-click → "Inspect Element" revives instantly. Focusing another window and coming back also revives it.
 
-**Cause:** When Hyprland (or any wlroots-based compositor with scene-graph workspaces) switches workspace, the wl_surface is NOT unmapped — it's just hidden in the scene graph. So GTK4's `map` signal does NOT fire on workspace toggle. But WebKit's compositor still gets confused and stops pushing frames; opening dev tools revives it (dev-tools attach schedules a JS task → layout → paint), and so does focusing another window and coming back (the toplevel `is_active` toggles, GTK natural focus handling triggers a redraw).
+**Status: known upstream limitation in WebKitGTK 6.0 ↔ Hyprland interaction. Not fixable in turm-side code.**
 
-The load-bearing distinction: same-window focus changes self-recover (because widget-level focus moves in/out of the WebView), but pure workspace switch keeps the WebView focused throughout — only the toplevel's `is_active` changes. So we hook at the toplevel level.
-
-**Fix (round 2 — round 1's `connect_map` did not work because `map` doesn't fire on Hyprland workspace toggle):** Hook the toplevel window's `is-active` notify. When `is_active` flips back to true (= turm window regained focus, whether via focus-back or workspace-switch-back), run a trivial `evaluate_javascript("0", …)` on the WebView so the JS scheduler kicks WebKit into pushing a fresh frame. Connect through `connect_realize` because the widget's `root()` (= toplevel window) is only valid once the widget is in the window tree.
-
-```rust
-webview.connect_realize(|wv| {
-    let Some(root) = wv.root() else { return };
-    let Some(window) = root.downcast_ref::<gtk4::Window>() else { return };
-    let wv2 = wv.clone();
-    window.connect_is_active_notify(move |w| {
-        if w.is_active() {
-            wv2.evaluate_javascript("0", None, None,
-                gtk4::gio::Cancellable::NONE, |_| {});
-        }
-    });
-});
+**Reproduction outside turm:** Spawn the official WebKitGTK reference browser:
 ```
+/usr/lib/webkitgtk-6.0/MiniBrowser https://www.google.com
+```
+on Hyprland and switch workspaces. Same freeze. This is zero turm code, so the bug is upstream.
 
-Applied at `turm-linux/src/plugin_panel.rs` (per-panel) and `turm-linux/src/webview.rs` (generic webview panel). Distinct from cold-boot blank panel (different mechanism — see commit `bb9c1f1` prewarm).
+**What was ruled out empirically (rounds 1–5, all reverted):**
+- Round 1 — `webview.connect_map(|wv| wv.evaluate_javascript("0"))`: signal never fires; Hyprland uses scene-graph hide without `wl_surface.unmap`.
+- Round 2 — toplevel `is-active` notify + `evaluate_javascript("0")`: hook fires correctly per stderr capture; nudge insufficient.
+- Round 3 — `is-active` + `GdkToplevel:state` notify with `queue_draw()` on both: hooks fire, queue_draw runs (verified via stderr); panel still freezes.
+- Round 4 — same hooks + `set_visible(false); set_visible(true)` on `GDK_TOPLEVEL_STATE_SUSPENDED` rising-edge clear: hook fires, toggle runs; freeze persists.
+- Round 5 — same hooks + full `webview.reload()` on suspended-clear: freeze persists, AND reload destroys panel state on every workspace return (bad UX, net negative).
+- Environment variables that did NOT help: `WEBKIT_DISABLE_DMABUF_RENDERER=1`, `GSK_RENDERER=cairo`, `WEBKIT_DISABLE_COMPOSITING_MODE=1`, `__EGL_VENDOR_LIBRARY_FILENAMES=…/50_mesa.json` (forcing Mesa EGL on NVIDIA).
+- Hardware: reproduces on NVIDIA RTX 3060 Ti (driver 595.71.05) AND on a separate integrated-graphics laptop. Not GPU-vendor-specific.
+- Compositor versions: Hyprland 0.54.3 (no longer wlroots-based) + WebKitGTK 2.52.3.
+
+**Why no application-level fix worked:** The freeze is in WebKit's compositor frame-production path after the wl_surface gets the SUSPENDED bit and then has it cleared. The bit DOES toggle on Hyprland (verified via `connect_state_notify` logs), but WebKit's render scheduler doesn't resume pushing frames on bit-clear unless an actual input event (pointer, dev-tools attach via JS pump from inspector init) drives it. There is no public WebKitGTK 6.0 API to tell the WebProcess "visibility changed, resume rendering."
+
+**User-facing workaround:** Click anywhere in the panel after coming back from a workspace, OR focus another window then refocus turm, OR right-click → Inspect Element. All three paths cause WebKit's compositor to resume.
+
+**Possible future paths (not pursued):**
+- File upstream issue at `bugs.webkit.org` and `github.com/hyprwm/Hyprland` with the MiniBrowser reproducer.
+- Wait for an upstream fix in WebKitGTK or Hyprland.
+- Replace the panel rendering layer (move away from WebKit) — large scope.
+
+**Distinct from cold-boot blank panel** (different mechanism — see commit `bb9c1f1` prewarm).
+
+The diagnostic signal hooks (`load_changed` / `load_failed` / `web_process_terminated`) added in commit `78ebdb1` remain in `plugin_panel.rs` because they are general-purpose, not specific to this freeze.
 
 ---
 

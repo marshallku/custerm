@@ -306,69 +306,23 @@ impl PluginPanel {
             });
         }
 
-        // Wayland workspace-switch freeze workaround. Symptom:
-        // user opens a plugin panel → switches Hyprland workspace
-        // away → comes back → panel is stuck on the last frame
-        // (backend healthy, WebProcess alive, only rendering is
-        // frozen). Recovers when the user opens dev-tools, clicks
-        // inside, OR focuses another window and comes back. The
-        // last clue is the load-bearing one: refocusing turm
-        // through a focus path revives it.
-        //
-        // Round 1 of this fix hooked `connect_map` thinking
-        // Hyprland would unmap/remap the wl_surface on workspace
-        // change. It doesn't — wlroots scene-graph hides the
-        // surface without unmapping, so `map` never fires for the
-        // workspace toggle. Round 2 (this) hooks the toplevel
-        // window's `is-active` notify, which DOES toggle on
-        // workspace switch (the focused window changes when the
-        // active workspace changes). When `is_active` flips back
-        // to true (= turm window regained focus, whether via
-        // focus-back or workspace-switch-back), nudge the JS
-        // scheduler with a trivial evaluate so WebKit's compositor
-        // schedules layout + paint and pushes a fresh frame.
-        //
-        // Same-window focus changes already self-recover without
-        // code, because GTK's natural focus handling on the
-        // WebView itself triggers redraws when widget focus
-        // arrives. Workspace switches leave the WebView focused
-        // throughout (only the toplevel's `is_active` changes), so
-        // widget-level focus doesn't fire — that's why we hook the
-        // toplevel.
-        //
-        // We connect through `connect_realize` because the widget's
-        // `root()` (= toplevel window) is only valid once the
-        // widget is in the window tree. Realization fires once for
-        // the panel's lifetime, so this installs exactly one
-        // is_active handler per panel.
-        //
-        // Distinct from the cold-boot prewarm (window.rs) — that
-        // warms host-side daemons before any panel opens; this
-        // recovers a per-panel frozen-frame after the panel is
-        // already alive.
-        {
-            let label = panel_label.clone();
-            webview.connect_realize(move |wv| {
-                let Some(root) = wv.root() else { return };
-                let Some(window) = root.downcast_ref::<gtk4::Window>() else {
-                    return;
-                };
-                let wv_for_handler = wv.clone();
-                let label_for_handler = label.clone();
-                window.connect_is_active_notify(move |w| {
-                    if w.is_active() {
-                        wv_for_handler.evaluate_javascript(
-                            "0",
-                            None,
-                            None,
-                            gtk4::gio::Cancellable::NONE,
-                            |_| {},
-                        );
-                        eprintln!("[panel:{label_for_handler}] is_active=true: nudged compositor");
-                    }
-                });
-            });
-        }
+        // Note on the "panel freezes after Hyprland workspace switch"
+        // symptom — confirmed upstream limitation, NOT fixable in
+        // turm-side code. See `docs/troubleshooting.md` for the full
+        // history. Reproduced with the official WebKitGTK MiniBrowser
+        // (zero turm code) and on a separate integrated-graphics
+        // laptop, ruling out turm code, NVIDIA-specific paths, the
+        // GSK renderer, the WebKit DMA-BUF renderer, and EGL vendor
+        // selection. Application-level workarounds tried and proven
+        // ineffective: `connect_map` JS nudge (signal doesn't fire
+        // because Hyprland scene-graph hides without unmap),
+        // `is-active` + JS evaluate / queue_draw, `GdkToplevel:state`
+        // SUSPENDED-clear + queue_draw / set_visible toggle / full
+        // `webview.reload()`. Empirical workaround for users:
+        // click in the panel, or focus another window and back, or
+        // right-click → Inspect Element. Diagnostic signal hooks
+        // above (load_changed / load_failed / web_process_terminated)
+        // are general-purpose and stay in place.
 
         webview.load_uri(&uri);
 
