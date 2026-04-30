@@ -43,6 +43,9 @@ fn main() {
     if let Command::Todo(cmd) = &cli.command {
         std::process::exit(plugin_cmds::todo::dispatch(cmd, &socket_path, cli.json));
     }
+    if let Command::Git(cmd) = &cli.command {
+        std::process::exit(plugin_cmds::git::dispatch(cmd, &socket_path, cli.json));
+    }
 
     let result = client::send_command(&socket_path, &cli.method(), cli.params());
 

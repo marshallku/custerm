@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+use crate::plugin_cmds::git::GitCommand;
 use crate::plugin_cmds::todo::TodoCommand;
 
 #[derive(Parser)]
@@ -70,6 +71,12 @@ pub enum Command {
     /// with prefix-resolved ids and a human-readable list view)
     #[command(subcommand)]
     Todo(TodoCommand),
+
+    /// Git plugin shortcuts (Phase 19.1b — wraps `git.*` actions
+    /// with cwd-derived workspace defaulting + human-readable
+    /// table renderers for workspaces / worktrees / status)
+    #[command(subcommand)]
+    Git(GitCommand),
 
     /// Status bar management
     #[command(subcommand)]
@@ -506,6 +513,9 @@ impl Cli {
             Command::Todo(_) => {
                 unreachable!("todo commands are dispatched via plugin_cmds::todo")
             }
+            Command::Git(_) => {
+                unreachable!("git commands are dispatched via plugin_cmds::git")
+            }
             Command::Call { method, .. } => method.clone(),
         }
     }
@@ -612,6 +622,9 @@ impl Cli {
             }
             Command::Todo(_) => {
                 unreachable!("todo commands are dispatched via plugin_cmds::todo")
+            }
+            Command::Git(_) => {
+                unreachable!("git commands are dispatched via plugin_cmds::git")
             }
             Command::Call { params, .. } => {
                 serde_json::from_str(params).unwrap_or_else(|_| json!({}))

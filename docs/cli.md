@@ -99,6 +99,19 @@ Ergonomic wrapper over the `todo.*` action surface. Every subcommand is sugar ov
 
 **ID prefix matching**: every `<id>` argument accepts a unique prefix. The CLI preflights `todo.list` to find candidates and resolves the workspace alongside, so a todo in a non-default workspace works without the user passing `--workspace`. Todo ids are workspace-scoped (not globally unique) — if the same id exists in multiple workspaces, the CLI errors out with the candidate list and the user disambiguates via `--workspace <ws>` (or a longer prefix). Exact-id collisions are NOT silently resolved.
 
+### Git (Phase 19.1b)
+
+Ergonomic wrapper over the `git.*` action surface. Every subcommand is sugar over `turmctl call git.<name> --params '...'`; no new IPC.
+
+- `turmctl git workspaces` — list configured workspaces (`git.list_workspaces`). Default render: `<name>  <branch>  wt=<count>  <path>`.
+- `turmctl git worktrees [--workspace <ws>]` — list worktrees for a workspace (`git.list_worktrees`). Default render: `<head8>  <branch>  <path> [tags]` where tags include `locked` / `prunable`.
+- `turmctl git wt add <branch> [--workspace <ws>] [--sanitize-jira]` — create a worktree (`git.worktree_add`). `--sanitize-jira` matches the Phase 15.2 vision-flow-3 trigger contract (lowercase + slash-preserve before branch validation).
+- `turmctl git wt remove <path> [--force]` — remove a worktree (`git.worktree_remove`). `path` must be under a configured workspace's `path` or `worktree_root`.
+- `turmctl git branch [--workspace <ws>]` — print the current branch of a workspace's primary checkout (`git.current_branch`).
+- `turmctl git status [--workspace <ws> | --path <path>]` — working-tree status (`git.status`). Renders `<branch> → <upstream> <ahead>↑<behind>↓  clean/dirty` plus staged/unstaged/untracked counts when dirty.
+
+**Workspace defaulting** (every command except `workspaces`, `wt remove`, `status --path`): explicit `--workspace` flag → `TURM_GIT_DEFAULT_WORKSPACE` env → cwd-derived (preflights `git.list_workspaces` and matches the longest prefix of the cwd against either the workspace's `path` OR its `worktree_root`, so `cd` into a created worktree under `<repo>-worktrees/<branch>` resolves correctly) → single-config-entry → error with the candidate list. The cwd-derive is the killer ergonomic — `cd` into a worktree, run `turmctl git status`, get the right answer.
+
 ### Theme
 
 - `turmctl theme list` — list available themes and current theme
