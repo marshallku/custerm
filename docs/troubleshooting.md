@@ -217,3 +217,11 @@ Also added `("background", "image")` as an alias for `("background", "path")` to
 **Cause:** OSC 7 delivers a `file://hostname/path` URI (e.g. `file://Marshalls-MacBook-Pro.local/Users/marshallku`). Simply stripping `file://` leaves the hostname in the path.
 
 **Fix:** Use `URL(string: directory).path` to correctly extract only the POSIX path component, discarding the scheme and hostname.
+
+### macOS: Web tab opens with no URL bar — only "Open a URL to get started"
+
+**Cause:** `WebViewController.loadView` set `view = wv` (the bare `WKWebView`), so the only way to navigate was the `webview.navigate` socket command. Linux's `WebViewPanel` ships a Catppuccin-themed toolbar (back / forward / reload / URL entry / devtools) above the webview; macOS lacked the entire toolbar.
+
+**Fix:** Wrap the `WKWebView` in an `NSView` container with an `NSStackView` toolbar above it. Toolbar buttons use SF Symbols (`chevron.left`, `chevron.right`, `arrow.clockwise`, `wrench.and.screwdriver`) and call existing `goBack` / `goForward` / `reload` / `toggleDevTools`. URL `NSTextField` fires its action on Enter and routes through `navigate(to:)`, which already handles the `https://` prefixing.
+
+Back/forward enabled state and URL field text sync via KVO on `WKWebView.canGoBack` / `canGoForward` / `url` — `WKWebView` is KVO-compliant for these. The URL sync skips updates while the field's editor is the first responder so it doesn't clobber what the user is typing. On a blank tab (no `startURL`), `viewDidAppear` focuses the URL field so the user can type immediately.

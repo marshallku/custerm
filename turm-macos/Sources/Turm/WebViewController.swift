@@ -12,6 +12,12 @@ final class WebViewController: NSViewController, TurmPanel {
     private var startURL: URL?
     private var started = false
 
+    private var urlField: NSTextField!
+    private var backButton: NSButton!
+    private var forwardButton: NSButton!
+    private var reloadButton: NSButton!
+    private var observations: [NSKeyValueObservation] = []
+
     /// Set by AppDelegate after EventBus is created.
     weak var eventBus: EventBus?
 
@@ -29,10 +35,121 @@ final class WebViewController: NSViewController, TurmPanel {
         let config = WKWebViewConfiguration()
         // Enable Safari Web Inspector (right-click → Inspect Element)
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
-        let wv = WKWebView(frame: NSRect(x: 0, y: 0, width: 1200, height: 800), configuration: config)
+        let wv = WKWebView(frame: .zero, configuration: config)
         wv.navigationDelegate = self
+        wv.translatesAutoresizingMaskIntoConstraints = false
         webView = wv
-        view = wv
+
+        let back = makeToolbarButton(symbol: "chevron.left", tooltip: "Back", action: #selector(backTapped))
+        let forward = makeToolbarButton(symbol: "chevron.right", tooltip: "Forward", action: #selector(forwardTapped))
+        let reload = makeToolbarButton(symbol: "arrow.clockwise", tooltip: "Reload", action: #selector(reloadTapped))
+        let devtools = makeToolbarButton(symbol: "wrench.and.screwdriver", tooltip: "DevTools", action: #selector(devtoolsTapped))
+        back.isEnabled = false
+        forward.isEnabled = false
+        backButton = back
+        forwardButton = forward
+        reloadButton = reload
+
+        let field = NSTextField()
+        field.placeholderString = "Enter URL or search…"
+        field.bezelStyle = .roundedBezel
+        field.font = .systemFont(ofSize: 12)
+        field.usesSingleLineMode = true
+        field.lineBreakMode = .byTruncatingTail
+        field.cell?.sendsActionOnEndEditing = false
+        field.target = self
+        field.action = #selector(urlFieldSubmit(_:))
+        field.translatesAutoresizingMaskIntoConstraints = false
+        if let url = startURL { field.stringValue = url.absoluteString }
+        urlField = field
+
+        let toolbar = NSStackView(views: [back, forward, reload, field, devtools])
+        toolbar.orientation = .horizontal
+        toolbar.spacing = 4
+        toolbar.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView()
+        container.addSubview(toolbar)
+        container.addSubview(wv)
+
+        NSLayoutConstraint.activate([
+            toolbar.topAnchor.constraint(equalTo: container.topAnchor),
+            toolbar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            toolbar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            wv.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
+            wv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            wv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            wv.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+
+        view = container
+
+        observations = [
+            wv.observe(\.canGoBack, options: [.new, .initial]) { [weak self] wv, _ in
+                Task { @MainActor in self?.backButton?.isEnabled = wv.canGoBack }
+            },
+            wv.observe(\.canGoForward, options: [.new, .initial]) { [weak self] wv, _ in
+                Task { @MainActor in self?.forwardButton?.isEnabled = wv.canGoForward }
+            },
+            wv.observe(\.url, options: [.new]) { [weak self] wv, _ in
+                Task { @MainActor in self?.syncURLField(wv.url) }
+            },
+        ]
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        if startURL == nil, urlField?.stringValue.isEmpty == true {
+            view.window?.makeFirstResponder(urlField)
+        }
+    }
+
+    private func makeToolbarButton(symbol: String, tooltip: String, action: Selector) -> NSButton {
+        let btn = NSButton()
+        btn.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
+        btn.bezelStyle = .regularSquare
+        btn.isBordered = false
+        btn.imageScaling = .scaleProportionallyDown
+        btn.toolTip = tooltip
+        btn.target = self
+        btn.action = action
+        btn.translatesAutoresizingMaskIntoConstraints = false
+        btn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        btn.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        return btn
+    }
+
+    private func syncURLField(_ url: URL?) {
+        guard let urlField else { return }
+        let s = url?.absoluteString ?? ""
+        guard !s.isEmpty, s != "about:blank" else { return }
+        // Don't clobber what the user is currently typing.
+        if view.window?.firstResponder === urlField.currentEditor() { return }
+        urlField.stringValue = s
+    }
+
+    @objc private func backTapped() {
+        goBack()
+    }
+
+    @objc private func forwardTapped() {
+        goForward()
+    }
+
+    @objc private func reloadTapped() {
+        reload()
+    }
+
+    @objc private func devtoolsTapped() {
+        toggleDevTools()
+    }
+
+    @objc private func urlFieldSubmit(_ sender: NSTextField) {
+        let text = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        navigate(to: text)
+        view.window?.makeFirstResponder(webView)
     }
 
     // MARK: - TurmPanel
