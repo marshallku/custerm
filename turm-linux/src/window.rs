@@ -1,11 +1,11 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, gio, glib};
+use gtk4::{Application, ApplicationWindow, gdk, gio, glib};
 use serde_json::json;
 use webkit6::prelude::WebViewExt;
 
@@ -345,6 +345,83 @@ impl TurmWindow {
                 pump_state_timer.borrow().drain_context_only(&ctx_pump);
             }
             glib::ControlFlow::Continue
+        });
+
+        // `window.restored` event publication (Phase WR-1).
+        //
+        // Watch the toplevel's `GDK_TOPLEVEL_STATE_SUSPENDED` bit and
+        // publish `window.restored` on the 1→0 transition — i.e. the
+        // compositor told us we were no longer visible/active and now
+        // we are again. The Hyprland WebKit-panel freeze (see
+        // `docs/troubleshooting.md`) leaves rendering stuck after this
+        // transition; user wires a trigger on this event to run
+        // `hyprctl dispatch resizeactive 1 0; ...` and force a render
+        // cycle. Generic hook — turm core has no Hyprland knowledge,
+        // user supplies the cure command via `[[triggers]]`.
+        //
+        // Detection only — `system.spawn` (the action that runs the
+        // cure) lands in WR-2 once user empirically confirms this
+        // event fires correctly + the `--batch` form of the cure
+        // works. SUSPENDED toggling on Hyprland is already verified
+        // (see troubleshooting.md), so the only WR-1 gate is "does
+        // our 1→0 detection emit the event at the right moments."
+        //
+        // Connected at `realize` because `Window::surface()` returns
+        // None until the window is realized; connecting at construct
+        // time silently no-ops.
+        let bus_for_state = event_bus.clone();
+        let last_suspended = Rc::new(Cell::new(false));
+        // Initialize so the FIRST 1→0 transition isn't suppressed by
+        // the leading-edge debounce. 1s back-dating is plenty: the
+        // user can't trigger a workspace cycle in the first 200ms of
+        // startup anyway.
+        let last_fired = Rc::new(Cell::new(Instant::now() - Duration::from_secs(1)));
+        window.connect_realize(move |w| {
+            let Some(surface) = w.surface() else {
+                eprintln!("[turm] window.restored: realize fired with no surface — disabled");
+                return;
+            };
+            let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() else {
+                eprintln!(
+                    "[turm] window.restored: surface is not a gdk::Toplevel — disabled (compositor/backend mismatch?)"
+                );
+                return;
+            };
+            // Seed `last_suspended` with the toplevel's CURRENT state so
+            // a window that's already SUSPENDED at attach time (e.g.,
+            // turm launched on a non-current Hyprland workspace) still
+            // emits `window.restored` on the first 1→0 transition. The
+            // default `false` would suppress it because `prev == current`
+            // == false even though the surface had been suspended all
+            // along.
+            last_suspended
+                .set(toplevel.state().contains(gdk::ToplevelState::SUSPENDED));
+            let bus = bus_for_state.clone();
+            let last = last_suspended.clone();
+            let last_fire = last_fired.clone();
+            toplevel.connect_state_notify(move |tl| {
+                let suspended = tl.state().contains(gdk::ToplevelState::SUSPENDED);
+                let prev = last.replace(suspended);
+                // Only the 1→0 transition fires `window.restored`.
+                if !prev || suspended {
+                    return;
+                }
+                // 1→0 transition. Apply 200ms leading-edge debounce
+                // so quick ping-pong (alt-tab back and forth) doesn't
+                // spam triggers — once we've fired, suppress until
+                // the window goes back into stable use.
+                let now = Instant::now();
+                if now.duration_since(last_fire.get()) < Duration::from_millis(200) {
+                    return;
+                }
+                last_fire.set(now);
+                eprintln!("[turm] window.restored: SUSPENDED bit cleared, publishing event");
+                bus.publish(BusEvent::new(
+                    "window.restored",
+                    "turm.window",
+                    json!({}),
+                ));
+            });
         });
 
         // Cleanup socket and tear down service plugins on window
