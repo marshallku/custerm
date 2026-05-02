@@ -19,11 +19,13 @@
 //!   inside the root that points outside.
 //! - Hidden directories (`.foo`) are skipped during walk.
 
+use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, FixedOffset, Local};
 
 use crate::frontmatter::{self, Frontmatter};
 
@@ -111,8 +113,23 @@ impl Store {
                 out.push(m);
             }
         }
-        // Newest first by captured_at, falling back to filesystem mtime.
-        out.sort_by(|a, b| b.captured_at.cmp(&a.captured_at));
+        // Newest first. `captured_at` is RFC3339 and may carry mixed
+        // timezone offsets across machines / hand-edits, so a raw
+        // string compare is not chronology-preserving (`...Z` vs
+        // `...+09:00` for the same instant). Parse to `DateTime` so
+        // the sort key is the actual instant. Unparseable values
+        // (hand-edited mistakes) sink to the bottom — better than
+        // letting them pollute the top of the list.
+        out.sort_by(|a, b| {
+            let pa = DateTime::<FixedOffset>::parse_from_rfc3339(&a.captured_at).ok();
+            let pb = DateTime::<FixedOffset>::parse_from_rfc3339(&b.captured_at).ok();
+            match (pa, pb) {
+                (Some(a), Some(b)) => b.cmp(&a),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
         out
     }
 
@@ -253,15 +270,41 @@ impl Store {
         let body = String::new();
         let rendered = frontmatter::render(&fm, &body);
 
-        atomic_write_new(&final_path, rendered.as_bytes())
-            .map_err(|e| StoreError::Io(format!("write {}: {e}", final_path.display())))?;
-
-        // Re-read so the surfaced Match reflects what landed on disk —
-        // and the path-safety re-check fires.
-        let m = self
-            .read_match(&final_path)
-            .ok_or_else(|| StoreError::Io("post-write re-read failed".into()))?;
-        Ok(CreateOutcome::Created(m))
+        match atomic_write_new(&final_path, rendered.as_bytes()) {
+            Ok(()) => {
+                // Re-read so the surfaced Match reflects what landed on
+                // disk — and the path-safety re-check fires.
+                let m = self
+                    .read_match(&final_path)
+                    .ok_or_else(|| StoreError::Io("post-write re-read failed".into()))?;
+                Ok(CreateOutcome::Created(m))
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // Lost the race: another writer (concurrent process or
+                // thread that also passed `find_by_urlhash` before us)
+                // created the same file between our dedup check and the
+                // `renameat2(RENAME_NOREPLACE)`. Re-run the dedup lookup
+                // — if the winner was a bookmark.add for the same URL,
+                // we now find it and report Existed for idempotent
+                // behavior. If the path was occupied by something
+                // foreign (a manually created file with our slug
+                // pattern but a different URL inside), we surface that
+                // explicitly rather than silently overwriting.
+                match self.find_by_urlhash(req.urlhash8) {
+                    Some(existing) => Ok(CreateOutcome::Existed(existing)),
+                    None => Err(StoreError::Io(format!(
+                        "target {} exists but doesn't match urlhash {} — \
+                         possibly a foreign file at the same path",
+                        final_path.display(),
+                        req.urlhash8
+                    ))),
+                }
+            }
+            Err(e) => Err(StoreError::Io(format!(
+                "write {}: {e}",
+                final_path.display()
+            ))),
+        }
     }
 
     pub fn delete(&self, m: &Match) -> Result<(), StoreError> {
@@ -334,19 +377,18 @@ fn id_from_filename(path: &Path) -> Option<String> {
     }
 }
 
-/// Write a new file atomically. Errors out if the target already
-/// exists — the caller has already done its dedup check via urlhash8.
-/// Implementation: write to `<final>.tmp.<pid>.<nanos>`, then rename.
-/// The final rename is `link + unlink` semantics under POSIX, so a
-/// reader that opens the path during the rename either sees the old
-/// inode (if any) or the new one, never a partially written file.
+/// Atomically create a new file at `final_path`. **No-replace**: if a
+/// file already exists at the target — even one that appeared between
+/// the caller's dedup check and this write — the rename fails with
+/// `AlreadyExists` rather than silently overwriting it.
+///
+/// Implementation matches `turm-plugin-todo` and `turm-plugin-kb`:
+/// write to a same-directory temp via `O_CREAT|O_EXCL`, then
+/// `renameat2(RENAME_NOREPLACE)` the temp into place. POSIX `rename(2)`
+/// alone replaces atomically — `RENAME_NOREPLACE` is the kernel-level
+/// "fail if destination exists" guarantee that keeps the no-replace
+/// contract honest under concurrent writers.
 fn atomic_write_new(final_path: &Path, contents: &[u8]) -> io::Result<()> {
-    if final_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{} already exists", final_path.display()),
-        ));
-    }
     let parent = final_path
         .parent()
         .ok_or_else(|| io::Error::other("final path has no parent"))?;
@@ -356,20 +398,47 @@ fn atomic_write_new(final_path: &Path, contents: &[u8]) -> io::Result<()> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp_name = format!(
-        "{}.tmp.{pid}.{nanos}",
+        ".bookmark-tmp-{pid}-{nanos}-{}",
         final_path.file_name().unwrap().to_string_lossy()
     );
     let tmp_path = parent.join(tmp_name);
     {
-        let mut f = fs::File::create(&tmp_path)?;
+        let mut f = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
         f.write_all(contents)?;
         f.sync_all()?;
     }
-    if let Err(e) = fs::rename(&tmp_path, final_path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
+    let from = path_to_cstring(&tmp_path)?;
+    let to = path_to_cstring(final_path)?;
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        return Ok(());
     }
-    Ok(())
+    let e = io::Error::last_os_error();
+    let _ = fs::remove_file(&tmp_path);
+    if e.raw_os_error() == Some(libc::EEXIST) {
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", final_path.display()),
+        ))
+    } else {
+        Err(e)
+    }
+}
+
+fn path_to_cstring(p: &Path) -> io::Result<CString> {
+    CString::new(p.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other(format!("path contains nul: {}", p.display())))
 }
 
 #[cfg(test)]
@@ -549,5 +618,64 @@ mod tests {
         assert!(m.path.exists());
         store.delete(&m).unwrap();
         assert!(!m.path.exists());
+    }
+
+    #[test]
+    fn atomic_write_new_refuses_existing_target() {
+        // Regression test for the no-replace contract: even if a file
+        // somehow appears at the target path between dedup check and
+        // write, `renameat2(RENAME_NOREPLACE)` must refuse to overwrite
+        // it. Plain `fs::rename` would silently replace.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("dest.md");
+        fs::write(&target, b"existing user content").unwrap();
+        let err = atomic_write_new(&target, b"new content").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // Existing content unchanged.
+        assert_eq!(fs::read(&target).unwrap(), b"existing user content");
+    }
+
+    #[test]
+    fn create_recovers_with_foreign_file_error_on_target_collision() {
+        // Reach the post-write recovery branch (`atomic_write_new`
+        // returned `AlreadyExists`) by pre-creating an unparseable
+        // file at the exact target path. Because the file lacks valid
+        // bookmark frontmatter, `find_by_urlhash` returns None → the
+        // pre-write dedup short-circuit doesn't catch it → create()
+        // proceeds to atomic_write_new → `renameat2(NOREPLACE)` errors
+        // EEXIST → the recovery branch re-runs find_by_urlhash → still
+        // None (file isn't a valid bookmark) → we surface the
+        // "foreign file" error rather than silently overwriting.
+        //
+        // The sibling Existed-on-race branch (concurrent valid
+        // writer) is only reachable under genuine concurrency between
+        // dedup and rename; reasoned about in the recovery comment in
+        // create(), not unit-tested because deterministic single-
+        // threaded simulation isn't possible — find_by_urlhash always
+        // catches a pre-existing valid bookmark before the write.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().to_path_buf()).unwrap();
+        let now = Local::now();
+        let month = now.format("%Y-%m").to_string();
+        let dir = tmp.path().join(&month);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("abcd1234-x.md");
+        fs::write(&path, "not a bookmark, no frontmatter").unwrap();
+        let err = store
+            .create(CreateRequest {
+                urlhash8: "abcd1234",
+                slug: "x",
+                canonical_url: "https://example.com/x",
+                title: "x",
+                source: "cli",
+                tags: &[],
+                now,
+            })
+            .unwrap_err();
+        let (code, msg) = err.code_message();
+        assert_eq!(code, "io_error");
+        assert!(msg.contains("foreign file"), "got: {msg}");
+        // Pre-existing content must be untouched.
+        assert_eq!(fs::read(&path).unwrap(), b"not a bookmark, no frontmatter");
     }
 }
