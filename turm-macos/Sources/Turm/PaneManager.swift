@@ -88,6 +88,11 @@ final class PaneManager {
     }
 
     private nonisolated(unsafe) var clickMonitor: Any?
+    /// Tier 1.5 (plain-text part) — separate `.leftMouseUp` monitor that
+    /// intercepts cmd+click for URL opening. Distinct from `clickMonitor`
+    /// (which is `.leftMouseDown` for pane focus) so each handler stays
+    /// single-purpose.
+    private nonisolated(unsafe) var urlClickMonitor: Any?
     /// Tracks the fill constraints added to containerView so they can be
     /// deactivated before the next rebuild.
     private var rootConstraints: [NSLayoutConstraint] = []
@@ -116,10 +121,12 @@ final class PaneManager {
         wirePanel(panel)
         rebuildViewHierarchy()
         installClickMonitor()
+        installURLClickMonitor()
     }
 
     deinit {
         if let m = clickMonitor { NSEvent.removeMonitor(m) }
+        if let m = urlClickMonitor { NSEvent.removeMonitor(m) }
     }
 
     // MARK: - Public API
@@ -319,6 +326,33 @@ final class PaneManager {
                 if view.bounds.contains(locationInView) {
                     setActive(panel)
                     break
+                }
+            }
+            return event
+        }
+    }
+
+    /// Tier 1.5 — Cmd+click anywhere in a terminal pane: detect a plain-text
+    /// URL at the click position via `URLClickHelper` and open it. Returning
+    /// `nil` consumes the event so SwiftTerm's own `mouseUp` doesn't also
+    /// see it (which would be harmless — its OSC 8 path looks at a payload
+    /// we don't have on plain text — but consuming keeps the responder
+    /// chain tidy). Returning the event when no URL matches is intentional:
+    /// SwiftTerm still gets to handle OSC 8 hyperlinks via its built-in
+    /// `requestOpenLink` flow.
+    private func installURLClickMonitor() {
+        urlClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
+            guard let self else { return event }
+            guard event.modifierFlags.contains(.command) else { return event }
+            for panel in root.allLeaves() {
+                guard let termVC = panel as? TerminalViewController,
+                      let terminalView = termVC.terminalView
+                else { continue }
+                let locInTerm = terminalView.convert(event.locationInWindow, from: nil)
+                guard terminalView.bounds.contains(locInTerm) else { continue }
+                if let url = URLClickHelper.findURL(at: event, in: terminalView) {
+                    NSWorkspace.shared.open(url)
+                    return nil
                 }
             }
             return event

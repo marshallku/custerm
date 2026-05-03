@@ -17,7 +17,10 @@ extension Notification.Name {
 /// Note on PTY output interception: SwiftTerm's `feed(byteArray:)` is an extension
 /// method, not overridable, so `terminal.output` events / OSC 133 shell integration
 /// cannot be implemented from outside SwiftTerm.
-private class TurmTerminalView: LocalProcessTerminalView {
+/// `internal` (no explicit modifier) so URLClickHelper can take a typed
+/// reference for `getTerminal()` access. Was `private` before Tier 1.5
+/// plain-text URL detection landed.
+class TurmTerminalView: LocalProcessTerminalView {
     private var exitMonitor: (any DispatchSourceProcess)?
     /// Strongly retained so SwiftTerm's `weak terminalDelegate` doesn't drop our proxy.
     private var delegateProxy: TurmTerminalDelegate?
@@ -67,9 +70,10 @@ private class TurmTerminalView: LocalProcessTerminalView {
 /// `requestOpenLink` implementation in `Mac/MacTerminalView.swift:1614`,
 /// which calls `NSWorkspace.shared.open(url)`. We don't override it, so click
 /// + open already happens for free. Plain-text URL detection (Cmd+click on
-/// a bare `https://example.com` in unstructured terminal output) is NOT yet
-/// implemented — that needs a mouse-event interceptor + cell-coordinate
-/// walker on the SwiftTerm view, which is its own larger piece of work.
+/// a bare `https://...` in unstructured output) lives in `URLClickHelper` +
+/// `PaneManager.installURLClickMonitor` — handled outside SwiftTerm via an
+/// `NSEvent` local monitor because `MacTerminalView.mouseUp` is `public
+/// override` (not `open`).
 @MainActor
 private final class TurmTerminalDelegate: NSObject, @preconcurrency TerminalViewDelegate {
     weak var host: LocalProcessTerminalView?
@@ -126,9 +130,12 @@ class TerminalViewController: NSViewController, TurmPanel {
     let panelID: String = UUID().uuidString
 
     private let config: TurmConfig
-    // Mutable so applyTheme() can update it; clearBackground() uses the live value.
+    /// Mutable so applyTheme() can update it; clearBackground() uses the live value.
     private var theme: TurmTheme
-    private var terminalView: TurmTerminalView?
+    /// `private(set)` so PaneManager's URL click monitor (Tier 1.5 plain-text
+    /// extension) can reach the SwiftTerm `Terminal` for buffer reads. Setter
+    /// stays private because TerminalViewController owns the view's lifecycle.
+    private(set) var terminalView: TurmTerminalView?
     private var backgroundView: NSImageView?
     private var tintView: NSView?
     private var currentFontSize: CGFloat
