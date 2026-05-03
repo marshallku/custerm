@@ -1,4 +1,5 @@
 import AppKit
+@preconcurrency import WebKit
 
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -704,8 +705,170 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 ])
             }
 
+        // Tier 4.3 — webview interaction. Each command builds the JS
+        // snippet (mirroring turm-linux/src/webview.rs::js) and runs it
+        // via the existing executeJS bridge. The JS returns a JSON string;
+        // we parse it back into `Any` so the wire format stays homogenous
+        // with Linux. Selector resolution is the same id/active fallback
+        // as the navigation commands.
+        case "webview.query":
+            guard let selector = params["selector"] as? String else {
+                completion(RPCError(code: "invalid_params", message: "Missing 'selector' param"))
+                return
+            }
+            runWebViewJS(WebViewJS.querySelector(selector), params: params, in: vc, completion: completion)
+
+        case "webview.query_all":
+            guard let selector = params["selector"] as? String else {
+                completion(RPCError(code: "invalid_params", message: "Missing 'selector' param"))
+                return
+            }
+            let limit = (params["limit"] as? Int) ?? 50
+            runWebViewJS(WebViewJS.querySelectorAll(selector, limit: limit), params: params, in: vc, completion: completion)
+
+        case "webview.get_styles":
+            guard let selector = params["selector"] as? String else {
+                completion(RPCError(code: "invalid_params", message: "Missing 'selector' param"))
+                return
+            }
+            let properties = (params["properties"] as? [String]) ?? []
+            runWebViewJS(WebViewJS.getStyles(selector, properties: properties), params: params, in: vc, completion: completion)
+
+        case "webview.click":
+            guard let selector = params["selector"] as? String else {
+                completion(RPCError(code: "invalid_params", message: "Missing 'selector' param"))
+                return
+            }
+            runWebViewJS(WebViewJS.click(selector), params: params, in: vc, completion: completion)
+
+        case "webview.fill":
+            guard let selector = params["selector"] as? String else {
+                completion(RPCError(code: "invalid_params", message: "Missing 'selector' param"))
+                return
+            }
+            guard let value = params["value"] as? String else {
+                completion(RPCError(code: "invalid_params", message: "Missing 'value' param"))
+                return
+            }
+            runWebViewJS(WebViewJS.fill(selector, value: value), params: params, in: vc, completion: completion)
+
+        case "webview.scroll":
+            // selector optional; if absent, scroll viewport to (x, y).
+            let selector = params["selector"] as? String
+            let x = (params["x"] as? Int) ?? 0
+            let y = (params["y"] as? Int) ?? 0
+            runWebViewJS(WebViewJS.scroll(selector: selector, x: x, y: y), params: params, in: vc, completion: completion)
+
+        case "webview.page_info":
+            runWebViewJS(WebViewJS.pageInfo(), params: params, in: vc, completion: completion)
+
+        case "webview.screenshot":
+            switch resolveWebView(params, in: vc) {
+            case let .failure(err): completion(err)
+            case let .success(webVC):
+                let config = WKSnapshotConfiguration()
+                // Default rect = visible area at full resolution. Linux's
+                // SnapshotRegion::Visible matches this, modulo platform pixel
+                // density differences.
+                webVC.webView.takeSnapshot(with: config) { image, error in
+                    if let error {
+                        completion(RPCError(code: "snapshot_failed", message: error.localizedDescription))
+                        return
+                    }
+                    guard let image,
+                          let tiff = image.tiffRepresentation,
+                          let bitmap = NSBitmapImageRep(data: tiff),
+                          let png = bitmap.representation(using: .png, properties: [:])
+                    else {
+                        completion(RPCError(code: "snapshot_failed", message: "could not encode PNG"))
+                        return
+                    }
+                    completion([
+                        "image_b64": png.base64EncodedString(),
+                        "width": Int(image.size.width),
+                        "height": Int(image.size.height),
+                    ])
+                }
+            }
+
+        // Tier 4.3 — theme + plugin introspection.
+        case "theme.list":
+            // Hardcoded list mirrors TurmTheme.byName's switch arms. Keep
+            // in sync when adding themes — no static array on TurmTheme yet.
+            let themes = [
+                "catppuccin-mocha", "catppuccin-latte", "catppuccin-frappe", "catppuccin-macchiato",
+                "dracula", "nord", "tokyo-night", "gruvbox-dark", "one-dark", "solarized-dark",
+            ]
+            let current = TurmConfig.load().themeName
+            completion(["themes": themes, "current": current])
+
+        case "plugin.list":
+            // Walk the same discovery path the supervisor uses at startup.
+            // Returns manifest snapshots + per-service metadata. Doesn't
+            // surface live runtime status (running/lazy/failed) yet —
+            // that'd be a `plugin.status` follow-up if useful.
+            let manifests = PluginManifestStore.discover()
+            let plugins: [[String: Any]] = manifests.map { loaded in
+                let m = loaded.manifest
+                return [
+                    "name": m.plugin.name,
+                    "title": m.plugin.title,
+                    "version": m.plugin.version,
+                    "description": m.plugin.description ?? NSNull(),
+                    "services": m.services.map { s in
+                        [
+                            "name": s.name,
+                            "exec": s.exec,
+                            "activation": s.activation,
+                            "provides": s.provides,
+                            "subscribes": s.subscribes,
+                        ] as [String: Any]
+                    },
+                ] as [String: Any]
+            }
+            completion(["plugins": plugins])
+
         default:
             completion(nil)
+        }
+    }
+
+    /// Helper: resolve the target webview, evaluate the JS snippet, parse
+    /// the JSON-string result, and pass the parsed value to completion.
+    /// Linux's `run_js_command` does the same shape; this is its mirror.
+    private func runWebViewJS(
+        _ js: String,
+        params: [String: Any],
+        in vc: TabViewController,
+        completion: @escaping (Any?) -> Void,
+    ) {
+        switch resolveWebView(params, in: vc) {
+        case let .failure(err):
+            completion(err)
+        case let .success(webVC):
+            webVC.executeJS(js) { result, error in
+                if let error {
+                    completion(RPCError(code: "js_error", message: error.localizedDescription))
+                    return
+                }
+                // The JS snippets always JSON.stringify their result, so
+                // the WKWebView completion gives us a String here. Decode
+                // back into [String: Any] / [Any] / scalar.
+                guard let str = result as? String else {
+                    // Fallback: hand the raw value back — covers JS that
+                    // accidentally returns a non-string (the Linux side
+                    // does the same passthrough).
+                    completion(["result": result ?? NSNull()])
+                    return
+                }
+                guard let data = str.data(using: .utf8),
+                      let parsed = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+                else {
+                    completion(["raw": str])
+                    return
+                }
+                completion(parsed)
+            }
         }
     }
 
