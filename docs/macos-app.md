@@ -163,10 +163,31 @@ turmctl call echo.ping --params '{"hello":"x","sleep_ms":200}'
 **MACOS_PLUGINS (현재 install-macos.sh에서 자동 빌드/설치):**
 - `echo` (PR 3) — 프로토콜 sanity check
 - `git` (PR 4) — 6개 액션 (`git.list_workspaces`/`list_worktrees`/`worktree_add`/`worktree_remove`/`current_branch`/`status`). cross-platform deps만 사용 (serde, serde_json, toml). `~/.config/turm/workspaces.toml` (또는 `TURM_GIT_WORKSPACES_FILE` env override)에서 워크스페이스 정의 읽음. config 없으면 list_workspaces가 빈 배열 반환 (`fatal_error: null`) — graceful.
+- `llm` (PR 5a) — Anthropic provider. 3개 액션 (`llm.complete`/`llm.usage`/`llm.auth_status`). `keyring` crate `apple-native` feature 통해 macOS Keychain에 토큰 저장. spike target으로 추가됨 — 자세한 건 아래 Keychain 섹션.
 
 **아직 enabled 못 된 plugins:**
 - `kb`, `todo`, `bookmark` — `renameat2` / `O_NOFOLLOW` 같은 Linux-only filesystem primitives 의존. atomic-create / symlink-safety 백엔드를 Apple File System 호환 형태로 갈아엎어야 함.
-- `slack`, `calendar`, `llm`, `discord` — `unix` cfg gate라 컴파일은 됨. 미검증: `keyring` `apple-native` Keychain prompt UX (특히 unsigned binary), 실제 OAuth 플로우.
+- `slack`, `calendar`, `discord` — `unix` cfg gate라 컴파일은 macOS에서 OK. `keyring` 코드 경로가 llm과 동일해서 Keychain 자체는 unblock됐음 (PR 5a). 남은 작업은 plugin별 auth flow (Slack Socket Mode token setup, Calendar Google OAuth, Discord Gateway token).
+
+### Keychain / `keyring` 통합 (PR 5a 발견)
+
+`slack/calendar/llm/discord` 모두 `keyring = { features = ["apple-native", "sync-secret-service", "crypto-rust"] }` 사용. macOS에선 `apple-native` feature가 Apple Security framework의 `SecItem*` API를 호출해서 user keychain에 entry를 만든다 (`SERVICE`/`ACCOUNT` 컴포지트 키).
+
+**spike 결과 (`turm-plugin-llm` 통해 검증):**
+1. `apple-native` 컴파일 OK — 모든 4개 plugin이 macOS host에서 cargo build 통과
+2. runtime에 Keychain backend 바인딩 OK — plugin spawn 후 `auth_status` 호출 시 `store_kind: "keyring"` 반환. 만약 keychain이 못 잡혔으면 plaintext file fallback이 떴을 텐데(`store_kind: "file"`) 그게 아님
+3. `keyring::Error::NoEntry` (entry 없을 때) graceful — `credentials_source: "none"` + `authenticated: false`로 변환되어 caller가 깔끔하게 처리 가능. crash나 fatal_error 안 남
+4. plugin stderr에 `[llm] token store: keyring (env key: empty — falls back to store)` 로그 — backend 선택 가시화
+
+**아직 미검증 (write path):**
+write는 `keyring::Entry::set_password` 호출. macOS는 새 application이 keychain에 처음 쓸 때 user prompt를 띄울 수 있음 (signed app은 자동 허용, unsigned binary는 매 launch마다 prompt 가능). spike에서는 read만 했고 write는 actual ANTHROPIC_API_KEY가 필요해서 보류 — slack/calendar/discord auth flow 들어올 때 같이 검증 예정.
+
+**auth flow (out-of-band):**
+plugin은 두 가지 모드로 실행:
+- supervisor RPC mode (default, no args) — turm이 spawn해서 stdio로 통신
+- `auth` subcommand — user가 직접 실행: `ANTHROPIC_API_KEY=sk-ant-... turm-plugin-llm auth`. API call로 키 validate 후 keychain에 `{api_key, validated_at}` 저장. 이 시점에 macOS Keychain prompt가 뜰 수 있음. 한 번 저장되면 후속 turm launch에서 supervisor가 같은 binary path 사용하므로 keychain ACL이 그대로 유효 (signed/unsigned 무관).
+
+binary path: `~/Library/Application Support/turm/plugins/llm/turm-plugin-llm`. install-macos.sh가 매 install마다 같은 path에 copy하므로 keychain ACL re-prompt 안 일어남 (path가 ACL 키의 일부).
 
 ---
 

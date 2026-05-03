@@ -54,10 +54,14 @@ DO_LAUNCH=false
 # macOS-buildable plugins. KB / Todo / Bookmark are excluded because
 # they depend on Linux-only filesystem primitives (renameat2, O_NOFOLLOW)
 # and won't compile — see codex round-2 finding in docs/macos-parity-plan.md.
-# Slack / Calendar / LLM / Discord are Unix-gated and theoretically build
-# on macOS but their Keychain/auth UX hasn't been verified yet (PR 5+).
-# PR 4 added git (no platform-specific deps, just argv shell-out to /usr/bin/git).
-MACOS_PLUGINS=(echo git)
+# PR 4 added git (no platform-specific deps).
+# PR 5 added llm as the Keychain-spike target — it's the cheapest of the
+# `keyring`-using plugins to verify (no websocket, no OAuth, dedicated
+# `llm.auth_status` action that exercises the Keychain backend without
+# making any HTTP call). Slack / Calendar / Discord share the same
+# `apple-native` keyring code path; once llm proves Keychain works,
+# they're safe to add behind their respective auth-flow PRs.
+MACOS_PLUGINS=(echo git llm)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
