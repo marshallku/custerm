@@ -92,17 +92,42 @@ struct LoadedPluginManifest {
 struct PluginManifest: Decodable {
     let plugin: PluginMeta
     let services: [PluginServiceDef]
-    // panels / commands / modules deferred until PR 4+; no need to
-    // decode them now since the supervisor doesn't use them.
+    /// PR Tier 4.1 — `[[panels]]` declarations. Each panel maps a `name`
+    /// (used by `plugin.open`) to a relative HTML `file` plus a display
+    /// `title`. Empty when the plugin doesn't ship any panels (echo, git).
+    let panels: [PluginPanelDef]
+    // commands / modules deferred until status bar (Tier 4.2) lands.
 
     enum CodingKeys: String, CodingKey {
-        case plugin, services
+        case plugin, services, panels
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         plugin = try c.decode(PluginMeta.self, forKey: .plugin)
         services = try c.decodeIfPresent([PluginServiceDef].self, forKey: .services) ?? []
+        panels = try c.decodeIfPresent([PluginPanelDef].self, forKey: .panels) ?? []
+    }
+}
+
+struct PluginPanelDef: Decodable {
+    let name: String
+    let title: String
+    /// Relative path under the plugin directory, e.g. `panel.html`. Resolved
+    /// to an absolute file URL by `PluginPanelController` at load time.
+    let file: String
+    let icon: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, title, file, icon
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        title = try c.decode(String.self, forKey: .title)
+        file = try c.decode(String.self, forKey: .file)
+        icon = try c.decodeIfPresent(String.self, forKey: .icon)
     }
 }
 

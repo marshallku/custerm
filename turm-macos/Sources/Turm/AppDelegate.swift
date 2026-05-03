@@ -802,6 +802,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let current = TurmConfig.load().themeName
             completion(["themes": themes, "current": current])
 
+        case "plugin.open":
+            // params: name (plugin name), panel (default "main"), mode
+            // (default "tab", also supports "split_h"/"split_v"). Mirrors
+            // the shape of `webview.open` so triggers + turmctl scripts
+            // can use the same param vocabulary across panel types.
+            guard let name = params["name"] as? String else {
+                completion(RPCError(code: "invalid_params", message: "Missing 'name' param"))
+                return
+            }
+            let panelName = (params["panel"] as? String) ?? "main"
+            let mode = (params["mode"] as? String) ?? "tab"
+            let manifests = PluginManifestStore.discover()
+            guard let manifest = manifests.first(where: { $0.manifest.plugin.name == name }) else {
+                completion(RPCError(code: "not_found", message: "plugin '\(name)' not installed"))
+                return
+            }
+            guard let panelDef = manifest.manifest.panels.first(where: { $0.name == panelName }) else {
+                let available = manifest.manifest.panels.map(\.name).joined(separator: ", ")
+                completion(RPCError(
+                    code: "not_found",
+                    message: "panel '\(panelName)' not in \(name) manifest (available: [\(available)])",
+                ))
+                return
+            }
+            let panelController = PluginPanelController(
+                plugin: manifest,
+                panelDef: panelDef,
+                registry: actionRegistry,
+                eventBus: eventBus,
+            )
+            let panelID: String? = switch mode {
+            case "split_h":
+                vc.splitActivePaneWithPluginPanel(panelController, orientation: .horizontal)
+            case "split_v":
+                vc.splitActivePaneWithPluginPanel(panelController, orientation: .vertical)
+            default: // "tab"
+                vc.newPluginPanelTab(panelController)
+            }
+            if let panelID {
+                completion(["status": "ok", "panel_id": panelID])
+            } else {
+                completion(RPCError(code: "internal_error", message: "no active tab to split into"))
+            }
+
         case "plugin.list":
             // Walk the same discovery path the supervisor uses at startup.
             // Returns manifest snapshots + per-service metadata. Doesn't
@@ -822,6 +866,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             "activation": s.activation,
                             "provides": s.provides,
                             "subscribes": s.subscribes,
+                        ] as [String: Any]
+                    },
+                    // Tier 4.1 — surface panel defs so `turmctl call plugin.list`
+                    // tells callers what's openable via plugin.open.
+                    "panels": m.panels.map { p in
+                        [
+                            "name": p.name,
+                            "title": p.title,
+                            "file": p.file,
+                            "icon": p.icon ?? NSNull(),
                         ] as [String: Any]
                     },
                 ] as [String: Any]

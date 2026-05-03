@@ -56,6 +56,10 @@ private class EqualSplitView: NSSplitView, NSSplitViewDelegate {
 enum InitialPanel {
     case terminal
     case webview(url: URL?)
+    /// Tier 4.1 — pre-constructed plugin panel. Caller (TabViewController)
+    /// builds the PluginPanelController itself because it needs the registry
+    /// + event bus references; PaneManager just embeds it.
+    case pluginPanel(any TurmPanel)
 }
 
 /// Manages the split-pane tree for a single tab.
@@ -99,6 +103,8 @@ final class PaneManager {
             TerminalViewController(config: config, theme: theme)
         case let .webview(url):
             WebViewController(url: url)
+        case let .pluginPanel(p):
+            p
         }
 
         root = .leaf(panel)
@@ -144,6 +150,22 @@ final class PaneManager {
         setActive(webVC)
         webVC.startIfNeeded()
         webVC.view.window?.makeFirstResponder(webVC.view)
+    }
+
+    /// Tier 4.1 — split with a pre-built plugin panel. Caller assembles the
+    /// PluginPanelController (registry + eventBus deps) and hands us the
+    /// TurmPanel to embed; PaneManager doesn't reach into AppDelegate state.
+    func splitActiveWithPluginPanel(_ panel: any TurmPanel, orientation: SplitOrientation = .horizontal) {
+        assignEventBus(to: panel)
+        wirePanel(panel)
+
+        root = root.splitting(activePane, with: .leaf(panel), orientation: orientation)
+
+        rebuildViewHierarchy()
+
+        setActive(panel)
+        panel.startIfNeeded()
+        panel.view.window?.makeFirstResponder(panel.view)
     }
 
     func closeActive() {

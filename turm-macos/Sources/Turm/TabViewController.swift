@@ -164,6 +164,28 @@ final class TabViewController: NSViewController {
         addTab(manager: manager)
     }
 
+    /// Tier 4.1 — open a pre-built plugin panel as a new tab. Caller is
+    /// AppDelegate's `plugin.open` handler, which has the registry + event
+    /// bus references PluginPanelController needs at construction time.
+    /// Returns the panel id so the caller can include it in the socket
+    /// response for trigger/automation use cases.
+    @discardableResult
+    func newPluginPanelTab(_ panel: any TurmPanel) -> String {
+        let manager = PaneManager(config: config, theme: theme, initialPanel: .pluginPanel(panel))
+        addTab(manager: manager)
+        return panel.panelID
+    }
+
+    /// Tier 4.1 — split active pane with a plugin panel. Same construction
+    /// pattern as `newPluginPanelTab`; routes through PaneManager's
+    /// `splitActiveWithPluginPanel`.
+    @discardableResult
+    func splitActivePaneWithPluginPanel(_ panel: any TurmPanel, orientation: SplitOrientation = .horizontal) -> String? {
+        guard let manager = activePaneManager else { return nil }
+        manager.splitActiveWithPluginPanel(panel, orientation: orientation)
+        return panel.panelID
+    }
+
     private func makeTerminalManager() -> PaneManager {
         PaneManager(config: config, theme: theme)
     }
