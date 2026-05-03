@@ -75,7 +75,15 @@ else
 fi
 
 # 1. Build the macOS app via SwiftPM (release config).
+#    The Turm executable links libturm_ffi.a from the Rust staticlib crate;
+#    SwiftPM cannot run cargo as a prebuild step from Package.swift, so we
+#    invoke cargo here first. swift build's linker phase then picks up the
+#    archive at $REPO_ROOT/target/release/libturm_ffi.a via the
+#    -L../target/release flag baked into Package.swift.
 if $DO_BUILD; then
+    echo "==> cargo build --release -p turm-ffi (Rust staticlib for Swift FFI)"
+    (cd "$REPO_ROOT" && cargo build --release -p turm-ffi)
+
     echo "==> swift build -c release (turm-macos)"
     (cd "$REPO_ROOT/turm-macos" && swift build -c release)
 fi

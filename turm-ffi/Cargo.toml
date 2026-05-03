@@ -1,0 +1,16 @@
+[package]
+name = "turm-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C-ABI bridge from turm-core to platform UIs that can't link Rust directly (currently turm-macos)."
+repository.workspace = true
+
+[lib]
+name = "turm_ffi"
+# staticlib so libturm_ffi.a embeds into Turm.app at link time. cdylib would
+# work too but adds a dylib distribution step; the spike stays simpler.
+crate-type = ["staticlib"]
+
+[dependencies]
+serde_json = "1"

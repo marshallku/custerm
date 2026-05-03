@@ -9,6 +9,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var configWatcher: ConfigWatcher?
 
     func applicationDidFinishLaunching(_: Notification) {
+        // PR 1 (Tier 2.1) FFI smoke test. Proves the Rust staticlib linked
+        // correctly and a JSON round-trip survives the C-ABI boundary.
+        // Remove once Tier 2.4 (TriggerEngine via FFI) replaces it with real
+        // engine startup.
+        TurmFFI.runSmokeTest()
+
         let config = TurmConfig.load()
         let theme = TurmTheme.byName(config.themeName) ?? .catppuccinMocha
 

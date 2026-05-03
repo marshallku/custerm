@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# Build and run turm-macos as a proper .app bundle
+# Build and run turm-macos as a proper .app bundle.
+#
+# The Turm executable links libturm_ffi.a (Rust staticlib at
+# <workspace>/target/release/libturm_ffi.a). SwiftPM cannot run cargo
+# itself from Package.swift, so this script wraps both build steps in
+# the right order. Same wrapping in scripts/install-macos.sh.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# 1. Build the Rust FFI staticlib first so swift build's linker phase finds it.
+(cd .. && cargo build --release -p turm-ffi)
+
+# 2. Build the Swift app, which links the .a above via Package.swift's
+#    linkerSettings (-L../target/release -lturm_ffi).
 swift build
 
 APP_DIR=".build/debug/Turm.app"

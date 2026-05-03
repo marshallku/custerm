@@ -74,14 +74,40 @@ swift build              # 빌드만
 ```
 
 설치 동작:
-1. `swift build -c release` → `turm-macos/.build/release/Turm` 생성
-2. `pkill -x Turm`로 실행 중 인스턴스 종료 (macOS는 실행 중 .app의 exec를 lock)
-3. tmp 디렉토리에 `.app` staging → `mv`로 atomic 설치 (실패해도 dest가 깨지지 않음)
-4. `cargo install --path turm-cli` → `~/.cargo/bin/turmctl`
+1. `cargo build --release -p turm-ffi` → `target/release/libturm_ffi.a` (Rust staticlib for Swift FFI)
+2. `swift build -c release` → `turm-macos/.build/release/Turm` (links libturm_ffi.a)
+3. `pkill -x Turm`로 실행 중 인스턴스 종료 (macOS는 실행 중 .app의 exec를 lock)
+4. tmp 디렉토리에 `.app` staging → `mv`로 atomic 설치 (실패해도 dest가 깨지지 않음)
+5. `cargo install --path turm-cli` → `~/.cargo/bin/turmctl`
 
 **왜 `cargo install`을 wrap하나:** `cargo install turm-cli` (crates.io 미배포)과 `cargo install --path .` (workspace 루트는 virtual manifest)는 모두 실패합니다. 올바른 형태는 `cargo install --path turm-cli`이고, 스크립트가 이걸 wrap합니다.
 
 **Info.plist 중복:** `run.sh`와 `install-macos.sh`가 동일 Info.plist를 인라인으로 포함합니다. 두 카피는 의도된 상태 (Rule of Three: 2회는 OK). 세 번째가 생기면 그때 템플릿화.
+
+### Rust FFI (`turm-ffi` + `CTurmFFI`)
+
+PR 1 / Tier 2.1 spike. macOS 앱이 shared Rust core(`turm-core`의 trigger engine, supervisor 등)를 향후 사용하려면 Swift ↔ Rust C-ABI 다리가 필요합니다. SwiftPM은 cargo를 prebuild로 직접 호출할 방법이 없어서 빌드 파이프라인이 두 단계로 갈라집니다:
+
+```
+cargo build --release -p turm-ffi   →  target/release/libturm_ffi.a
+swift build                          →  Turm (links libturm_ffi.a)
+```
+
+`run.sh` / `install-macos.sh` 둘 다 두 단계를 묶어 줍니다. `swift build`만 단독으로 돌리면 link 단계에서 undefined-symbol 에러가 납니다 (clean target/ 상태에서).
+
+**구성:**
+- `turm-ffi/` — workspace member, `crate-type = ["staticlib"]`. `serde_json`만 의존. 4개의 `extern "C"` 심볼 노출:
+  - `turm_ffi_version()` — 정적 C 문자열, 해제 불필요
+  - `turm_ffi_call_json(input)` — JSON in / JSON out, 결과는 heap-alloc (caller가 free)
+  - `turm_ffi_free_string(*mut c_char)` — `call_json` 결과 해제
+  - `turm_ffi_last_error()` — thread-local 마지막 에러 메시지 (borrowed)
+- `turm-macos/Sources/CTurmFFI/` — SwiftPM C target. `include/turm_ffi.h` (수동 declaration, `turm-ffi/src/lib.rs`와 동기화) + `include/module.modulemap` (`module CTurmFFI { ... }`) + `dummy.c` (SwiftPM이 header-only target은 link graph에 안 넣어서 placeholder C 파일 필요).
+- `turm-macos/Package.swift` — `Turm` exec target에 `linkerSettings: [.unsafeFlags(["-L../target/release"]), .linkedLibrary("turm_ffi")]`. 상대경로 `../target/release`는 link 시점에 패키지 루트(`turm-macos/`) 기준으로 풀려 cargo workspace target 디렉토리를 가리킴.
+- `turm-macos/Sources/Turm/FFIBridge.swift` — `TurmFFI` enum 파사드. C 포인터를 Swift 호출자에게 노출하지 않음. `String(cString:)` copy 후 즉시 `turm_ffi_free_string`으로 free, ownership round-trip 닫힘.
+
+**Smoke test:** `AppDelegate.applicationDidFinishLaunching`의 `TurmFFI.runSmokeTest()`가 매 launch마다 stderr에 `[turm-ffi] version = ...` + `[turm-ffi] echo round-trip = ...`를 찍음. `echoed_at`는 Rust가 만든 unix-ms timestamp이므로 round-trip이 진짜로 일어나는지 확인 가능. Tier 2.4 (TriggerEngine via FFI)에서 실제 엔진 startup으로 교체 예정.
+
+**Universal binary:** 현재 spike는 cargo 호스트 아키텍처(arm64) only. x86_64 사용자가 생기면 `cargo build --target aarch64-apple-darwin && cargo build --target x86_64-apple-darwin && lipo -create … -output target/release/libturm_ffi.a` recipe로 합치면 됨 (PR 1 시점에 deferred).
 
 ---
 
