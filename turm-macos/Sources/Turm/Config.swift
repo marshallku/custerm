@@ -32,6 +32,17 @@ enum TabsPosition: String, Decodable {
     }
 }
 
+/// `[statusbar]` config: enable + position + height. Same shape as Linux.
+/// Position support is limited to `bottom` on macOS today (top deferred —
+/// requires layout reshuffle around tab bar position).
+struct StatusBarConfig {
+    let enabled: Bool
+    let position: String
+    let height: Int
+
+    static let defaults = StatusBarConfig(enabled: true, position: "bottom", height: 28)
+}
+
 struct TurmConfig {
     let shell: String
     let fontFamily: String
@@ -45,6 +56,9 @@ struct TurmConfig {
     let osc52: OSC52Policy
     /// Tier 1.4 — `[tabs] position` (top/bottom). left/right deferred.
     let tabsPosition: TabsPosition
+    /// Tier 4.2 — `[statusbar]` config (enabled/position/height). Modules
+    /// themselves come from plugin manifests' `[[modules]]` declarations.
+    let statusBar: StatusBarConfig
     /// Tier 1.2 — `[keybindings]` flat dict: combo string → command string.
     /// Compiled to `Keybindings.Binding` at AppDelegate init time and
     /// matched in the NSEvent local monitor. Empty when no `[keybindings]`
@@ -100,6 +114,11 @@ struct TurmConfig {
             backgroundOpacity: clamp01(raw.background?.opacity ?? defaults.backgroundOpacity),
             osc52: raw.security?.osc52 ?? defaults.osc52,
             tabsPosition: raw.tabs?.position.map(TabsPosition.parse) ?? defaults.tabsPosition,
+            statusBar: StatusBarConfig(
+                enabled: raw.statusbar?.enabled ?? defaults.statusBar.enabled,
+                position: raw.statusbar?.position ?? defaults.statusBar.position,
+                height: raw.statusbar?.height ?? defaults.statusBar.height,
+            ),
             keybindings: parseKeybindings(from: contents),
             triggers: parseTriggersArray(from: contents),
         )
@@ -124,6 +143,7 @@ struct TurmConfig {
             backgroundOpacity: 1.0,
             osc52: .deny,
             tabsPosition: .top,
+            statusBar: .defaults,
             keybindings: [:],
             triggers: [],
         )
@@ -226,6 +246,13 @@ private struct RawConfig: Decodable {
     var background: BackgroundSection?
     var security: SecuritySection?
     var tabs: TabsSection?
+    var statusbar: StatusBarSection?
+}
+
+private struct StatusBarSection: Decodable {
+    var enabled: Bool?
+    var position: String?
+    var height: Int?
 }
 
 private struct TabsSection: Decodable {

@@ -101,6 +101,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         self.window = window
         tabVC = vc
         vc.eventBus = eventBus
+
+        // Tier 4.2 — status bar modules. Loaded AFTER tabVC is built (it
+        // owns the StatusBarView) but BEFORE socket starts so the modules'
+        // initial exec doesn't race a turmctl command that depends on
+        // module state. PluginManifestStore.discover() ran inside the
+        // supervisor too — second walk is cheap.
+        if let bar = vc.statusBar {
+            let manifests = PluginManifestStore.discover()
+            bar.loadModules(manifests, socketPath: socketServer.path)
+        }
+
         startSocketServer()
         startConfigWatcher()
         vc.openInitialTab()
@@ -120,6 +131,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 4. Config watcher — stops file watching.
         turmEngine.shutdown()
         pluginSupervisor.shutdown()
+        tabVC?.statusBar?.shutdown()
         socketServer.stop()
         configWatcher?.stop()
         if let token = keybindingMonitor {
@@ -846,6 +858,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 completion(RPCError(code: "internal_error", message: "no active tab to split into"))
             }
 
+        // Tier 4.2 — status bar visibility toggles. Match Linux's
+        // `{visible: bool}` response shape.
+        case "statusbar.show":
+            if let bar = vc.statusBar {
+                completion(["visible": bar.setShown(true)])
+            } else {
+                completion(["visible": false, "note": "statusbar disabled in config"])
+            }
+
+        case "statusbar.hide":
+            if let bar = vc.statusBar {
+                completion(["visible": bar.setShown(false)])
+            } else {
+                completion(["visible": false, "note": "statusbar disabled in config"])
+            }
+
+        case "statusbar.toggle":
+            if let bar = vc.statusBar {
+                completion(["visible": bar.setShown(!bar.isShown)])
+            } else {
+                completion(["visible": false, "note": "statusbar disabled in config"])
+            }
+
         case "plugin.list":
             // Walk the same discovery path the supervisor uses at startup.
             // Returns manifest snapshots + per-service metadata. Doesn't
@@ -876,6 +911,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             "title": p.title,
                             "file": p.file,
                             "icon": p.icon ?? NSNull(),
+                        ] as [String: Any]
+                    },
+                    // Tier 4.2 — surface module defs for diagnostics.
+                    "modules": m.modules.map { mo in
+                        [
+                            "name": mo.name,
+                            "exec": mo.exec,
+                            "interval": mo.interval,
+                            "position": mo.position,
+                            "order": mo.order,
                         ] as [String: Any]
                     },
                 ] as [String: Any]

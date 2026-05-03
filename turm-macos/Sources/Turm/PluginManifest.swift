@@ -96,10 +96,15 @@ struct PluginManifest: Decodable {
     /// (used by `plugin.open`) to a relative HTML `file` plus a display
     /// `title`. Empty when the plugin doesn't ship any panels (echo, git).
     let panels: [PluginPanelDef]
-    // commands / modules deferred until status bar (Tier 4.2) lands.
+    /// PR Tier 4.2 — `[[modules]]` declarations. Each module is a status-bar
+    /// widget that runs a shell command on a timer and renders the stdout
+    /// (plain text or JSON `{text, tooltip}`). Empty when the plugin
+    /// doesn't ship a status bar widget.
+    let modules: [PluginModuleDef]
+    // commands deferred (no current macOS user).
 
     enum CodingKeys: String, CodingKey {
-        case plugin, services, panels
+        case plugin, services, panels, modules
     }
 
     init(from decoder: Decoder) throws {
@@ -107,6 +112,31 @@ struct PluginManifest: Decodable {
         plugin = try c.decode(PluginMeta.self, forKey: .plugin)
         services = try c.decodeIfPresent([PluginServiceDef].self, forKey: .services) ?? []
         panels = try c.decodeIfPresent([PluginPanelDef].self, forKey: .panels) ?? []
+        modules = try c.decodeIfPresent([PluginModuleDef].self, forKey: .modules) ?? []
+    }
+}
+
+struct PluginModuleDef: Decodable {
+    let name: String
+    let exec: String
+    let interval: Int
+    let position: String
+    let order: Int
+    let cssClass: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, exec, interval, position, order
+        case cssClass = "class"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        exec = try c.decode(String.self, forKey: .exec)
+        interval = try c.decodeIfPresent(Int.self, forKey: .interval) ?? 10
+        position = try c.decodeIfPresent(String.self, forKey: .position) ?? "right"
+        order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 50
+        cssClass = try c.decodeIfPresent(String.self, forKey: .cssClass)
     }
 }
 

@@ -11,6 +11,11 @@ final class TabViewController: NSViewController {
 
     private var tabBar: TabBarView!
     private var contentArea: NSView!
+    /// Tier 4.2 — status bar at the bottom of the window. nil when
+    /// `[statusbar] enabled = false`. Public so AppDelegate can wire
+    /// it up post-launch (load modules from discovered plugin manifests
+    /// + handle statusbar.show/hide/toggle socket commands).
+    private(set) var statusBar: StatusBarView?
     private var paneManagers: [PaneManager] = []
     private(set) var activeIndex: Int = -1
 
@@ -112,6 +117,27 @@ final class TabViewController: NSViewController {
         contentArea.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(contentArea)
 
+        // Tier 4.2 — status bar at the very bottom of the root view, BELOW
+        // the tab bar even when `tabsPosition = bottom`. Linux does the
+        // same: statusbar is the lowest-priority container and the rest
+        // of the layout sits on top of it. macOS only supports
+        // `[statusbar] position = bottom` for now; top would need to flip
+        // the tabBar/contentArea anchors against statusBar's top edge,
+        // which isn't worth the layout complexity until somebody asks.
+        var statusBarBottom: NSLayoutYAxisAnchor = root.bottomAnchor
+        if config.statusBar.enabled {
+            let bar = StatusBarView(theme: theme)
+            statusBar = bar
+            root.addSubview(bar)
+            NSLayoutConstraint.activate([
+                bar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                bar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+                bar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+                bar.heightAnchor.constraint(equalToConstant: CGFloat(config.statusBar.height)),
+            ])
+            statusBarBottom = bar.topAnchor
+        }
+
         // Tier 1.4 — tabs position. The tabBar is always full-width and at
         // either the top or bottom of root; contentArea fills the rest.
         // left/right would need a 90-degree rotation of the bar view itself
@@ -128,13 +154,13 @@ final class TabViewController: NSViewController {
             constraints.append(contentsOf: [
                 tabBar.topAnchor.constraint(equalTo: root.topAnchor),
                 contentArea.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
-                contentArea.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+                contentArea.bottomAnchor.constraint(equalTo: statusBarBottom),
             ])
         case .bottom:
             constraints.append(contentsOf: [
                 contentArea.topAnchor.constraint(equalTo: root.topAnchor),
                 contentArea.bottomAnchor.constraint(equalTo: tabBar.topAnchor),
-                tabBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+                tabBar.bottomAnchor.constraint(equalTo: statusBarBottom),
             ])
         }
         NSLayoutConstraint.activate(constraints)
