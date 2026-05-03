@@ -7,6 +7,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let socketServer = SocketServer()
     private let eventBus = EventBus()
     private let actionRegistry = ActionRegistry()
+    private lazy var pluginSupervisor = PluginSupervisor(registry: actionRegistry, eventBus: eventBus)
     private var configWatcher: ConfigWatcher?
 
     func applicationDidFinishLaunching(_: Notification) {
@@ -21,6 +22,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // legacy switch fires. Plugin host (PR 3) and trigger engine (PR 5)
         // will register additional actions through this same path.
         registerBuiltinActions()
+
+        // PR 3 (Tier 3) plugin supervisor — discover ~/Library/Application Support/turm/plugins/
+        // (and ~/.config/turm/plugins/ for dotfile-sharing users), spawn services
+        // with onStartup activation, run init handshake, register provides[]
+        // actions with the registry. Must run BEFORE startSocketServer so any
+        // turmctl call that lands while the socket comes up sees the registered
+        // plugin actions.
+        pluginSupervisor.discoverAndStart()
 
         let config = TurmConfig.load()
         let theme = TurmTheme.byName(config.themeName) ?? .catppuccinMocha
@@ -59,6 +68,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_: Notification) {
+        // Plugin supervisor first so plugins receive `shutdown` before we
+        // stop accepting incoming socket commands; ordering doesn't matter
+        // for correctness (socket clients can't reach already-terminated
+        // plugins) but ensures clean teardown when both shutdowns log.
+        pluginSupervisor.shutdown()
         socketServer.stop()
         configWatcher?.stop()
     }

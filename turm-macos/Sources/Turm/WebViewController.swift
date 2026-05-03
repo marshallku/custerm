@@ -279,14 +279,5 @@ extension WebViewController: WKNavigationDelegate {
     }
 }
 
-// MARK: - SendableBox
-
-/// Type-erased Sendable bridge for non-Sendable closures captured into @Sendable
-/// callback positions (e.g. WKWebView.evaluateJavaScript). Sound when the captured
-/// callback is invoked on a single, known thread (the main thread in our case).
-private final class SendableBox<T>: @unchecked Sendable {
-    let value: T
-    init(_ value: T) {
-        self.value = value
-    }
-}
+// SendableBox lives in Sources/Turm/SendableBox.swift now — same need shows
+// up in PluginSupervisor (PR 3), so the type was hoisted out of this file.

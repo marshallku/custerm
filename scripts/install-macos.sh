@@ -22,6 +22,7 @@
 #   ./scripts/install-macos.sh --system     # /Applications + ~/.cargo/bin (sudo for /Applications)
 #   ./scripts/install-macos.sh --no-build   # skip swift build (use existing .build/release/Turm)
 #   ./scripts/install-macos.sh --no-turmctl # skip cargo install of turmctl
+#   ./scripts/install-macos.sh --no-plugins # skip building/installing plugin binaries
 #   ./scripts/install-macos.sh --launch     # open the installed app afterwards
 #
 # Notes:
@@ -47,13 +48,23 @@ APP_NAME="Turm.app"
 DO_BUILD=true
 SYSTEM_INSTALL=false
 DO_TURMCTL=true
+DO_PLUGINS=true
 DO_LAUNCH=false
+
+# macOS-buildable plugins. KB / Todo / Bookmark are excluded today because
+# they depend on Linux-only filesystem primitives (renameat2, O_NOFOLLOW)
+# and won't compile — see codex round-2 finding in docs/macos-parity-plan.md.
+# Slack / Calendar / LLM / Discord are Unix-gated and theoretically build
+# on macOS but their Keychain/auth UX hasn't been verified yet (PR 4+).
+# For PR 3 we only ship echo so the plugin host has something to talk to.
+MACOS_PLUGINS=(echo)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --system)      SYSTEM_INSTALL=true ; shift ;;
         --no-build)    DO_BUILD=false ; shift ;;
         --no-turmctl)  DO_TURMCTL=false ; shift ;;
+        --no-plugins)  DO_PLUGINS=false ; shift ;;
         --launch)      DO_LAUNCH=true ; shift ;;
         -h|--help)
             sed -n '2,/^set -euo/p' "$0" | grep -E '^# ' | sed 's/^# \?//'
@@ -156,6 +167,45 @@ if $DO_TURMCTL; then
     cargo install --path "$REPO_ROOT/turm-cli"
 fi
 
+# 6. Build + install macOS-buildable plugins. PluginSupervisor (PR 3) reads
+#    ~/Library/Application Support/turm/plugins/<name>/ at startup; we
+#    cargo-build the binary and copy the manifest. Manifest's
+#    `services.exec` is resolved against the plugin dir first, so we drop
+#    the binary alongside plugin.toml so the supervisor finds it without
+#    a $PATH dance.
+PLUGIN_DEST="$HOME/Library/Application Support/turm/plugins"
+if $DO_PLUGINS; then
+    mkdir -p "$PLUGIN_DEST"
+    for name in "${MACOS_PLUGINS[@]}"; do
+        crate="turm-plugin-$name"
+        src_manifest="$REPO_ROOT/examples/plugins/$name/plugin.toml"
+        if [[ ! -f "$src_manifest" ]]; then
+            echo "skip plugin $name: $src_manifest missing"
+            continue
+        fi
+        echo "==> cargo build --release -p $crate"
+        (cd "$REPO_ROOT" && cargo build --release -p "$crate")
+
+        bin_src="$REPO_ROOT/target/release/$crate"
+        if [[ ! -x "$bin_src" ]]; then
+            echo "warn  plugin $name: binary $bin_src not built — skipping" >&2
+            continue
+        fi
+
+        plugin_dir="$PLUGIN_DEST/$name"
+        mkdir -p "$plugin_dir"
+        # Copy every loose file next to plugin.toml (manifest + panel.html
+        # if any) so panel-bearing plugins land complete.
+        find "$REPO_ROOT/examples/plugins/$name" -maxdepth 1 -type f \
+            -exec cp -f {} "$plugin_dir/" \;
+        # Copy (don't symlink) the binary so a `git clean` of target/ doesn't
+        # silently break the install. Cheap — these binaries are small.
+        cp -f "$bin_src" "$plugin_dir/$crate"
+        chmod 755 "$plugin_dir/$crate"
+        echo "ok    plugin $name → $plugin_dir/"
+    done
+fi
+
 if $DO_LAUNCH; then
     open "$APP_DEST/$APP_NAME"
 fi
@@ -168,6 +218,9 @@ EOF
 if $DO_TURMCTL; then
     echo "  $HOME/.cargo/bin/turmctl"
 fi
+if $DO_PLUGINS; then
+    echo "  $PLUGIN_DEST/{$(IFS=,; echo "${MACOS_PLUGINS[*]}")}"
+fi
 cat <<'EOF'
 
 Next:
@@ -175,4 +228,5 @@ Next:
   - Generate a default config: `turmctl --init-config`-equivalent does
     not exist on macOS yet; create ~/.config/turm/config.toml manually
     or copy from examples/config.toml.
+  - Verify a plugin is alive: `turmctl call echo.ping --params '{"hi":"there"}'`
 EOF

@@ -109,6 +109,52 @@ swift build                          →  Turm (links libturm_ffi.a)
 
 **Universal binary:** 현재 spike는 cargo 호스트 아키텍처(arm64) only. x86_64 사용자가 생기면 `cargo build --target aarch64-apple-darwin && cargo build --target x86_64-apple-darwin && lipo -create … -output target/release/libturm_ffi.a` recipe로 합치면 됨 (PR 1 시점에 deferred).
 
+### Plugin Supervisor (`PluginManifest` + `PluginSupervisor`)
+
+PR 3 / Tier 3 spike. Linux의 `service_supervisor.rs` (1794 LOC)를 native Swift로 최소 surface만 포팅. echo plugin 하나 굴리는 데 필요한 것만 들어감.
+
+**Discovery:**
+`PluginManifestStore.discover()`가 두 디렉토리를 union:
+1. `~/Library/Application Support/turm/plugins/<name>/plugin.toml` (macOS-native, 우선)
+2. `~/.config/turm/plugins/<name>/plugin.toml` (XDG fallback — Linux/macOS dotfile-sharing 사용자용)
+
+같은 plugin name이 둘 다 있으면 macOS path가 이김. parse 실패한 manifest는 stderr에 로그 + skip.
+
+**TOMLKit Decodable gotcha:**
+TOMLKit의 Decoder는 `var foo: T = default` 디폴트 값을 무시함. Swift init feature지 Decodable feature가 아님. 누락된 키는 `keyNotFound` throw. serde의 `#[serde(default)]`처럼 동작하려면 `init(from:)`에서 `decodeIfPresent ?? <default>` 명시적으로. PR 3에서 echo manifest 디코딩 시 이 버그로 한 번 실패해서 잡았음.
+
+**Spawn + init handshake:**
+service.activation == "onStartup"인 service만 spawn (PR 5에서 `onAction:*` / `onEvent:*` 추가). `Process` + 3 `Pipe` (stdin/stdout/stderr), `executableURL`은 `<plugin_dir>/<service.exec>` 우선 → 없으면 `$PATH` 직접 lookup (`/usr/bin/which` shell-out 안 함 — `$PATH` 재평가가 process spawn 시점에 다시 일어나서). reader thread 먼저 띄우고 `{id, method: "initialize", params: {protocol_version: 1}}` 보낸 뒤 5s 시한으로 `InitBox.semaphore.wait()`. 응답 받으면 manifest의 provides[] subset인지 검증 (런타임이 manifest보다 더 많이 claim하면 reject — 다른 plugin 액션 shadow 위험), `ActionRegistry.register(name, ...)`로 등록, `{method: "initialized"}` notification 발사.
+
+**Action dispatch:**
+ActionRegistry handler는 `proc.invoke(action:params:completion:)` 호출. UUID 만들어 `pending[id] = completion` 저장 (NSLock-protected), `{id, method: "action.invoke", params: {name, params}}` stdin 전송, 즉시 리턴. reader thread가 응답에서 id 매칭 → completion(payload) 호출. payload는 `decodeResponse(obj)`가 `result` 또는 `RPCError`로 변환.
+
+**Critical bug (verification 중 발견):**
+초기 구현은 reader thread completion을 `DispatchQueue.main.async`로 main actor에 hop했음. 그런데 init handshake 중 main thread가 `initBox.semaphore.wait()` 으로 park돼 있어서 main에 hop된 작업이 영원히 안 깨어남 → deadlock. **수정:** completion은 reader thread에서 inline 호출. SocketServer leaf와 InitBox.resolve 둘 다 actor isolation 가정 없는 leaf (sema signal + class var set)이라 thread-safe. main actor 작업이 필요한 미래 completion은 자기 body에서 hop하면 됨.
+
+**Shutdown:**
+`applicationWillTerminate`에서 `pluginSupervisor.shutdown()`. 각 process에 `{method: "shutdown"}` 보내고 200ms 대기, 살아있으면 `process.terminate()`. pending request는 모두 `RPCError(plugin_shutdown)`로 reject. SIGTERM/SIGKILL은 applicationWillTerminate를 안 거치지만, 어차피 parent가 죽으면 plugin의 stdin이 EOF되면서 reader loop 종료 → `main()` return → 자연사.
+
+**의도적으로 deferred (PR 4+):**
+- restart-on-crash policy
+- `event.publish` notification → EventBus 포워딩 (PR 5에서 trigger engine과 함께)
+- `event.dispatch` (host → plugin) — echo는 subscribe 안 함
+- provides[] cross-plugin 충돌 해결
+- Process group (`setpgid(0,0)`) + PID file 기반 crash recovery (codex I5)
+- 코드 서명 — 로컬 빌드는 quarantine xattr 없어서 Gatekeeper 패스, release tarball에서는 별도 처리 필요
+
+**Install flow:**
+`scripts/install-macos.sh` 가 `MACOS_PLUGINS=(echo)` 배열 돌면서 각각 `cargo build --release -p turm-plugin-<name>` → `~/Library/Application Support/turm/plugins/<name>/`에 manifest copy + binary copy (symlink 아님 — `git clean target/`로 silently 깨지지 않게). `--no-plugins` 플래그로 스킵 가능.
+
+**End-to-end 검증:**
+```bash
+turmctl call system.list_actions
+# {"count":3, "names":["echo.ping","system.ffi_test","system.list_actions"]}
+
+turmctl call echo.ping --params '{"hello":"x","sleep_ms":200}'
+# {"echoed":{"hello":"x","sleep_ms":200}, "from":"turm-plugin-echo"}  # 200ms+ blocking
+```
+
 ---
 
 ## 파일별 구현 세부사항
