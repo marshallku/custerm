@@ -16,7 +16,19 @@ final class EventBus: @unchecked Sendable {
     /// the trigger engine (PR 5c) without making EventBus aware of
     /// TurmEngine. Closure must be cheap — runs synchronously on the
     /// broadcast call's thread.
-    nonisolated(unsafe) var onBroadcast: (@Sendable (_ kind: String, _ data: [String: Any]) -> Void)?
+    ///
+    /// `source` mirrors `turm_core::event_bus::Event.source` — used by
+    /// the trigger engine's `try_promote_or_drop_preflight` to gate
+    /// await-chain promotion (only events stamped
+    /// `turm_core::action_registry::COMPLETION_EVENT_SOURCE` =
+    /// `"turm.action"` advance an await state machine). PR 7 plumbs
+    /// the field through so registry-synthesized completion events
+    /// satisfy the same trust boundary as on Linux.
+    nonisolated(unsafe) var onBroadcast: (@Sendable (
+        _ kind: String,
+        _ source: String,
+        _ data: [String: Any],
+    ) -> Void)?
 
     func subscribe() -> EventChannel {
         let ch = EventChannel()
@@ -25,12 +37,17 @@ final class EventBus: @unchecked Sendable {
     }
 
     /// Broadcast an event to all live subscribers. Dead subscribers are pruned.
-    func broadcast(event: String, data: [String: Any] = [:]) {
+    ///
+    /// `source` defaults to `"macos.eventbus"` — match the historical
+    /// stamp the FFI used pre-PR-7. `ActionRegistry.publishCompletion`
+    /// passes `"turm.action"` for registry-synthesized completion
+    /// events; other broadcast sites should leave the default.
+    func broadcast(event: String, source: String = "macos.eventbus", data: [String: Any] = [:]) {
         // Fire the trigger-engine hook first — keeps the engine in
         // the same logical "tick" as the channel publish so a trigger
         // that itself broadcasts (chained workflows) gets its event
         // ordered immediately after the original.
-        onBroadcast?(event, data)
+        onBroadcast?(event, source, data)
 
         let payload: [String: Any] = ["event": event, "data": data]
         guard

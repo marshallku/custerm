@@ -413,15 +413,27 @@ pub unsafe extern "C" fn turm_engine_set_triggers(
 /// triggers and fires the C action callback for each match. Returns
 /// the number of triggers that fired.
 ///
+/// `source` controls the trust-boundary stamp on the synthesized
+/// `Event` and MUST be threaded through faithfully — Linux's
+/// `try_promote_or_drop_preflight` (in `turm_core::trigger`) gates
+/// await-chain promotion on `event.source == COMPLETION_EVENT_SOURCE`
+/// (`"turm.action"`), so a registry-synthesized completion event
+/// stamped with any other source will silently fail to promote await
+/// state machines. Pass NULL to default to `"macos.eventbus"` (the
+/// pre-PR-7 stamp, retained for callers that aren't synthesizing
+/// completion events).
+///
 /// # Safety
 ///
-/// `handle` must be a valid engine pointer. `event_kind` and `payload_json`
-/// must be NUL-terminated UTF-8 (payload may be NULL → defaults to `null`).
-/// All pointers must outlive the call.
+/// `handle` must be a valid engine pointer. `event_kind` must be
+/// NUL-terminated UTF-8. `source` and `payload_json` may each be
+/// NULL (defaults: `"macos.eventbus"` and `null` respectively).
+/// All non-NULL pointers must outlive the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn turm_engine_dispatch_event(
     handle: *mut EngineHandle,
     event_kind: *const c_char,
+    source: *const c_char,
     payload_json: *const c_char,
 ) -> i32 {
     if handle.is_null() || event_kind.is_null() {
@@ -433,13 +445,20 @@ pub unsafe extern "C" fn turm_engine_dispatch_event(
     let kind = unsafe { CStr::from_ptr(event_kind) }
         .to_string_lossy()
         .into_owned();
+    let source_str = if source.is_null() {
+        "macos.eventbus".to_string()
+    } else {
+        unsafe { CStr::from_ptr(source) }
+            .to_string_lossy()
+            .into_owned()
+    };
     let payload: Value = if payload_json.is_null() {
         Value::Null
     } else {
         let s = unsafe { CStr::from_ptr(payload_json) }.to_string_lossy();
         serde_json::from_str(&s).unwrap_or(Value::Null)
     };
-    let event = Event::new(kind, "macos.eventbus", payload);
+    let event = Event::new(kind, source_str, payload);
     let fired = h.engine.dispatch(&event, None);
     clear_last_error();
     fired as i32

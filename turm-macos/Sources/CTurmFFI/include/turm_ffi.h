@@ -68,9 +68,15 @@ int turm_engine_set_triggers(EngineHandle *handle, const char *triggers_json);
 
 /// Dispatch an event into the engine. Returns # of triggers fired, or -1
 /// on bad input.
+///
+/// `source` controls the trust-boundary stamp on the synthesized Event.
+/// Pass "turm.action" for registry-synthesized completion events to
+/// satisfy await-promotion (see turm_core::action_registry::
+/// COMPLETION_EVENT_SOURCE). Pass NULL to default to "macos.eventbus".
 int turm_engine_dispatch_event(
     EngineHandle *handle,
     const char *event_kind,
+    const char *source,
     const char *payload_json
 );
 

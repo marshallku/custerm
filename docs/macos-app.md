@@ -165,6 +165,56 @@ event_kind = "system.heartbeat"
 
 **Universal binary:** 현재 spike는 cargo 호스트 아키텍처(arm64) only. x86_64 사용자가 생기면 `cargo build --target aarch64-apple-darwin && cargo build --target x86_64-apple-darwin && lipo -create … -output target/release/libturm_ffi.a` recipe로 합치면 됨 (PR 1 시점에 deferred).
 
+### ActionRegistry completion fan-out (PR 7)
+
+PR 5c 의 chain 다이어그램은 **upstream** event (plugin → bus → engine → action) 만 그렸음. PR 7 은 거기에 **downstream** completion event 를 더한다 — registered action 이 끝나면 `<method>.completed` (또는 `RPCError` 일 때 `<method>.failed`) 가 같은 bus 로 broadcast 돼서 chain 의 다음 단계가 발화 가능. `examples/triggers/vision-flow-3.toml` 의 `git.worktree_add.completed → claude.start` 같은 chain 을 macOS 에서도 그대로 표현 가능해짐.
+
+**Chokepoint:** Linux 와 동일하게 `ActionRegistry.tryDispatch` 안에서 broadcast (Linux `with_completion_bus(bus)` invariant). Plugin RPC reply 도 `PluginSupervisor` 가 `proc.invoke(..., completion: completion)` 을 registry handler 안에서 호출하기 때문에 자동으로 wrapping path 통과 → 별도 supervisor-side broadcast 불필요 (double-fire 방지).
+
+**Wrapping path:**
+```
+turmctl call kb.read --params '{...not-found...}'
+    ↓
+SocketServer → AppDelegate.handleCommand
+    ↓
+ActionRegistry.tryDispatch("kb.read", params, completion=replyToSocket)
+    ↓ wraps:
+let wrapped = { value in
+    if !silent { eventBus.broadcast("kb.read.failed" or "kb.read.completed") }
+    completion(value)  // original — replies to socket client
+}
+    ↓
+PluginSupervisor's registered handler → proc.invoke(...) → stdio reply
+    ↓ (reader thread)
+wrapped(RPCError(code: "not_found", ...))
+    ↓
+broadcast("kb.read.failed", {code, message}) FIRST
+    ↓
+EventBus.onBroadcast hook → TurmEngine.dispatchEvent
+    ↓ (chain continues, e.g. trigger fires alert action)
+THEN completion(value) — turmctl client receives error envelope
+```
+
+**Payload normalization:** EventBus 의 `[String: Any]` 계약을 유지하기 위해 success result 가 dict 면 그대로, 아니면 `["value": result]` 로 wrap. `RPCError` 는 `["code": err.code, "message": err.message]` 형태. 결과적으로 trigger interpolation 입장에선 `{event.X}` 로 모든 케이스 접근 가능 (단, dict 가 아닌 경우는 `{event.value}` 로 한 단계 들어가야 함).
+
+**registerSilent (silent flag):** Linux 의 `register_silent` mirror. introspection action (`system.ping`, `system.list_actions`, future `context.snapshot`) 처럼 polling tooling 이 자주 부르는 action 은 silent 로 등록해서 bus flood 막음. 현재 `system.ffi_test` (debug round-trip) + `system.list_actions` (introspection) 가 silent. plugin action 들과 향후 builtin (`claude.start`, `webview.*`) 은 noisy default.
+
+**Linux invariant 유지:** registered action 만 fan out. legacy switch-arm dispatch (`AppDelegate.handleCommand` 의 `webview.*`/`terminal.*`/`tab.*` 등) 는 registry 우회 → completion event 미발행. 이걸 registry 로 마이그레이션하면 chain surface 가 넓어짐 — 별개 parity 작업.
+
+**Source-stamp trust boundary (cross-review CRITICAL):** Linux 의 `try_promote_or_drop_preflight` (`turm-core/src/trigger.rs:482`) 가 await-chain promotion 에 source check 를 검: `event.source == COMPLETION_EVENT_SOURCE` (`"turm.action"`) 일 때만 await 상태 머신을 advance. 안 그러면 plugin 이 임의로 emit 한 `<X>.completed` 이벤트가 await chain 을 silently advance 시킬 수 있음. macOS FFI 가 원래 `Event::new(kind, "macos.eventbus", payload)` 로 모든 이벤트 source 를 hardcode 했었기 때문에, registry-synth 된 completion 도 trust check 를 통과 못 해서 `[triggers.await]` chain 이 silently 통째로 stall 됐을 거. 
+
+Fix: `turm_engine_dispatch_event` C signature 에 `source` 인자 추가, Swift 쪽 모든 hop 에 propagate — `EventBus.broadcast(event:source:data:)` (default `"macos.eventbus"` back-compat) → `EventBus.onBroadcast` 3-tuple closure → `TurmEngine.dispatchEvent(kind:source:payload:)` → FFI 로 source 그대로 전달. FFI 안에서 `let source_str = if source.is_null() { "macos.eventbus" } else { CStr::from_ptr(source).to_string_lossy() }` 로 default 처리. `ActionRegistry.publishCompletion` 만 `bus.broadcast(event:..., source: "turm.action", data:...)` 로 호출. 다른 broadcast 사이트는 unchanged.
+
+`ActionRegistry.completionEventSource = "turm.action"` 라는 Swift-side 상수가 Rust 의 `COMPLETION_EVENT_SOURCE` 와 sync 돼야 함 (hand-maintained — 향후 Linux 가 상수 바꾸면 macOS 도 수동 업데이트).
+
+**Codex pressure-test 결과 (Round 1+2 + cross-review):** Round 1 에서 plan 에 있던 4개 우선순위 중 3개 빗나감을 잡음 — 제일 큰 finding 은 vision-flow-3 의 `git.worktree_add.completed` 가 Phase 17 file-watcher event 와 다른 메커니즘 (registry-emitted action-completion 이벤트) 이라 macOS ActionRegistry 의 completion fan-out 이 진짜 Vision Flow 3 critical path 라는 거. Round 2 에서 3개 architecture 안 (A: FFI-side fan-out, B: registry chokepoint, C: hybrid) 비교해서 B 채택 — `PluginSupervisor.swift:105` 가 plugin action 을 registry 에 등록하니 plugin RPC reply 도 자동으로 `tryDispatch` chokepoint 통과, double-fire 없음. 그 후 cross-review 에서 source-stamp 누락을 CRITICAL 로 잡아서 위 fix 추가.
+
+**End-to-end 검증:**
+1. `~/.config/turm/config.toml` 에 `[[triggers]] when.event_kind = "echo.ping.completed", action = "system.list_actions"` + 동일 형태의 `kb.read.failed` 트리거 추가
+2. `turmctl call echo.ping --params '{"hi":"x"}'` → stderr `[turm-engine] event echo.ping.completed fired 1 trigger(s)`
+3. `turmctl call kb.read --params '{"id":"nope"}'` → stderr `[turm-engine] event kb.read.failed fired 1 trigger(s)`
+4. Source-plumbing fix 적용 후에도 두 chain 모두 정상 발화 (regression 없음). Await-promotion path 는 코드 inspection 으로 검증 — Swift `publishCompletion` 의 source 가 FFI 까지 그대로 전달되어 `Event::new(kind, source_str, payload)` 시점에 `"turm.action"` 으로 stamp 되고 trigger.rs:482 의 trust check 를 통과. 라이브 `[triggers.await]` chain test 는 별도 PR (Vision Flow 3 자체가 await 안 쓰고, await 는 Phase 14.2 chained workflow 용으로 예약).
+
 ### Plugin Supervisor (`PluginManifest` + `PluginSupervisor`)
 
 PR 3 / Tier 3 spike. Linux의 `service_supervisor.rs` (1794 LOC)를 native Swift로 최소 surface만 포팅. echo plugin 하나 굴리는 데 필요한 것만 들어감.

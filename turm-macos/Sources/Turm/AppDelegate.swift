@@ -28,6 +28,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // engine startup.
         TurmFFI.runSmokeTest()
 
+        // PR 7 — wire the registry's completion fan-out bus BEFORE anything
+        // registers an action handler. This way the very first dispatch
+        // (whether from a turmctl that races the socket startup or from an
+        // onStartup plugin's first action) gets `<method>.completed` /
+        // `.failed` broadcast on the same bus the trigger engine listens to.
+        // Idempotent; mirrors Linux's `with_completion_bus(bus)` constructor
+        // pattern but applied via setter so we don't have to construct
+        // `eventBus` before `actionRegistry` (Swift property init order).
+        actionRegistry.setEventBus(eventBus)
+
         // PR 2 (Tier 2.3) registry seam — register first-party actions so the
         // socket dispatcher can hand off to them via tryDispatch BEFORE the
         // legacy switch fires. Plugin host (PR 3) and trigger engine (PR 5)
@@ -53,14 +63,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // plugin actions on the very first event, config must be loaded so
         // the [[triggers]] array is available.
         turmEngine.actionRegistry = actionRegistry
-        eventBus.onBroadcast = { [weak turmEngine] kind, data in
+        eventBus.onBroadcast = { [weak turmEngine] kind, source, data in
             // EventBus.broadcast can fire from any thread (plugin reader
             // thread for event.publish, main actor for tab.opened, etc.).
             // dispatchEvent enters the Rust engine which has its own
             // RwLock — safe to call from any thread. Log only when a
             // trigger actually matches so heartbeat noise doesn't drown
-            // the useful signal.
-            let n = turmEngine?.dispatchEvent(kind: kind, payload: data) ?? 0
+            // the useful signal. `source` plumbs the await-promotion
+            // trust stamp through (PR 7); registry-synthesized completion
+            // events arrive with source = "turm.action".
+            let n = turmEngine?.dispatchEvent(kind: kind, source: source, payload: data) ?? 0
             if n > 0 {
                 FileHandle.standardError.write(Data("[turm-engine] event \(kind) fired \(n) trigger(s)\n".utf8))
             }
@@ -328,7 +340,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         //   2. Gives PR 5 (trigger engine via FFI) a smoke test target it
         //      can dispatch as a registered action — same code path as a
         //      plugin will use.
-        actionRegistry.register("system.ffi_test") { params, completion in
+        // Silent: this is a debug round-trip with no workflow meaning;
+        // firing `system.ffi_test.completed` would dirty the bus during
+        // FFI smoke testing without enabling any meaningful chain.
+        actionRegistry.registerSilent("system.ffi_test") { params, completion in
             // Pass through whatever the caller sent; if absent, send an
             // empty object so the FFI side still gets a valid JSON object.
             let payload = params.isEmpty ? ["caller": "system.ffi_test"] : params
@@ -345,8 +360,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // system.list_actions — introspection for diagnostics. Returns
         // every name registered through the action registry. Mirrors
         // Linux's debug behavior of being able to query "what actions
-        // exist right now".
-        actionRegistry.register("system.list_actions") { [weak self] _, completion in
+        // exist right now". Silent because UIs that poll this on a timer
+        // would flood the bus with `.completed` events that never drive
+        // a meaningful trigger.
+        actionRegistry.registerSilent("system.list_actions") { [weak self] _, completion in
             guard let self else {
                 completion(RPCError(code: "no_app", message: "AppDelegate gone"))
                 return

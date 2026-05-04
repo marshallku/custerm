@@ -176,8 +176,15 @@ final class TurmEngine: @unchecked Sendable {
     /// Dispatch an event to the engine. Triggers matching the kind/payload
     /// fire their actions synchronously via the C callback (which then
     /// hops to the action registry). Returns # triggers fired.
+    ///
+    /// `source` is stamped onto the synthesized `Event` and threads
+    /// through the trust boundary that gates Linux's await-promotion
+    /// (`turm_core::trigger::try_promote_or_drop_preflight` rejects
+    /// completion-suffixed events whose source is not
+    /// `COMPLETION_EVENT_SOURCE`). Defaults to `"macos.eventbus"` —
+    /// `ActionRegistry.publishCompletion` overrides with `"turm.action"`.
     @discardableResult
-    func dispatchEvent(kind: String, payload: [String: Any]) -> Int {
+    func dispatchEvent(kind: String, source: String = "macos.eventbus", payload: [String: Any]) -> Int {
         guard let handle else { return 0 }
         let payloadStr: String = if let data = try? JSONSerialization.data(withJSONObject: payload),
                                     let s = String(data: data, encoding: .utf8)
@@ -187,13 +194,16 @@ final class TurmEngine: @unchecked Sendable {
             "null"
         }
         return kind.withCString { kindPtr in
-            payloadStr.withCString { payloadPtr in
-                let n = turm_engine_dispatch_event(
-                    handle,
-                    kindPtr,
-                    payloadPtr,
-                )
-                return n < 0 ? 0 : Int(n)
+            source.withCString { sourcePtr in
+                payloadStr.withCString { payloadPtr in
+                    let n = turm_engine_dispatch_event(
+                        handle,
+                        kindPtr,
+                        sourcePtr,
+                        payloadPtr,
+                    )
+                    return n < 0 ? 0 : Int(n)
+                }
             }
         }
     }
