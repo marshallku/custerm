@@ -23,7 +23,7 @@
 
 - **Binary names**: `turm` (terminal app), `turmctl` (CLI control tool)
 - **Config path**: `~/.config/turm/config.toml`
-- **Cache path**: `~/.cache/turm/wallpapers.txt`
+- **Cache path**: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/turm/wallpapers.txt` (macOS, falls back to Linux path)
 - **GTK app ID**: `com.marshall.turm`
 - **Theme**: Catppuccin Mocha
 - **Rust edition**: 2024

@@ -35,7 +35,9 @@ turm/
 │   └── src/                    # main.rs (RPC loop + actions), config.rs (env),
 │                                # todo.rs (Todo struct + frontmatter parse/render +
 │                                # surgical update_status_in_text), store.rs (atomic
-│                                # create via renameat2 NOREPLACE, list_all, set_status,
+│                                # create via turm_core::fs_atomic::rename_no_replace —
+│                                # Linux renameat2(RENAME_NOREPLACE) / macOS
+│                                # renamex_np(RENAME_EXCL); list_all, set_status,
 │                                # delete; mirrors KB security posture), watcher.rs
 │                                # (poll-based diff emitting todo.created/changed/
 │                                # completed/deleted)
@@ -55,12 +57,20 @@ turm/
 # tricky); pass `prompt` and you'll get not_implemented.
 ├── turm-core/            # Shared Rust library
 │   └── src/
-│       ├── lib.rs           # Module declarations
-│       ├── config.rs        # TOML config loading/defaults
-│       ├── background.rs    # Background image cache & rotation
-│       ├── plugin.rs         # Plugin manifest types + discovery
-│       ├── protocol.rs      # cmux V2 JSON protocol types
-│       └── error.rs         # Error types (thiserror)
+│       ├── lib.rs              # Module declarations
+│       ├── config.rs           # TOML config loading/defaults
+│       ├── plugin.rs           # Plugin manifest types + discovery
+│       ├── protocol.rs         # cmux V2 JSON protocol types
+│       ├── error.rs            # Error types (thiserror)
+│       ├── event_bus.rs        # Pub/sub bus with glob patterns + subscriber receivers
+│       ├── action_registry.rs  # Name → handler map (sync + blocking variants)
+│       ├── context.rs          # ContextService — active panel, cwd cache, snapshots
+│       ├── trigger.rs          # TriggerEngine + TriggerSink trait + condition matching
+│       ├── condition.rs        # Trigger condition DSL parser/evaluator
+│       ├── theme.rs            # 10 built-in Catppuccin/Solarized/etc. palettes
+│       └── fs_atomic.rs        # Cross-platform atomic-create-or-fail rename
+│                               #   (Linux: renameat2(RENAME_NOREPLACE);
+│                               #    macOS: renamex_np(RENAME_EXCL))
 ├── turm-linux/           # GTK4 + VTE4 native terminal
 │   ├── src/
 │   │   ├── main.rs          # Entry point, CLI flags (--init-config, --config-path)
@@ -112,7 +122,7 @@ turm/
 | CLI tool        | clap (Rust)                                                 |
 | Config          | TOML (`~/.config/turm/config.toml`)                         |
 | IPC             | Unix domain socket, cmux V2 newline-delimited JSON          |
-| Background mgmt | File cache at `~/.cache/turm/wallpapers.txt`                |
+| Background mgmt | File cache at `~/.cache/terminal-wallpapers.txt` (Linux) or `~/Library/Caches/turm/wallpapers.txt` (macOS, falls back to Linux path) |
 | Theme           | Catppuccin Mocha (hardcoded palette)                        |
 
 ## Key Dependencies

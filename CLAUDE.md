@@ -83,7 +83,7 @@ git config core.hooksPath .githooks
 - VTE handles PTY on Linux (no custom PTY management)
 - Unix socket (`/tmp/turm-{PID}.sock`) for IPC
 - Config: `~/.config/turm/config.toml` (TOML)
-- Cache: `~/.cache/turm/wallpapers.txt`
+- Cache: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/turm/wallpapers.txt` (macOS, falls back to Linux path)
 - Theme: Catppuccin Mocha (hardcoded)
 - Dark theme forced via GTK settings
 
