@@ -2725,6 +2725,7 @@ name = "turm-core"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "log",
  "serde",
  "serde_json",
@@ -2769,6 +2770,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "tempfile",
+ "turm-core",
  "url",
 ]
 
@@ -2819,6 +2821,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "serde_json",
+ "turm-core",
 ]
 
 [[package]]
@@ -2856,6 +2859,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "turm-core",
 ]
 
 [[package]]

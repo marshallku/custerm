@@ -19,10 +19,8 @@
 //!   inside the root that points outside.
 //! - Hidden directories (`.foo`) are skipped during walk.
 
-use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, Local};
@@ -383,11 +381,12 @@ fn id_from_filename(path: &Path) -> Option<String> {
 /// `AlreadyExists` rather than silently overwriting it.
 ///
 /// Implementation matches `turm-plugin-todo` and `turm-plugin-kb`:
-/// write to a same-directory temp via `O_CREAT|O_EXCL`, then
-/// `renameat2(RENAME_NOREPLACE)` the temp into place. POSIX `rename(2)`
-/// alone replaces atomically — `RENAME_NOREPLACE` is the kernel-level
-/// "fail if destination exists" guarantee that keeps the no-replace
-/// contract honest under concurrent writers.
+/// write to a same-directory temp via `O_CREAT|O_EXCL`, then route the
+/// final rename through `turm_core::fs_atomic::rename_no_replace`
+/// (Linux `renameat2(RENAME_NOREPLACE)` / macOS
+/// `renamex_np(RENAME_EXCL)`). POSIX `rename(2)` alone replaces
+/// atomically — the kernel-level "fail if destination exists" guarantee
+/// is what keeps the no-replace contract honest under concurrent writers.
 fn atomic_write_new(final_path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = final_path
         .parent()
@@ -410,35 +409,20 @@ fn atomic_write_new(final_path: &Path, contents: &[u8]) -> io::Result<()> {
         f.write_all(contents)?;
         f.sync_all()?;
     }
-    let from = path_to_cstring(&tmp_path)?;
-    let to = path_to_cstring(final_path)?;
-    let r = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if r == 0 {
-        return Ok(());
+    match turm_core::fs_atomic::rename_no_replace(&tmp_path, final_path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} already exists", final_path.display()),
+                ))
+            } else {
+                Err(e)
+            }
+        }
     }
-    let e = io::Error::last_os_error();
-    let _ = fs::remove_file(&tmp_path);
-    if e.raw_os_error() == Some(libc::EEXIST) {
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{} already exists", final_path.display()),
-        ))
-    } else {
-        Err(e)
-    }
-}
-
-fn path_to_cstring(p: &Path) -> io::Result<CString> {
-    CString::new(p.as_os_str().as_bytes())
-        .map_err(|_| io::Error::other(format!("path contains nul: {}", p.display())))
 }
 
 #[cfg(test)]

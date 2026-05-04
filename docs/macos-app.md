@@ -200,7 +200,7 @@ ActionRegistry handler는 `proc.invoke(action:params:completion:)` 호출. UUID 
 - 코드 서명 — 로컬 빌드는 quarantine xattr 없어서 Gatekeeper 패스, release tarball에서는 별도 처리 필요
 
 **Install flow:**
-`scripts/install-macos.sh` 가 `MACOS_PLUGINS=(echo)` 배열 돌면서 각각 `cargo build --release -p turm-plugin-<name>` → `~/Library/Application Support/turm/plugins/<name>/`에 manifest copy + binary copy (symlink 아님 — `git clean target/`로 silently 깨지지 않게). `--no-plugins` 플래그로 스킵 가능.
+`scripts/install-macos.sh` 가 `MACOS_PLUGINS` 배열 (`echo git llm calendar kb todo bookmark slack discord` — 9 first-party) 돌면서 각각 `cargo build --release -p turm-plugin-<name>` → `~/Library/Application Support/turm/plugins/<name>/`에 manifest copy + binary copy (symlink 아님 — `git clean target/`로 silently 깨지지 않게). `--no-plugins` 플래그로 스킵 가능.
 
 **End-to-end 검증:**
 ```bash
@@ -221,10 +221,8 @@ turmctl call echo.ping --params '{"hello":"x","sleep_ms":200}'
 - `git` (PR 4) — 6개 액션 (`git.list_workspaces`/`list_worktrees`/`worktree_add`/`worktree_remove`/`current_branch`/`status`). cross-platform deps만 사용 (serde, serde_json, toml). `~/.config/turm/workspaces.toml` (또는 `TURM_GIT_WORKSPACES_FILE` env override)에서 워크스페이스 정의 읽음. config 없으면 list_workspaces가 빈 배열 반환 (`fatal_error: null`) — graceful.
 - `llm` (PR 5a) — Anthropic provider. 3개 액션 (`llm.complete`/`llm.usage`/`llm.auth_status`). `keyring` crate `apple-native` feature 통해 macOS Keychain에 토큰 저장. spike target으로 추가됨 — 자세한 건 아래 Keychain 섹션.
 - `calendar` (PR 5b) — Google Calendar (read-only). 3개 액션 (`calendar.list_events`/`calendar.event_details`/`calendar.auth_status`). `onStartup` polling daemon: 백그라운드 thread가 `TURM_CALENDAR_POLL_SECS` 간격으로 Google API polling, `TURM_CALENDAR_LEAD_MINUTES` 시점에 `calendar.event_imminent` 이벤트 publish. credential 없으면 RPC 액션은 `not_authenticated` 반환하고 poller는 idle 대기 — `Config::minimal()` fallback 덕에 supervisor handshake는 통과. polling-daemon supervisor lifecycle 검증 차원에서 추가됨.
-
-**아직 enabled 못 된 plugins:**
-- `kb`, `todo`, `bookmark` — `renameat2` / `O_NOFOLLOW` 같은 Linux-only filesystem primitives 의존. atomic-create / symlink-safety 백엔드를 Apple File System 호환 형태로 갈아엎어야 함.
-- `slack`, `discord` — `unix` cfg gate라 컴파일은 macOS에서 OK. `keyring` 코드 경로가 llm/calendar와 동일해서 macOS plumbing은 unblock됐음 (PR 5a-b). 남은 작업은 plugin별 auth flow: Slack은 Socket Mode token setup (xoxb- bot + xapp- app-level), Discord는 Gateway token.
+- `kb` / `todo` / `bookmark` (PR 6) — 셋 다 atomic-create-or-fail 의 rename primitive에 의존했는데, 원래 inline `libc::renameat2(RENAME_NOREPLACE)` 호출이라 Linux-only `compile_error!` 게이트 가 걸려있었음. PR 6 에서 `turm_core::fs_atomic::rename_no_replace` 로 추출 — Linux 는 그대로 `renameat2`, macOS 는 `renamex_np(RENAME_EXCL)` 매핑 (semantically identical: target 존재시 `EEXIST`). 게이트는 `any(linux, macos)` 로 완화됨. `O_NOFOLLOW` / `OsStrExt` 는 원래부터 macOS 에서도 OK (`std::os::unix::ffi`, `bsd/mod.rs::O_NOFOLLOW`). End-to-end: `kb.search` fulltext hit, `todo.create` → `todo.list` round-trip via `renamex_np`, `bookmark.add` 의 `existed: false` → `existed: true` no-replace dedup 모두 검증.
+- `slack` / `discord` (PR 6) — `unix` cfg gate라 컴파일은 원래부터 OK였고, `keyring` 코드 경로가 llm/calendar와 동일 (`store_kind: "keyring"` 검증됨). PR 6 에서 `MACOS_PLUGINS` 에 추가. RPC 호출은 token 없으면 `not_authenticated` 반환 — fully functional 하려면 plugin별 `auth` 서브커맨드로 Slack Socket Mode token (xoxb- bot + xapp- app-level) / Discord Gateway bot token 을 사용자가 한 번 등록해야 함.
 
 ### Keychain / `keyring` 통합 (PR 5a 발견)
 

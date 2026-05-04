@@ -15,6 +15,7 @@ restart = "on-crash"
 provides = [
     "todo.create",
     "todo.list",
+    "todo.update",
     "todo.set_status",
     "todo.start",
     "todo.delete",

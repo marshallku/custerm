@@ -19,6 +19,7 @@ chrono = { version = "0.4", default-features = false, features = [
     "serde",
     "std",
 ] }
+turm-core = { path = "../turm-core" }
 
 [dev-dependencies]
 tempfile = "3"

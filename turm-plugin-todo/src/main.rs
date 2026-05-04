@@ -17,14 +17,14 @@
 //! first user-initiated action, which would silently break
 //! triggers like `todo.completed → slack.post_message`.
 //!
-//! Linux-only via `compile_error!` because `store.rs` uses
-//! `renameat2(RENAME_NOREPLACE)` and `O_NOFOLLOW` — same gate as
-//! `turm-plugin-kb`.
+//! Unix-only (Linux + macOS) — `store.rs` needs `O_NOFOLLOW` plus a
+//! kernel atomic-create-or-fail primitive, both of which we get via
+//! `turm_core::fs_atomic`.
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
-    "turm-plugin-todo is currently Linux-only (uses renameat2, O_NOFOLLOW, OsStrExt). \
-     Same gate as turm-plugin-kb."
+    "turm-plugin-todo supports Linux and macOS. Other Unixes need a \
+     backend-specific atomic-create primitive — extend turm_core::fs_atomic."
 );
 
 mod config;

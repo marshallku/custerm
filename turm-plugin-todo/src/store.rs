@@ -1,9 +1,10 @@
 //! Filesystem operations on `~/docs/todos/<workspace>/<id>.md`.
 //!
 //! Atomicity contract:
-//! - `create` uses temp + `renameat2(RENAME_NOREPLACE)` so concurrent
-//!   creators never see torn files; exactly one wins on id collision
-//!   (loser gets `id_exists`).
+//! - `create` uses temp + `turm_core::fs_atomic::rename_no_replace`
+//!   (Linux `renameat2(RENAME_NOREPLACE)` / macOS
+//!   `renamex_np(RENAME_EXCL)`) so concurrent creators never see torn
+//!   files; exactly one wins on id collision (loser gets `id_exists`).
 //! - `set_status` is read-modify-rewrite. The rewrite uses temp +
 //!   `rename` (atomic replace, NO_REPLACE-not-applicable since the
 //!   file MUST exist). A concurrent vim save during the same window
@@ -23,10 +24,8 @@
 //! - O_NOFOLLOW on read so a leaf-swap during a read doesn't
 //!   redirect us out.
 
-use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -487,26 +486,18 @@ fn atomic_create(target: &Path, content: &[u8]) -> Result<(), Err> {
         f.sync_data()
             .map_err(|e| Err::Io(format!("fsync temp {}: {e}", tmp.display())))?;
     }
-    let from = path_to_cstring(&tmp)?;
-    let to = path_to_cstring(target)?;
-    let r = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if r == 0 {
-        Ok(())
-    } else {
-        let e = io::Error::last_os_error();
-        let _ = fs::remove_file(&tmp);
-        if e.raw_os_error() == Some(libc::EEXIST) {
-            Err(Err::IdExists(format!("todo {}", target.display())))
-        } else {
-            Err(Err::Io(format!("renameat2 -> {}: {e}", target.display())))
+    match turm_core::fs_atomic::rename_no_replace(&tmp, target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                Err(Err::IdExists(format!("todo {}", target.display())))
+            } else {
+                Err(Err::Io(format!(
+                    "rename_no_replace -> {}: {e}",
+                    target.display()
+                )))
+            }
         }
     }
 }
@@ -530,11 +521,6 @@ fn atomic_replace(target: &Path, content: &[u8]) -> Result<(), Err> {
         let _ = fs::remove_file(&tmp);
         Err::Io(format!("rename -> {}: {e}", target.display()))
     })
-}
-
-fn path_to_cstring(p: &Path) -> Result<CString, Err> {
-    CString::new(p.as_os_str().as_bytes())
-        .map_err(|_| Err::Io(format!("path contains nul: {}", p.display())))
 }
 
 #[cfg(test)]

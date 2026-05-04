@@ -51,19 +51,23 @@ DO_TURMCTL=true
 DO_PLUGINS=true
 DO_LAUNCH=false
 
-# macOS-buildable plugins. KB / Todo / Bookmark are excluded because
-# they depend on Linux-only filesystem primitives (renameat2, O_NOFOLLOW)
-# and won't compile — see codex round-2 finding in docs/macos-parity-plan.md.
-# PR 4 added git (no platform-specific deps).
-# PR 5a added llm as the Keychain-spike target — proved that
-# `keyring` `apple-native` reaches Apple Keychain at runtime.
-# PR 5b adds calendar to validate the polling-daemon supervisor
-# lifecycle on macOS (different from llm's pure-RPC mode — calendar
-# spawns a background poller thread that publishes lead-time
-# `calendar.event_imminent` events). RPC actions still work without
-# Google OAuth credentials thanks to `Config::minimal()` fallback.
-# Slack / Discord remain blocked on Socket Mode / Gateway token setup.
-MACOS_PLUGINS=(echo git llm calendar)
+# macOS-buildable plugins. All first-party plugins now compile on macOS:
+# - PR 4 added git (no platform-specific deps).
+# - PR 5a added llm — proved `keyring` `apple-native` reaches Apple
+#   Keychain at runtime.
+# - PR 5b added calendar — validated the polling-daemon supervisor
+#   lifecycle on macOS (background poller publishing
+#   `calendar.event_imminent`). RPC actions still work without Google
+#   OAuth creds thanks to `Config::minimal()` fallback.
+# - kb / todo / bookmark formerly required Linux's `renameat2(RENAME_NOREPLACE)`;
+#   the shared `turm_core::fs_atomic` primitive now selects between
+#   `renameat2` (Linux) and `renamex_np(RENAME_EXCL)` (Darwin), so all
+#   three install and run on macOS.
+# - slack / discord install fine; full functionality needs user-supplied
+#   Slack `xoxb-` tokens / Discord bot tokens in Keychain (see plugin
+#   READMEs). Without creds the plugins return RPC errors gracefully
+#   rather than crashing the supervisor.
+MACOS_PLUGINS=(echo git llm calendar kb todo bookmark slack discord)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

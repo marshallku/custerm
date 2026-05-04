@@ -17,13 +17,14 @@
 //!   rather than retried (so concurrent appends never interleave).
 //! - `.raw/` is excluded from `kb.search` results (still writable by id).
 //!
-//! Linux-only: relies on `renameat2(RENAME_NOREPLACE)` and `O_NOFOLLOW`.
-//! Other Unixes need a backend-specific atomic-create primitive.
+//! Unix-only: relies on `O_NOFOLLOW` plus a kernel atomic-create-or-fail
+//! primitive (Linux `renameat2(RENAME_NOREPLACE)` / macOS
+//! `renamex_np(RENAME_EXCL)`) routed through `turm_core::fs_atomic`.
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
-    "turm-plugin-kb is currently Linux-only (uses renameat2, O_NOFOLLOW, OsStrExt). \
-     Other Unixes need a backend-specific atomic-create primitive."
+    "turm-plugin-kb supports Linux and macOS. Other Unixes need a \
+     backend-specific atomic-create primitive — extend turm_core::fs_atomic."
 );
 
 mod kb;

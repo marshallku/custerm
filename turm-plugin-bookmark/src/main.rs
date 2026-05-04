@@ -19,13 +19,15 @@
 //! - BM-4: HTML panel.
 //! - BM-5: harness `/bookmark` slash skill + offline inbox drain.
 //!
-//! Linux-focused; the path-safety primitives match `turm-plugin-kb`
-//! (canonicalize root + re-validate every resolved path).
+//! Unix-only (Linux + macOS); path-safety primitives mirror
+//! `turm-plugin-kb` (canonicalize root + re-validate every resolved
+//! path). The atomic-create-or-fail rename routes through
+//! `turm_core::fs_atomic` so the per-OS syscall lives in one place.
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
-    "turm-plugin-bookmark is currently Linux-only (path-safety primitives \
-     mirror turm-plugin-kb / turm-plugin-todo)."
+    "turm-plugin-bookmark supports Linux and macOS. Other Unixes need a \
+     backend-specific atomic-create primitive — extend turm_core::fs_atomic."
 );
 
 mod bookmark;

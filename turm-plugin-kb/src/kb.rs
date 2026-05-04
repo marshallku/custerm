@@ -6,10 +6,8 @@
 //! directly because `std::fs` doesn't expose the precise semantics the
 //! protocol requires.
 
-use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -906,42 +904,28 @@ fn atomic_create_with_content(path: &Path, content: &[u8]) -> Result<bool, KbErr
         }
     }
 
-    // Atomic rename with no-replace. On Linux this is `renameat2` with
-    // `RENAME_NOREPLACE`; on platforms without it we'd need a
-    // different approach (this binary is Linux-only via libc::renameat2
-    // for now).
-    let from = path_to_cstring(&temp_path)?;
-    let to = path_to_cstring(path)?;
-    let r = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if r == 0 {
-        Ok(true)
-    } else {
-        let err = std::io::Error::last_os_error();
-        // Clean up our orphaned temp file regardless of which branch
-        // we take next.
-        let _ = std::fs::remove_file(&temp_path);
-        if err.raw_os_error() == Some(libc::EEXIST) {
-            // Lost the race — the target file already exists. That's
-            // not an error for our caller; protocol says
-            // `created=false` and the existing content stands.
-            Ok(false)
-        } else {
-            Err(io_error(format!("renameat2 -> {}: {err}", path.display())))
+    // Atomic create-or-fail rename. Routed through `turm_core::fs_atomic`
+    // so the platform-specific syscall (Linux `renameat2(RENAME_NOREPLACE)`,
+    // macOS `renamex_np(RENAME_EXCL)`) lives in one place.
+    match turm_core::fs_atomic::rename_no_replace(&temp_path, path) {
+        Ok(()) => Ok(true),
+        Err(err) => {
+            // Clean up our orphaned temp file regardless of which branch
+            // we take next.
+            let _ = std::fs::remove_file(&temp_path);
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                // Lost the race — the target file already exists. That's
+                // not an error for our caller; protocol says
+                // `created=false` and the existing content stands.
+                Ok(false)
+            } else {
+                Err(io_error(format!(
+                    "rename_no_replace -> {}: {err}",
+                    path.display()
+                )))
+            }
         }
     }
-}
-
-fn path_to_cstring(p: &Path) -> Result<CString, KbErr> {
-    CString::new(p.as_os_str().as_bytes())
-        .map_err(|_| io_error(format!("path contains nul: {}", p.display())))
 }
 
 /// Process-local monotonic counter for temp file names. Collisions
