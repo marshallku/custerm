@@ -2,11 +2,11 @@
 name = "git"
 title = "Git Workspaces"
 version = "0.1.0"
-description = "Lightweight git workspace + worktree plugin. Reads workspaces from ~/.config/turm/workspaces.toml. Provides git.list_workspaces / list_worktrees / worktree_add / worktree_remove / current_branch / status — every call is an argv-vector shell-out to `git`, no shell strings."
+description = "Lightweight git workspace + worktree plugin. Reads workspaces from ~/.config/nestty/workspaces.toml. Provides git.list_workspaces / list_worktrees / worktree_add / worktree_remove / current_branch / status — every call is an argv-vector shell-out to `git`, no shell strings."
 
 [[services]]
 name = "main"
-exec = "turm-plugin-git"
+exec = "nestty-plugin-git"
 # Lazy: actions don't need a long-lived stream, so onAction is
 # enough. File-watcher-driven events (git.worktree_created,
 # git.branch_created, etc.) are deferred to slice 2 — at that
@@ -24,5 +24,5 @@ provides = [
 ]
 subscribes = []
 # Optional env:
-#   TURM_GIT_WORKSPACES_FILE — override the default
-#                              ~/.config/turm/workspaces.toml location.
+#   NESTTY_GIT_WORKSPACES_FILE — override the default
+#                              ~/.config/nestty/workspaces.toml location.

@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "turm-core",
-    "turm-linux",
-    "turm-cli",
-    "turm-ffi",
-    "turm-plugin-echo",
-    "turm-plugin-kb",
-    "turm-plugin-calendar",
-    "turm-plugin-slack",
-    "turm-plugin-llm",
-    "turm-plugin-todo",
-    "turm-plugin-git",
-    "turm-plugin-discord",
-    "turm-plugin-bookmark",
+    "nestty-core",
+    "nestty-linux",
+    "nestty-cli",
+    "nestty-ffi",
+    "nestty-plugin-echo",
+    "nestty-plugin-kb",
+    "nestty-plugin-calendar",
+    "nestty-plugin-slack",
+    "nestty-plugin-llm",
+    "nestty-plugin-todo",
+    "nestty-plugin-git",
+    "nestty-plugin-discord",
+    "nestty-plugin-bookmark",
 ]
 
 [workspace.package]
@@ -21,4 +21,4 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Cross-platform custom terminal emulator"
-repository = "https://github.com/marshall/turm"
+repository = "https://github.com/marshallku/nestty"

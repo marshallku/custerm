@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Build and run nestty-macos as a proper .app bundle.
+#
+# The Nestty executable links libnestty_ffi.a (Rust staticlib at
+# <workspace>/target/release/libnestty_ffi.a). SwiftPM cannot run cargo
+# itself from Package.swift, so this script wraps both build steps in
+# the right order. Same wrapping in scripts/install-macos.sh.
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# 1. Build the Rust FFI staticlib first so swift build's linker phase finds it.
+(cd .. && cargo build --release -p nestty-ffi)
+
+# 2. Build the Swift app, which links the .a above via Package.swift's
+#    linkerSettings (-L../target/release -lnestty_ffi).
+swift build
+
+APP_DIR=".build/debug/Nestty.app"
+CONTENTS="$APP_DIR/Contents"
+MACOS="$CONTENTS/MacOS"
+RESOURCES="$CONTENTS/Resources"
+
+mkdir -p "$MACOS" "$RESOURCES"
+cp .build/debug/Nestty "$MACOS/Nestty"
+
+cat > "$CONTENTS/Info.plist" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>Nestty</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.marshall.nestty</string>
+    <key>CFBundleName</key>
+    <string>nestty</string>
+    <key>CFBundleDisplayName</key>
+    <string>nestty</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>
+EOF
+
+# Kill any running instance first so the rebuilt binary is used
+pkill -x Nestty 2>/dev/null || true
+sleep 0.3
+
+open -n "$APP_DIR"

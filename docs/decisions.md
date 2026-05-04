@@ -15,7 +15,7 @@
 
 **Rationale:** VTE has its own optimized PTY management. Using `portable-pty` alongside VTE would mean double PTY handling. Let VTE do what it does best.
 
-**Consequence:** `turm-core/pty.rs` and `state.rs` were removed — both platforms handle PTY natively (VTE on Linux, SwiftTerm on macOS).
+**Consequence:** `nestty-core/pty.rs` and `state.rs` were removed — both platforms handle PTY natively (VTE on Linux, SwiftTerm on macOS).
 
 ## 3. Unix Socket for IPC (D-Bus Removed)
 
@@ -29,28 +29,28 @@
 
 **Stack:** `bg_picture` (window-overlay child) → `tint_overlay` (overlay) → layout box (overlay) → notebook → panels (terminal / plugin webview / external webview, all transparent)
 
-`BackgroundLayer` (in `turm-linux/src/background.rs`) lives at the window level. The root `gtk4::Overlay` has the `bg_picture` as its base child and adds the tint plus the actual UI layout as overlays. Every panel sits over this single image so the background is consistent across tabs (terminals, todo, etc.) instead of being painted per-terminal.
+`BackgroundLayer` (in `nestty-linux/src/background.rs`) lives at the window level. The root `gtk4::Overlay` has the `bg_picture` as its base child and adds the tint plus the actual UI layout as overlays. Every panel sits over this single image so the background is consistent across tabs (terminals, todo, etc.) instead of being painted per-terminal.
 
 **Critical details to keep the layer visible through every panel:**
 
 1. VTE: `terminal.set_clear_background(false)` + bg color `RGBA(0,0,0,0)` (always — not conditional on whether an image is loaded). VTE otherwise paints its own opaque background and hides the layer.
 2. WebKit (plugin + external webview): `webview.set_background_color(RGBA(0,0,0,0))` so blank pages don't paint opaque white over the layer.
-3. CSS: `notebook header`, `notebook > stack`, `.turm-statusbar` are all `background-color: transparent`. Plugin user CSS sets `html, body { background-color: transparent }`.
+3. CSS: `notebook header`, `notebook > stack`, `.nestty-statusbar` are all `background-color: transparent`. Plugin user CSS sets `html, body { background-color: transparent }`.
 4. `bg_picture` and `tint_overlay` use `set_can_target(false)` so input events pass through to the panels above.
 
 When no image is configured, `bg_picture` is hidden and the window's CSS `window { background-color: <theme.background> }` provides the solid theme color underneath.
 
 **Why moved here from per-`TerminalPanel`:** the previous design only rendered the image inside the first terminal's overlay, so opening a non-terminal panel (todo plugin, webview) hid the image entirely, and split terminals each rendered their own copy with independent positioning. Window-level layer fixes both.
 
-## 5. Binary Names: turm + turmctl
+## 5. Binary Names: nestty + nestctl
 
-**Problem:** Both turm-linux and turm-cli had `[[bin]] name = "turm"`, causing Cargo output filename collision.
+**Problem:** Both nestty-linux and nestty-cli had `[[bin]] name = "nestty"`, causing Cargo output filename collision.
 
-**Decision:** CLI binary renamed to `turmctl` (follows kubectl, sysctl naming convention).
+**Decision:** CLI binary renamed to `nestctl` (follows kubectl, sysctl naming convention).
 
 ## 6. Theme System
 
-**Design:** Themes are defined as `Theme` structs in `turm-core/theme.rs` with semantic color slots (foreground, background, 16-color palette, surface/overlay/accent UI colors). 10 built-in themes are embedded. All UI components (terminal, tab bar, search bar, webview URL bar, window background) use theme colors via CSS generation functions.
+**Design:** Themes are defined as `Theme` structs in `nestty-core/theme.rs` with semantic color slots (foreground, background, 16-color palette, surface/overlay/accent UI colors). 10 built-in themes are embedded. All UI components (terminal, tab bar, search bar, webview URL bar, window background) use theme colors via CSS generation functions.
 
 **Config:** `[theme] name = "catppuccin-mocha"` selects the active theme. Hot-reloads on config change.
 
@@ -61,7 +61,7 @@ When no image is configured, `bg_picture` is hidden and the window's CSS `window
 **Format:** Newline-delimited JSON with UUID request IDs.
 **Reference:** ~/dev/cmux/ (Marshall's macOS terminal multiplexer)
 
-This protocol is used by both turmctl and the turm-linux socket server. D-Bus remains for system integration (background control), while the socket API handles all rich control (tabs, splits, webview, terminal agent, approval workflow).
+This protocol is used by both nestctl and the nestty-linux socket server. D-Bus remains for system integration (background control), while the socket API handles all rich control (tabs, splits, webview, terminal agent, approval workflow).
 
 ## 8. Forced Dark Theme
 
@@ -112,13 +112,13 @@ Using the latest Rust edition. No compatibility concerns since the project is ne
 
 **Why `ResultBox`:** Swift 6 strict concurrency rejects capturing a `var` local in an `@MainActor` closure sent to another thread. A `final class` box with `@unchecked Sendable` is safe because the semaphore serializes all access — the socket thread never reads until after the signal.
 
-## 15. macOS: TurmPanel Protocol for Mixed Terminal+WebView Splits
+## 15. macOS: NesttyPanel Protocol for Mixed Terminal+WebView Splits
 
 **Problem:** `SplitNode` and `PaneManager` were typed to `TerminalViewController`. Adding WebView panels required either a union type or polymorphism.
 
-**Decision:** Introduced `TurmPanel: AnyObject` protocol with common interface (`view`, `currentTitle`, `startIfNeeded()`, `applyBackground`, etc.). `SplitNode` uses `case leaf(any TurmPanel)`. Identity comparison uses `ObjectIdentifier` since `any TurmPanel` is not `Equatable`.
+**Decision:** Introduced `NesttyPanel: AnyObject` protocol with common interface (`view`, `currentTitle`, `startIfNeeded()`, `applyBackground`, etc.). `SplitNode` uses `case leaf(any NesttyPanel)`. Identity comparison uses `ObjectIdentifier` since `any NesttyPanel` is not `Equatable`.
 
-**Tradeoff:** `any TurmPanel` existentials have a small overhead vs. concrete types, but panel operations are infrequent (split/close/focus) so the overhead is negligible.
+**Tradeoff:** `any NesttyPanel` existentials have a small overhead vs. concrete types, but panel operations are infrequent (split/close/focus) so the overhead is negligible.
 
 ## 11. Configurable Tab Position
 
@@ -130,7 +130,7 @@ Using the latest Rust edition. No compatibility concerns since the project is ne
 
 **Problem:** Original framing was "terminal-centric programmable workspace" — a terminal with extensions for browser panels and AI. As integration scope grew to encompass calendars, messengers, knowledge bases, and trigger-driven automation, the "terminal with some extras" framing became inadequate. Every new integration was adding ad-hoc wiring between its source, the UI surfaces that render it, and the actions that operate on it.
 
-**Decision:** Reframe turm as a **personal workflow runtime** that surfaces through a terminal. `turm-core` gains three central abstractions — Event Bus, Action Registry, Context Service — and existing features (socket event stream, plugin system, AI agent integration) consume them rather than reimplementing per-feature wiring.
+**Decision:** Reframe nestty as a **personal workflow runtime** that surfaces through a terminal. `nestty-core` gains three central abstractions — Event Bus, Action Registry, Context Service — and existing features (socket event stream, plugin system, AI agent integration) consume them rather than reimplementing per-feature wiring.
 
 **Tradeoff:** Larger architectural surface and more upfront design. The alternative — adding each integration ad-hoc — produces n×m wiring between n sources and m consumers (UI panels, triggers, AI agent, future KB indexer). The three abstractions turn this into n + m.
 
@@ -144,28 +144,28 @@ Using the latest Rust edition. No compatibility concerns since the project is ne
 
 ## 17. Plugin-First for External Integrations (Post-Phase 8)
 
-**Problem:** ADR 16 reframed turm as a personal workflow runtime, with the implicit assumption that integrations like Calendar, Slack, KB, Notion, and LLM would land as modules in `turm-core`/`turm-linux`. As the integration surface grew it became clear this would make turm a kitchen-sink monolith, lock the user to specific backends (e.g. KB always means `~/docs` if KB is built in), and make third-party contributions painful. The user explicitly raised the comparison to VSCode-style extensions.
+**Problem:** ADR 16 reframed nestty as a personal workflow runtime, with the implicit assumption that integrations like Calendar, Slack, KB, Notion, and LLM would land as modules in `nestty-core`/`nestty-linux`. As the integration surface grew it became clear this would make nestty a kitchen-sink monolith, lock the user to specific backends (e.g. KB always means `~/docs` if KB is built in), and make third-party contributions painful. The user explicitly raised the comparison to VSCode-style extensions.
 
-**Decision:** Every external integration is a **service plugin** — a long-running supervised subprocess that speaks newline-delimited JSON over stdin/stdout and registers itself with `turm-core` via a manifest-declared `[[services]]` section. The KB action protocol (and similar contracts) lives in `turm-core` as documented protocol; implementations live in plugins. `turm-core` and `turm-linux` own the runtime primitives only — Event Bus, Action Registry, Trigger Engine, Context Service, Plugin Loader.
+**Decision:** Every external integration is a **service plugin** — a long-running supervised subprocess that speaks newline-delimited JSON over stdin/stdout and registers itself with `nestty-core` via a manifest-declared `[[services]]` section. The KB action protocol (and similar contracts) lives in `nestty-core` as documented protocol; implementations live in plugins. `nestty-core` and `nestty-linux` own the runtime primitives only — Event Bus, Action Registry, Trigger Engine, Context Service, Plugin Loader.
 
 **Tradeoff:** First-call latency of a few hundred milliseconds (lazy plugin spawn) and IPC overhead per action call vs in-process performance. Acceptable at personal scale; the gain is extensibility, swappability of backends, crash isolation, and language-agnostic plugin authoring. Subprocess + stdio is the dominant pattern across the editor/IDE ecosystem (VSCode language servers, Neovim remote plugins, LSP) so it carries proven integration patterns.
 
 **Key sub-decisions** (with research validation):
 - **Lazy activation** like VSCode `activationEvents`. Initial instinct toward eager startup was wrong — research showed mature systems uniformly chose lazy.
 - **LSP-style initialization handshake** for capability and version negotiation.
-- **Manifest-declared `provides`/`subscribes` as source of truth + lexical-name conflict resolution** at load time. The runtime `initialize` response is checked asymmetrically against the manifest — applied identically to BOTH `provides` AND `subscribes`: subset allowed (degraded mode — turm wires up only what runtime declared); superset rejected with warning (extras dropped, plugin keeps running for manifest-approved set). The pre-spawn ownership analysis stays accurate. Two enabled plugins with overlapping `provides` resolve via alphabetical `[plugin].name` ordering (the existing canonical plugin identifier from [plugins.md](./plugins.md)) — deterministic across runs and filesystems. User controls precedence by enabling/disabling plugins, or by editing the manifest `[plugin].name` if a finer override is needed.
-- **Subprocess + stdio + newline-JSON**, NOT WASM yet. WASM (Zed's choice) adds Wasmtime runtime and WIT compilation barriers that personal-scale turm doesn't yet need.
+- **Manifest-declared `provides`/`subscribes` as source of truth + lexical-name conflict resolution** at load time. The runtime `initialize` response is checked asymmetrically against the manifest — applied identically to BOTH `provides` AND `subscribes`: subset allowed (degraded mode — nestty wires up only what runtime declared); superset rejected with warning (extras dropped, plugin keeps running for manifest-approved set). The pre-spawn ownership analysis stays accurate. Two enabled plugins with overlapping `provides` resolve via alphabetical `[plugin].name` ordering (the existing canonical plugin identifier from [plugins.md](./plugins.md)) — deterministic across runs and filesystems. User controls precedence by enabling/disabling plugins, or by editing the manifest `[plugin].name` if a finer override is needed.
+- **Subprocess + stdio + newline-JSON**, NOT WASM yet. WASM (Zed's choice) adds Wasmtime runtime and WIT compilation barriers that personal-scale nestty doesn't yet need.
 
 **See:** [service-plugins.md](./service-plugins.md) for full vision, decisions, rationale, research sources, and the Phase 9–18 roadmap.
 
 ## 18. Service Plugin Supervisor Threading: One Reader, One Writer, Workers for Recursive Calls
 
-**Problem:** A service plugin can call back into turm via `action.invoke` — a registered action handler that the registry might dispatch to *another* service plugin (or even back to the same one). If the reader thread that just received that inbound `action.invoke` synchronously calls `registry.invoke`, and that handler resolves through `invoke_remote` on the same service, we deadlock: the response we're blocking on is the response that this very reader thread is responsible for delivering.
+**Problem:** A service plugin can call back into nestty via `action.invoke` — a registered action handler that the registry might dispatch to *another* service plugin (or even back to the same one). If the reader thread that just received that inbound `action.invoke` synchronously calls `registry.invoke`, and that handler resolves through `invoke_remote` on the same service, we deadlock: the response we're blocking on is the response that this very reader thread is responsible for delivering.
 
 **Decision:** Per running service, supervise with three OS threads — one writer (drains outgoing channel into child stdin), one reader (parses child stdout, dispatches frames), one stderr-tail (logs). On every inbound `action.invoke` request, the reader spawns a short-lived worker thread that runs `registry.invoke` and sends the response. Notifications (`event.publish`, `log`) stay on the reader thread because they don't recurse.
 
 For the action-handler side: `invoke_remote` blocks the calling thread on a oneshot channel up to the action timeout. Since the calling thread is the dispatcher (socket→GTK timer or trigger sink worker), this is acceptable. The supervisor's response routing is decoupled because `dispatch_invocation` spawns its own worker that owns the reply channel.
 
-**Tradeoff:** Higher thread count per service (3 + 1 wait + 1 per `subscribes` glob, plus transient workers per inbound recursive call). Justified at personal scale (a handful of services). The alternative — a single-threaded event loop with futures — would let us avoid threads but adds an async runtime dependency to `turm-linux` that nothing else needs yet.
+**Tradeoff:** Higher thread count per service (3 + 1 wait + 1 per `subscribes` glob, plus transient workers per inbound recursive call). Justified at personal scale (a handful of services). The alternative — a single-threaded event loop with futures — would let us avoid threads but adds an async runtime dependency to `nestty-linux` that nothing else needs yet.
 
-**See:** `turm-linux/src/service_supervisor.rs` for the implementation.
+**See:** `nestty-linux/src/service_supervisor.rs` for the implementation.

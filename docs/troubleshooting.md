@@ -22,11 +22,11 @@ The method is gated behind a feature flag.
 ### Cargo binary name collision
 
 ```
-warning: output filename collision at target/debug/turm
+warning: output filename collision at target/debug/nestty
 ```
 
-turm-linux and turm-cli both output `turm`.
-**Fix:** CLI binary renamed to `turmctl` in turm-cli/Cargo.toml.
+nestty-linux and nestty-cli both output `nestty`.
+**Fix:** CLI binary renamed to `nestctl` in nestty-cli/Cargo.toml.
 
 ## Runtime Issues
 
@@ -58,7 +58,7 @@ Failed to create GBM buffer of size 841x1352: Invalid argument
 
 Multiple possible causes:
 
-1. **Config `directory` is commented out**: Check `~/.config/turm/config.toml`. The `directory` field must be uncommented. A `#` before the key comments it out.
+1. **Config `directory` is commented out**: Check `~/.config/nestty/config.toml`. The `directory` field must be uncommented. A `#` before the key comments it out.
 
 2. **Surface is opaque**: the window-level `BackgroundLayer` paints behind everything, so any opaque widget above it hides the image. Required transparent surfaces: VTE (`set_clear_background(false)` + `RGBA(0,0,0,0)`), WebKit (`webview.set_background_color(RGBA(0,0,0,0))`), notebook header / statusbar / `html, body` in plugin CSS — all transparent. If you add a new chrome widget and the image disappears under it, that widget needs the same treatment.
 
@@ -66,17 +66,17 @@ Multiple possible causes:
 
 4. **Tint too opaque**: Tint at 0.9 makes images nearly invisible (90% opaque dark overlay). Lower to 0.85 or less.
 
-5. **GTK single-instance**: If an old turm is running, new launches activate the old instance and exit immediately (exit code 0, no output). Kill all instances first: `killall turm`.
+5. **GTK single-instance**: If an old nestty is running, new launches activate the old instance and exit immediately (exit code 0, no output). Kill all instances first: `killall nestty`.
 
 ### App exits immediately with no error
 
-**Cause:** GTK single-instance behavior. Another turm instance already owns the GTK app ID `com.marshall.turm`.
-**Fix:** `killall turm` then relaunch.
+**Cause:** GTK single-instance behavior. Another nestty instance already owns the GTK app ID `com.marshall.nestty`.
+**Fix:** `killall nestty` then relaunch.
 
 ### env_logger output not visible
 
 **Cause:** GTK may capture/redirect stderr. `RUST_LOG=info` has no visible effect.
-**Fix:** Use `eprintln!("[turm] ...")` instead of `log::info!()` for debug output.
+**Fix:** Use `eprintln!("[nestty] ...")` instead of `log::info!()` for debug output.
 
 ### Terminal shows only one line (collapsed height)
 
@@ -103,13 +103,13 @@ WebProcess CRASHED
 
 **Symptom:** Plugin panel (or any `webkit6::WebView`) renders fine on first show. User switches to a different Hyprland workspace, then comes back. Panel is stuck on the last frame — appears alive (backend healthy, WebProcess alive, IPC responsive) but doesn't repaint. Right-click → "Inspect Element" revives instantly. Focusing another window and coming back also revives it.
 
-**Status: known upstream limitation in WebKitGTK 6.0 ↔ Hyprland interaction. Not fixable in turm-side code.**
+**Status: known upstream limitation in WebKitGTK 6.0 ↔ Hyprland interaction. Not fixable in nestty-side code.**
 
-**Reproduction outside turm:** Spawn the official WebKitGTK reference browser:
+**Reproduction outside nestty:** Spawn the official WebKitGTK reference browser:
 ```
 /usr/lib/webkitgtk-6.0/MiniBrowser https://www.google.com
 ```
-on Hyprland and switch workspaces. Same freeze. This is zero turm code, so the bug is upstream.
+on Hyprland and switch workspaces. Same freeze. This is zero nestty code, so the bug is upstream.
 
 **What was ruled out empirically (rounds 1–5, all reverted):**
 - Round 1 — `webview.connect_map(|wv| wv.evaluate_javascript("0"))`: signal never fires; Hyprland uses scene-graph hide without `wl_surface.unmap`.
@@ -123,7 +123,7 @@ on Hyprland and switch workspaces. Same freeze. This is zero turm code, so the b
 
 **Why no application-level fix worked:** The freeze is in WebKit's compositor frame-production path after the wl_surface gets the SUSPENDED bit and then has it cleared. The bit DOES toggle on Hyprland (verified via `connect_state_notify` logs), but WebKit's render scheduler doesn't resume pushing frames on bit-clear unless an actual input event (pointer, dev-tools attach via JS pump from inspector init) drives it. There is no public WebKitGTK 6.0 API to tell the WebProcess "visibility changed, resume rendering."
 
-**User-facing workaround:** Click anywhere in the panel after coming back from a workspace, OR focus another window then refocus turm, OR right-click → Inspect Element. All three paths cause WebKit's compositor to resume.
+**User-facing workaround:** Click anywhere in the panel after coming back from a workspace, OR focus another window then refocus nestty, OR right-click → Inspect Element. All three paths cause WebKit's compositor to resume.
 
 **Possible future paths (not pursued):**
 - File upstream issue at `bugs.webkit.org` and `github.com/hyprwm/Hyprland` with the MiniBrowser reproducer.
@@ -142,7 +142,7 @@ The diagnostic signal hooks (`load_changed` / `load_failed` / `web_process_termi
 
 **Cause:** SwiftTerm's `LocalProcess.childProcessRead` detects PTY EOF and calls `childStopped()`, which cancels the internal `childMonitor` DispatchSource before it can fire. The `processTerminated` call in the EOF handler is commented out in SwiftTerm source.
 
-**Fix:** Install a separate `DispatchSource.makeProcessSource` after `startProcess()` returns (in `TurmTerminalView.installExitMonitor()`). This source is not affected by `childStopped()` and fires independently when the process exits.
+**Fix:** Install a separate `DispatchSource.makeProcessSource` after `startProcess()` returns (in `NesttyTerminalView.installExitMonitor()`). This source is not affected by `childStopped()` and fires independently when the process exits.
 
 ```swift
 func installExitMonitor() {
@@ -183,7 +183,7 @@ func installExitMonitor() {
 
 **Cause:** SwiftTerm's `LocalProcessTerminalView.clipboardCopy(source:content:)` is declared `public` (not `open`) and unconditionally writes the OSC 52 payload to `NSPasteboard.general`. Because the method is `public`, subclasses outside the SwiftTerm module cannot override it. Pre-fix, any program in a pane could silently overwrite the user's clipboard.
 
-**Fix:** `TurmTerminalView` installs a custom `TurmTerminalDelegate` proxy into SwiftTerm's `terminalDelegate` slot. The proxy forwards `sizeChanged` / `setTerminalTitle` / `hostCurrentDirectoryUpdate` / `send` / `scrolled` / `rangeChanged` to the host's public methods (so PTY winsize, title updates, OSC 7, key input, etc. continue to work) and applies an `OSC52Policy` gate on `clipboardCopy`. `requestOpenLink` / `bell` / `iTermContent` are left to the protocol-extension defaults — overriding them would change behavior with no benefit.
+**Fix:** `NesttyTerminalView` installs a custom `NesttyTerminalDelegate` proxy into SwiftTerm's `terminalDelegate` slot. The proxy forwards `sizeChanged` / `setTerminalTitle` / `hostCurrentDirectoryUpdate` / `send` / `scrolled` / `rangeChanged` to the host's public methods (so PTY winsize, title updates, OSC 7, key input, etc. continue to work) and applies an `OSC52Policy` gate on `clipboardCopy`. `requestOpenLink` / `bell` / `iTermContent` are left to the protocol-extension defaults — overriding them would change behavior with no benefit.
 
 The policy is read from `[security] osc52` in config (`"deny"` default, `"allow"` opts back into legacy behavior). Hot-reload propagates through `applyConfig` → `paneManager.applyOSC52Policy` so live panes pick up the change without restart.
 
@@ -208,7 +208,7 @@ font_family = "JetBrainsMono Nerd Font Mono"
 
 **Cause:** `Config.swift` only parsed `path` and `tint` from the `[background]` section. The `opacity` field was silently ignored, and the `applyBackground` signature only accepted `path` and `tint`. Hot-reload therefore never changed the image layer's alpha.
 
-**Fix:** Added `backgroundOpacity: Double` to `TurmConfig`, parse `("background", "opacity")` in `Config.parse`, and propagated an `opacity` parameter through the full call chain: `TurmPanel.applyBackground(path:tint:opacity:)` → `TerminalViewController` (sets `backgroundView?.alphaValue`) → `WebViewController` (no-op) → `PaneManager` → `TabViewController` (stores `currentBackgroundOpacity`) → `AppDelegate` initial apply and `background.set` socket command.
+**Fix:** Added `backgroundOpacity: Double` to `NesttyConfig`, parse `("background", "opacity")` in `Config.parse`, and propagated an `opacity` parameter through the full call chain: `NesttyPanel.applyBackground(path:tint:opacity:)` → `TerminalViewController` (sets `backgroundView?.alphaValue`) → `WebViewController` (no-op) → `PaneManager` → `TabViewController` (stores `currentBackgroundOpacity`) → `AppDelegate` initial apply and `background.set` socket command.
 
 Also added `("background", "image")` as an alias for `("background", "path")` to match the documented config key.
 

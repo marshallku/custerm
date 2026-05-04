@@ -1,4 +1,4 @@
-# turm
+# nestty
 
 <img width="3440" height="1440" alt="image" src="https://github.com/user-attachments/assets/a1392646-1255-40ed-9722-ea8523a5c342" />
 
@@ -13,8 +13,8 @@ A custom terminal emulator built with a shared Rust core and platform-native UIs
 - **Tabs** — create, switch, and split terminal tabs (horizontal/vertical)
 - **Dynamic font scaling** — `Ctrl+=`/`Ctrl+-`/`Ctrl+0`
 - **D-Bus control** — change backgrounds, tint, and more at runtime
-- **CLI tool (`turmctl`)** — control the terminal from the command line
-- **TOML configuration** — simple config at `~/.config/turm/config.toml`
+- **CLI tool (`nestctl`)** — control the terminal from the command line
+- **TOML configuration** — simple config at `~/.config/nestty/config.toml`
 
 ## Screenshots
 
@@ -34,7 +34,7 @@ Install GTK4 and libvte-2.91-gtk4 from your distribution's package manager.
 
 ### macOS
 
-Xcode Command Line Tools (for SwiftPM) and Rust (for `turmctl`).
+Xcode Command Line Tools (for SwiftPM) and Rust (for `nestctl`).
 
 ```bash
 xcode-select --install
@@ -50,13 +50,13 @@ The macOS app targets macOS 14+. SwiftTerm is fetched as an SPM dep at build tim
 cargo build
 
 # Run the terminal
-cargo run -p turm-linux
+cargo run -p nestty-linux
 
 # Generate a default config file
-cargo run -p turm-linux -- --init-config
+cargo run -p nestty-linux -- --init-config
 
 # Control the running terminal via CLI
-cargo run -p turm-cli -- <command>
+cargo run -p nestty-cli -- <command>
 ```
 
 ## Install
@@ -64,7 +64,7 @@ cargo run -p turm-cli -- <command>
 ### Linux — From GitHub Releases (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/marshallku/turm/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/marshallku/nestty/master/install.sh | bash
 ```
 
 Options:
@@ -77,7 +77,7 @@ Options:
 ```bash
 ./scripts/install-dev.sh           # build + install everything (sudo, /usr/local/bin)
 ./scripts/install-dev.sh --user    # ~/.local/bin (no sudo)
-./scripts/install-dev.sh --restart # also pkill -x turm afterwards
+./scripts/install-dev.sh --restart # also pkill -x nestty afterwards
 ```
 
 This builds a release binary, installs the desktop entry, and lays down first-party plugins.
@@ -87,23 +87,23 @@ This builds a release binary, installs the desktop entry, and lays down first-pa
 ```bash
 ./scripts/install-macos.sh             # ~/Applications + ~/.cargo/bin (no sudo)
 ./scripts/install-macos.sh --system    # /Applications + ~/.cargo/bin (sudo for /Applications)
-./scripts/install-macos.sh --launch    # open Turm.app after installing
+./scripts/install-macos.sh --launch    # open Nestty.app after installing
 ```
 
-This builds the macOS app via SwiftPM (release config), installs `Turm.app`, and installs `turmctl` via `cargo install --path turm-cli` (the workspace root is a virtual manifest, so the more obvious `cargo install turm-cli` and `cargo install --path .` both fail — the script wraps the correct invocation).
+This builds the macOS app via SwiftPM (release config), installs `Nestty.app`, and installs `nestctl` via `cargo install --path nestty-cli` (the workspace root is a virtual manifest, so the more obvious `cargo install nestty-cli` and `cargo install --path .` both fail — the script wraps the correct invocation).
 
-For dev iteration without installing, use `turm-macos/run.sh` (debug bundle under `.build/debug/Turm.app`, opened in place).
+For dev iteration without installing, use `nestty-macos/run.sh` (debug bundle under `.build/debug/Nestty.app`, opened in place).
 
 ### Update
 
 ```bash
-turmctl update check    # check for new versions
-turmctl update apply    # download and install latest (Linux only — macOS users re-run install-macos.sh)
+nestctl update check    # check for new versions
+nestctl update apply    # download and install latest (Linux only — macOS users re-run install-macos.sh)
 ```
 
 ## Configuration
 
-Config file: `~/.config/turm/config.toml`
+Config file: `~/.config/nestty/config.toml`
 
 ```toml
 [terminal]
@@ -120,7 +120,7 @@ opacity = 0.95
 position = "top"  # top, bottom, left, right
 
 [socket]
-path = "/tmp/turm.sock"
+path = "/tmp/nestty.sock"
 
 [theme]
 name = "catppuccin-mocha"
@@ -131,11 +131,11 @@ All fields have defaults — the config file is entirely optional.
 ## Project Structure
 
 ```
-turm/
-├── turm-core/    # Shared Rust library (config, background, protocol, state)
-├── turm-linux/   # GTK4 + VTE4 native terminal app
-├── turm-cli/     # CLI control tool (turmctl)
-├── turm-macos/   # Swift/AppKit app (stub)
+nestty/
+├── nestty-core/    # Shared Rust library (config, background, protocol, state)
+├── nestty-linux/   # GTK4 + VTE4 native terminal app
+├── nestty-cli/     # CLI control tool (nestctl)
+├── nestty-macos/   # Swift/AppKit app (stub)
 └── docs/            # Internal documentation
 ```
 

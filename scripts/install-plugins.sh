@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Install first-party plugins into ~/.config/turm/plugins/ with
+# Install first-party plugins into ~/.config/nestty/plugins/ with
 # binaries symlinked from a build directory. Solves the common
-# "service X is not running" startup error caused by turm being
+# "service X is not running" startup error caused by nestty being
 # launched from a desktop entry whose PATH doesn't include the
 # built binaries.
 #
@@ -15,10 +15,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXAMPLES_DIR="$REPO_ROOT/examples/plugins"
 TARGET_DIR="$REPO_ROOT/target/release"
-PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/turm/plugins"
+PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nestty/plugins"
 
 if [ ! -d "$EXAMPLES_DIR" ]; then
-    echo "error: $EXAMPLES_DIR not found — run from a turm checkout" >&2
+    echo "error: $EXAMPLES_DIR not found — run from a nestty checkout" >&2
     exit 1
 fi
 
@@ -28,11 +28,11 @@ fi
 # them whenever the common preamble drifts. We only create empty
 # stubs when missing; existing user content is never touched.
 #
-# Path derivation MUST match `turm-plugin-todo::prompt::docs_root_for`
-# at runtime: `parent(TURM_TODO_ROOT)`. Default is `~/docs/todos` →
+# Path derivation MUST match `nestty-plugin-todo::prompt::docs_root_for`
+# at runtime: `parent(NESTTY_TODO_ROOT)`. Default is `~/docs/todos` →
 # stubs at `~/docs/claude/`. Anything else here would create stubs
 # the plugin never reads.
-TODO_ROOT="${TURM_TODO_ROOT:-$HOME/docs/todos}"
+TODO_ROOT="${NESTTY_TODO_ROOT:-$HOME/docs/todos}"
 DOCS_ROOT="$(dirname -- "$TODO_ROOT")"
 ensure_claude_stub() {
     local path="$1"
@@ -47,7 +47,7 @@ ensure_claude_stub "$DOCS_ROOT/claude/global.md" "# Global preamble for claude s
 
 Common context applied to every Todo's claude.start prompt. Edit
 freely — the Todo plugin re-reads this file at start time, so
-changes apply on the next click without restarting turm.
+changes apply on the next click without restarting nestty.
 
 (stub created by scripts/install-plugins.sh — replace with your
 own coding rules, language conventions, project-wide reminders.)"
@@ -90,4 +90,4 @@ for name in "$@"; do
 done
 
 echo
-echo "Restart turm so discover_plugins() picks up the changes."
+echo "Restart nestty so discover_plugins() picks up the changes."

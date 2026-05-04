@@ -1,15 +1,15 @@
-# turm Documentation Index
+# nestty Documentation Index
 
 ## File Structure
 
 | File                                       | Purpose                                     | When to Read                              |
 | ------------------------------------------ | ------------------------------------------- | ----------------------------------------- |
 | [architecture.md](./architecture.md)       | Project structure, crate layout, tech stack | Starting work, understanding the codebase |
-| [linux-app.md](./linux-app.md)             | GTK4 + VTE4 Linux app internals             | Working on turm-linux                     |
-| [macos-app.md](./macos-app.md)             | Swift/AppKit + SwiftTerm macOS app          | Working on turm-macos                     |
+| [linux-app.md](./linux-app.md)             | GTK4 + VTE4 Linux app internals             | Working on nestty-linux                     |
+| [macos-app.md](./macos-app.md)             | Swift/AppKit + SwiftTerm macOS app          | Working on nestty-macos                     |
 | [macos-parity-plan.md](./macos-parity-plan.md) | Tiered plan to bring macOS to Linux parity (codex-reviewed) | Picking next macOS work item |
-| [core-lib.md](./core-lib.md)               | Shared Rust core library modules            | Working on turm-core                      |
-| [cli.md](./cli.md)                         | CLI tool (turmctl) and D-Bus interface      | Working on remote control features        |
+| [core-lib.md](./core-lib.md)               | Shared Rust core library modules            | Working on nestty-core                      |
+| [cli.md](./cli.md)                         | CLI tool (nestctl) and D-Bus interface      | Working on remote control features        |
 | [config.md](./config.md)                   | Configuration format and defaults           | Adding config options                     |
 | [decisions.md](./decisions.md)             | Key technical decisions and rationale       | Understanding "why" behind choices        |
 | [troubleshooting.md](./troubleshooting.md) | Known issues, fixes, gotchas                | Debugging problems                        |
@@ -21,9 +21,9 @@
 
 ## Quick Reference
 
-- **Binary names**: `turm` (terminal app), `turmctl` (CLI control tool)
-- **Config path**: `~/.config/turm/config.toml`
-- **Cache path**: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/turm/wallpapers.txt` (macOS, falls back to Linux path)
-- **GTK app ID**: `com.marshall.turm`
+- **Binary names**: `nestty` (terminal app), `nestctl` (CLI control tool)
+- **Config path**: `~/.config/nestty/config.toml`
+- **Cache path**: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/nestty/wallpapers.txt` (macOS, falls back to Linux path)
+- **GTK app ID**: `com.marshall.nestty`
 - **Theme**: Catppuccin Mocha
 - **Rust edition**: 2024

@@ -1,17 +1,17 @@
-# Linux App (turm-linux)
+# Linux App (nestty-linux)
 
 ## Entry Point (`main.rs`)
 
 CLI flags handled before GTK launch:
 
-- `--init-config` — writes default config to `~/.config/turm/config.toml`
+- `--init-config` — writes default config to `~/.config/nestty/config.toml`
 - `--config-path` — prints config file path
 
 ## Application (`app.rs`)
 
-- GTK Application ID: `com.marshall.turm`
+- GTK Application ID: `com.marshall.nestty`
 - Forces dark theme on startup via `set_gtk_application_prefer_dark_theme(true)`
-- Loads config with `TurmConfig::load()`, falls back to defaults
+- Loads config with `NesttyConfig::load()`, falls back to defaults
 
 ## Window (`window.rs`)
 
@@ -118,7 +118,7 @@ All built-in shortcuts use `Ctrl+Shift` — Ctrl-only keys pass through to termi
 
 ### Custom Keybindings
 
-Custom keybindings can be configured in `[keybindings]` section of `config.toml`. They are checked before built-in shortcuts, so they can override defaults. Spawned commands receive `TURM_SOCKET` environment variable. See [config.md](./config.md#keybindings) for details.
+Custom keybindings can be configured in `[keybindings]` section of `config.toml`. They are checked before built-in shortcuts, so they can override defaults. Spawned commands receive `NESTTY_SOCKET` environment variable. See [config.md](./config.md#keybindings) for details.
 
 ## Search (`search.rs`)
 
@@ -140,13 +140,13 @@ Binary tree of `SplitNode` (Leaf = terminal, Branch = `gtk4::Paned` with two chi
 
 ```bash
 # Build + install
-./turm-linux/install.sh
+./nestty-linux/install.sh
 
 # Or manually
-cargo build --release -p turm-linux
-sudo install -Dm755 target/release/turm /usr/local/bin/turm
-sudo install -Dm644 turm-linux/turm.desktop /usr/share/applications/turm.desktop
+cargo build --release -p nestty-linux
+sudo install -Dm755 target/release/nestty /usr/local/bin/nestty
+sudo install -Dm644 nestty-linux/nestty.desktop /usr/share/applications/nestty.desktop
 
 # Set as default terminal (GNOME)
-gsettings set org.gnome.desktop.default-applications.terminal exec turm
+gsettings set org.gnome.desktop.default-applications.terminal exec nestty
 ```

@@ -25,14 +25,14 @@
 #   files, attachments, edit-history, all of it).
 #
 # slack.post_message action:
-#   turmctl call slack.post_message --params \
+#   nestctl call slack.post_message --params \
 #     '{"channel":"C123","text":"hello","thread_ts":"1700000000.000100"}'
 #   Returns {ts, channel} on success; surfaces Slack error codes
 #   (missing_scope / not_in_channel / channel_not_found / etc.)
 #   verbatim as `io_error`.
 #
 # slack.get_message action:
-#   turmctl call slack.get_message --params \
+#   nestctl call slack.get_message --params \
 #     '{"channel":"C123","ts":"1700000000.000100"}'
 #   Returns the full Slack message object on success. Failure codes
 #   surface STRUCTURALLY at the action's top-level error code so
@@ -122,7 +122,7 @@ event_kind = "slack.mention"
 # ---------------------------------------------------------------------
 # 5. Emoji-react → Todo capture (parity with Discord 2.5)
 #
-# Use case: see something in Slack, react with :memo:, turm captures
+# Use case: see something in Slack, react with :memo:, nestty captures
 # the message as a Todo with the permalink + body. Uses Phase 14.2
 # `await` to correlate the get_message reply with THIS specific
 # trigger instance — without correlation every successful

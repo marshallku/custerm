@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
-# scripts/install-macos.sh — Build + install turm-macos as a real .app
-# and install turmctl via `cargo install --path turm-cli`.
+# scripts/install-macos.sh — Build + install nestty-macos as a real .app
+# and install nestctl via `cargo install --path nestty-cli`.
 #
 # Companion to scripts/install-dev.sh (which is Linux-only — it does
-# `cargo build --workspace`, and the workspace contains turm-linux which
+# `cargo build --workspace`, and the workspace contains nestty-linux which
 # does not build on macOS without GTK4).
 #
 # Why this script exists:
-#   - The macOS GUI app builds via SwiftPM in turm-macos/, not cargo.
-#     Up to now, turm-macos/run.sh was the only path, and it builds an
+#   - The macOS GUI app builds via SwiftPM in nestty-macos/, not cargo.
+#     Up to now, nestty-macos/run.sh was the only path, and it builds an
 #     ephemeral debug bundle under .build/debug/ and `open -n`s it. There
-#     was no way to install turm as a real /Applications app.
-#   - `cargo install turm-cli` (crates.io) fails — the package is not
+#     was no way to install nestty as a real /Applications app.
+#   - `cargo install nestty-cli` (crates.io) fails — the package is not
 #     published. `cargo install --path .` from the repo root also fails
 #     because the root manifest is a workspace, not a package. The
-#     correct invocation is `cargo install --path turm-cli`, which this
+#     correct invocation is `cargo install --path nestty-cli`, which this
 #     script wraps so the user does not need to memorize it.
 #
 # Usage:
 #   ./scripts/install-macos.sh              # ~/Applications + ~/.cargo/bin (no sudo)
 #   ./scripts/install-macos.sh --system     # /Applications + ~/.cargo/bin (sudo for /Applications)
-#   ./scripts/install-macos.sh --no-build   # skip swift build (use existing .build/release/Turm)
-#   ./scripts/install-macos.sh --no-turmctl # skip cargo install of turmctl
+#   ./scripts/install-macos.sh --no-build   # skip swift build (use existing .build/release/Nestty)
+#   ./scripts/install-macos.sh --no-nestctl # skip cargo install of nestctl
 #   ./scripts/install-macos.sh --no-plugins # skip building/installing plugin binaries
 #   ./scripts/install-macos.sh --launch     # open the installed app afterwards
 #
 # Notes:
-#   - turmctl always goes to ~/.cargo/bin (cargo install's default). If you
+#   - nestctl always goes to ~/.cargo/bin (cargo install's default). If you
 #     want it in /usr/local/bin, run `sudo install -m755 \\
-#     ~/.cargo/bin/turmctl /usr/local/bin/turmctl` after this script.
-#   - This script kills any running Turm instance so the binary can be
+#     ~/.cargo/bin/nestctl /usr/local/bin/nestctl` after this script.
+#   - This script kills any running Nestty instance so the binary can be
 #     replaced. macOS holds an exclusive lock on a running .app's exec.
 #   - First launch may show Gatekeeper warning if the .app is unsigned;
 #     right-click → Open once, or `xattr -d com.apple.quarantine` (only
@@ -44,10 +44,10 @@ if [[ "$(uname)" != "Darwin" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_NAME="Turm.app"
+APP_NAME="Nestty.app"
 DO_BUILD=true
 SYSTEM_INSTALL=false
-DO_TURMCTL=true
+DO_NESTCTL=true
 DO_PLUGINS=true
 DO_LAUNCH=false
 
@@ -60,7 +60,7 @@ DO_LAUNCH=false
 #   `calendar.event_imminent`). RPC actions still work without Google
 #   OAuth creds thanks to `Config::minimal()` fallback.
 # - kb / todo / bookmark formerly required Linux's `renameat2(RENAME_NOREPLACE)`;
-#   the shared `turm_core::fs_atomic` primitive now selects between
+#   the shared `nestty_core::fs_atomic` primitive now selects between
 #   `renameat2` (Linux) and `renamex_np(RENAME_EXCL)` (Darwin), so all
 #   three install and run on macOS.
 # - slack / discord install fine; full functionality needs user-supplied
@@ -73,7 +73,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --system)      SYSTEM_INSTALL=true ; shift ;;
         --no-build)    DO_BUILD=false ; shift ;;
-        --no-turmctl)  DO_TURMCTL=false ; shift ;;
+        --no-nestctl)  DO_NESTCTL=false ; shift ;;
         --no-plugins)  DO_PLUGINS=false ; shift ;;
         --launch)      DO_LAUNCH=true ; shift ;;
         -h|--help)
@@ -96,27 +96,27 @@ else
 fi
 
 # 1. Build the macOS app via SwiftPM (release config).
-#    The Turm executable links libturm_ffi.a from the Rust staticlib crate;
+#    The Nestty executable links libnestty_ffi.a from the Rust staticlib crate;
 #    SwiftPM cannot run cargo as a prebuild step from Package.swift, so we
 #    invoke cargo here first. swift build's linker phase then picks up the
-#    archive at $REPO_ROOT/target/release/libturm_ffi.a via the
+#    archive at $REPO_ROOT/target/release/libnestty_ffi.a via the
 #    -L../target/release flag baked into Package.swift.
 if $DO_BUILD; then
-    echo "==> cargo build --release -p turm-ffi (Rust staticlib for Swift FFI)"
-    (cd "$REPO_ROOT" && cargo build --release -p turm-ffi)
+    echo "==> cargo build --release -p nestty-ffi (Rust staticlib for Swift FFI)"
+    (cd "$REPO_ROOT" && cargo build --release -p nestty-ffi)
 
-    echo "==> swift build -c release (turm-macos)"
-    (cd "$REPO_ROOT/turm-macos" && swift build -c release)
+    echo "==> swift build -c release (nestty-macos)"
+    (cd "$REPO_ROOT/nestty-macos" && swift build -c release)
 fi
 
-BUILT_BIN="$REPO_ROOT/turm-macos/.build/release/Turm"
+BUILT_BIN="$REPO_ROOT/nestty-macos/.build/release/Nestty"
 if [[ ! -x "$BUILT_BIN" ]]; then
-    echo "error: $BUILT_BIN not found — drop --no-build, or run swift build -c release in turm-macos/" >&2
+    echo "error: $BUILT_BIN not found — drop --no-build, or run swift build -c release in nestty-macos/" >&2
     exit 1
 fi
 
 # 2. Stop any running instance so we can replace the bundle's executable.
-pkill -x Turm 2>/dev/null || true
+pkill -x Nestty 2>/dev/null || true
 sleep 0.3
 
 # 3. Stage the bundle in a tmp dir so the install is atomic — the user
@@ -128,9 +128,9 @@ CONTENTS="$STAGING/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 mkdir -p "$MACOS" "$RESOURCES"
-cp "$BUILT_BIN" "$MACOS/Turm"
+cp "$BUILT_BIN" "$MACOS/Nestty"
 
-# Info.plist — kept in sync with turm-macos/run.sh by hand. Two copies is
+# Info.plist — kept in sync with nestty-macos/run.sh by hand. Two copies is
 # acceptable (Rule of Three); a third would mean extracting to a template.
 cat > "$CONTENTS/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -138,13 +138,13 @@ cat > "$CONTENTS/Info.plist" <<'EOF'
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>Turm</string>
+    <string>Nestty</string>
     <key>CFBundleIdentifier</key>
-    <string>com.marshall.turm</string>
+    <string>com.marshall.nestty</string>
     <key>CFBundleName</key>
-    <string>turm</string>
+    <string>nestty</string>
     <key>CFBundleDisplayName</key>
-    <string>turm</string>
+    <string>nestty</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>
@@ -168,26 +168,26 @@ mkdir -p "$APP_DEST" 2>/dev/null || $SUDO_APP mkdir -p "$APP_DEST"
 $SUDO_APP rm -rf "$APP_DEST/$APP_NAME"
 $SUDO_APP mv "$STAGING" "$APP_DEST/$APP_NAME"
 
-# 5. Install turmctl via cargo install (writes to ~/.cargo/bin). This
-#    is the canonical CLI install path on macOS — `cargo install turm-cli`
+# 5. Install nestctl via cargo install (writes to ~/.cargo/bin). This
+#    is the canonical CLI install path on macOS — `cargo install nestty-cli`
 #    fails (not on crates.io) and `cargo install --path .` fails (workspace
 #    root is a virtual manifest), so we wrap the correct invocation here.
-if $DO_TURMCTL; then
-    echo "==> cargo install --path turm-cli (turmctl → ~/.cargo/bin)"
-    cargo install --path "$REPO_ROOT/turm-cli"
+if $DO_NESTCTL; then
+    echo "==> cargo install --path nestty-cli (nestctl → ~/.cargo/bin)"
+    cargo install --path "$REPO_ROOT/nestty-cli"
 fi
 
 # 6. Build + install macOS-buildable plugins. PluginSupervisor (PR 3) reads
-#    ~/Library/Application Support/turm/plugins/<name>/ at startup; we
+#    ~/Library/Application Support/nestty/plugins/<name>/ at startup; we
 #    cargo-build the binary and copy the manifest. Manifest's
 #    `services.exec` is resolved against the plugin dir first, so we drop
 #    the binary alongside plugin.toml so the supervisor finds it without
 #    a $PATH dance.
-PLUGIN_DEST="$HOME/Library/Application Support/turm/plugins"
+PLUGIN_DEST="$HOME/Library/Application Support/nestty/plugins"
 if $DO_PLUGINS; then
     mkdir -p "$PLUGIN_DEST"
     for name in "${MACOS_PLUGINS[@]}"; do
-        crate="turm-plugin-$name"
+        crate="nestty-plugin-$name"
         src_manifest="$REPO_ROOT/examples/plugins/$name/plugin.toml"
         if [[ ! -f "$src_manifest" ]]; then
             echo "skip plugin $name: $src_manifest missing"
@@ -225,8 +225,8 @@ cat <<EOF
 Installed:
   $APP_DEST/$APP_NAME
 EOF
-if $DO_TURMCTL; then
-    echo "  $HOME/.cargo/bin/turmctl"
+if $DO_NESTCTL; then
+    echo "  $HOME/.cargo/bin/nestctl"
 fi
 if $DO_PLUGINS; then
     echo "  $PLUGIN_DEST/{$(IFS=,; echo "${MACOS_PLUGINS[*]}")}"
@@ -234,9 +234,9 @@ fi
 cat <<'EOF'
 
 Next:
-  - Launch turm via Spotlight, Launchpad, or `open -a turm`.
-  - Generate a default config: `turmctl --init-config`-equivalent does
-    not exist on macOS yet; create ~/.config/turm/config.toml manually
+  - Launch nestty via Spotlight, Launchpad, or `open -a nestty`.
+  - Generate a default config: `nestctl --init-config`-equivalent does
+    not exist on macOS yet; create ~/.config/nestty/config.toml manually
     or copy from examples/config.toml.
-  - Verify a plugin is alive: `turmctl call echo.ping --params '{"hi":"there"}'`
+  - Verify a plugin is alive: `nestctl call echo.ping --params '{"hi":"there"}'`
 EOF

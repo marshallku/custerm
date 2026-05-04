@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=nestty
+Comment=Custom Terminal Emulator
+Exec=nestty
+Icon=utilities-terminal
+Type=Application
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;
+StartupNotify=true

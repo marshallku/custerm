@@ -1,23 +1,23 @@
 #!/bin/bash
-# End-user install script: downloads turm + turmctl from the
+# End-user install script: downloads nestty + nestctl from the
 # latest GitHub Release tag and lays them out at ~/.local/bin (or
 # /usr/local/bin with --system).
 #
 # For LOCAL DEVELOPMENT iteration on the working tree, use
 # scripts/install-dev.sh instead — that one builds from source
-# AND warns (loudly, in stderr) when ~/.local/bin/turm and
-# /usr/local/bin/turm differ, so a stale system binary silently
+# AND warns (loudly, in stderr) when ~/.local/bin/nestty and
+# /usr/local/bin/nestty differ, so a stale system binary silently
 # shadowing a working-tree fix at least becomes visible. (It
 # can't auto-resolve the drift; remediation is one of the
 # documented sudo rm or overwrite options the warning prints.)
 #
-# Plugin binaries (turm-plugin-*) are NOT in the release tarball
+# Plugin binaries (nestty-plugin-*) are NOT in the release tarball
 # yet; if you want plugins, install them separately via
 # scripts/install-plugins.sh after running install-dev.sh, OR
 # build from source.
 set -euo pipefail
 
-REPO="marshallku/turm"
+REPO="marshallku/nestty"
 INSTALL_DIR="${HOME}/.local/bin"
 DESKTOP_DIR="${HOME}/.local/share/applications"
 TARGET_VERSION=""
@@ -26,7 +26,7 @@ SYSTEM_INSTALL=false
 usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "Install turm from GitHub Releases."
+    echo "Install nestty from GitHub Releases."
     echo ""
     echo "Options:"
     echo "  --version VERSION    Install a specific version (e.g., v0.1.0)"
@@ -72,7 +72,7 @@ check_deps() {
     pkg-config --exists gstreamer-1.0 2>/dev/null || missing+=("gst-plugins-good gst-plugins-bad")
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "Warning: missing system dependencies: ${missing[*]}"
-        echo "turm requires these libraries to run. Install them via your package manager."
+        echo "nestty requires these libraries to run. Install them via your package manager."
     fi
 }
 
@@ -92,30 +92,30 @@ if [[ -z "${VERSION}" ]]; then
     exit 1
 fi
 
-echo "Installing turm ${VERSION}..."
+echo "Installing nestty ${VERSION}..."
 
-ASSET_NAME="turm-${VERSION}-x86_64-linux.tar.gz"
+ASSET_NAME="nestty-${VERSION}-x86_64-linux.tar.gz"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET_NAME}"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR}"' EXIT
 
 echo "Downloading ${ASSET_NAME}..."
-curl -fsSL -o "${TMPDIR}/turm.tar.gz" "${DOWNLOAD_URL}"
+curl -fsSL -o "${TMPDIR}/nestty.tar.gz" "${DOWNLOAD_URL}"
 
 echo "Extracting..."
-tar -xzf "${TMPDIR}/turm.tar.gz" -C "${TMPDIR}"
+tar -xzf "${TMPDIR}/nestty.tar.gz" -C "${TMPDIR}"
 
 if ${SYSTEM_INSTALL}; then
     echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-    sudo install -Dm755 "${TMPDIR}/turm" "${INSTALL_DIR}/turm"
-    sudo install -Dm755 "${TMPDIR}/turmctl" "${INSTALL_DIR}/turmctl"
-    sudo install -Dm644 "${TMPDIR}/turm.desktop" "${DESKTOP_DIR}/turm.desktop"
+    sudo install -Dm755 "${TMPDIR}/nestty" "${INSTALL_DIR}/nestty"
+    sudo install -Dm755 "${TMPDIR}/nestctl" "${INSTALL_DIR}/nestctl"
+    sudo install -Dm644 "${TMPDIR}/nestty.desktop" "${DESKTOP_DIR}/nestty.desktop"
 else
     mkdir -p "${INSTALL_DIR}" "${DESKTOP_DIR}"
-    install -m755 "${TMPDIR}/turm" "${INSTALL_DIR}/turm"
-    install -m755 "${TMPDIR}/turmctl" "${INSTALL_DIR}/turmctl"
-    install -m644 "${TMPDIR}/turm.desktop" "${DESKTOP_DIR}/turm.desktop"
+    install -m755 "${TMPDIR}/nestty" "${INSTALL_DIR}/nestty"
+    install -m755 "${TMPDIR}/nestctl" "${INSTALL_DIR}/nestctl"
+    install -m644 "${TMPDIR}/nestty.desktop" "${DESKTOP_DIR}/nestty.desktop"
 fi
 
 check_deps
@@ -128,6 +128,6 @@ if ! echo "${PATH}" | tr ':' '\n' | grep -qx "${INSTALL_DIR}"; then
 fi
 
 echo ""
-echo "turm ${VERSION} installed successfully!"
-echo "  turm    -> ${INSTALL_DIR}/turm"
-echo "  turmctl -> ${INSTALL_DIR}/turmctl"
+echo "nestty ${VERSION} installed successfully!"
+echo "  nestty    -> ${INSTALL_DIR}/nestty"
+echo "  nestctl -> ${INSTALL_DIR}/nestctl"

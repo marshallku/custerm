@@ -1,0 +1,29 @@
+[package]
+name = "nestty-plugin-slack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "First-party Slack service plugin for nestty — connects via Socket Mode WebSocket, emits slack.mention / slack.dm events."
+repository.workspace = true
+
+[[bin]]
+name = "nestty-plugin-slack"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+tungstenite = { version = "0.24", default-features = false, features = [
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+keyring = { version = "3", default-features = false, features = [
+    "apple-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

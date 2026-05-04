@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Build + install the local working-tree turm binaries + plugins
+# Build + install the local working-tree nestty binaries + plugins
 # in one shot. Companion to `install.sh` (which downloads from
 # GitHub Releases for end users); this is the dev-iteration path
-# for working on turm itself.
+# for working on nestty itself.
 #
-# Why this exists: `install.sh --system` puts turm at
-# `/usr/local/bin/turm`. After that, `cargo build --release` only
-# refreshes `target/release/turm` — `/usr/local/bin/turm` stays at
+# Why this exists: `install.sh --system` puts nestty at
+# `/usr/local/bin/nestty`. After that, `cargo build --release` only
+# refreshes `target/release/nestty` — `/usr/local/bin/nestty` stays at
 # whatever version was last installed via Releases. That's how a
 # stale system binary silently shadowed a freshly-built fix and
 # wasted real debugging time. Run THIS script after every
-# meaningful change so the GUI turm and CLI turmctl on PATH stay
+# meaningful change so the GUI nestty and CLI nestctl on PATH stay
 # in sync with the working tree.
 #
 # Usage:
@@ -18,12 +18,12 @@
 #   ./scripts/install-dev.sh --user         # install to ~/.local/bin (no sudo)
 #   ./scripts/install-dev.sh --no-build     # skip cargo build (use existing target/release)
 #   ./scripts/install-dev.sh --no-plugins   # skip the plugin install step
-#   ./scripts/install-dev.sh --restart      # also `pkill -x turm` afterwards
+#   ./scripts/install-dev.sh --restart      # also `pkill -x nestty` afterwards
 #
 # By default this is a SYSTEM install (`/usr/local/bin`, sudo
 # required) because that matches how `install.sh --system` lays
 # things out — using `--user` instead is fine but won't override a
-# pre-existing `/usr/local/bin/turm` which takes PATH precedence.
+# pre-existing `/usr/local/bin/nestty` which takes PATH precedence.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -63,7 +63,7 @@ if $DO_BUILD; then
     cargo build --release --workspace --manifest-path "$REPO_ROOT/Cargo.toml"
 fi
 
-for bin in turm turmctl; do
+for bin in nestty nestctl; do
     src="$TARGET/$bin"
     if [ ! -x "$src" ]; then
         echo "error: $src not built — run with default flags or 'cargo build --release'" >&2
@@ -71,34 +71,34 @@ for bin in turm turmctl; do
     fi
 done
 
-echo "==> installing turm + turmctl into $INSTALL_DIR"
+echo "==> installing nestty + nestctl into $INSTALL_DIR"
 if [ -n "$SUDO" ]; then
     # `install -m755` on existing files just rewrites; safe to repeat.
-    $SUDO install -Dm755 "$TARGET/turm" "$INSTALL_DIR/turm"
-    $SUDO install -Dm755 "$TARGET/turmctl" "$INSTALL_DIR/turmctl"
+    $SUDO install -Dm755 "$TARGET/nestty" "$INSTALL_DIR/nestty"
+    $SUDO install -Dm755 "$TARGET/nestctl" "$INSTALL_DIR/nestctl"
 else
     mkdir -p "$INSTALL_DIR"
-    install -Dm755 "$TARGET/turm" "$INSTALL_DIR/turm"
-    install -Dm755 "$TARGET/turmctl" "$INSTALL_DIR/turmctl"
+    install -Dm755 "$TARGET/nestty" "$INSTALL_DIR/nestty"
+    install -Dm755 "$TARGET/nestctl" "$INSTALL_DIR/nestctl"
 fi
 
-# Sanity: user might have BOTH ~/.local/bin/turm and
-# /usr/local/bin/turm. PATH typically prefers /usr/local/bin, so
+# Sanity: user might have BOTH ~/.local/bin/nestty and
+# /usr/local/bin/nestty. PATH typically prefers /usr/local/bin, so
 # if they're out of sync the user gets the wrong one. We can't
 # auto-fix without making policy decisions about which copy to
 # trust, but we can flag the drift so the next "why isn't my fix
 # applied?" debug session is shorter. Concrete remedies the user
 # can pick from are listed in the warning.
-if [ -x "$HOME/.local/bin/turm" ] && [ -x "/usr/local/bin/turm" ]; then
-    if ! cmp -s "$HOME/.local/bin/turm" "/usr/local/bin/turm"; then
+if [ -x "$HOME/.local/bin/nestty" ] && [ -x "/usr/local/bin/nestty" ]; then
+    if ! cmp -s "$HOME/.local/bin/nestty" "/usr/local/bin/nestty"; then
         echo
-        echo "warn: ~/.local/bin/turm and /usr/local/bin/turm differ." >&2
+        echo "warn: ~/.local/bin/nestty and /usr/local/bin/nestty differ." >&2
         echo "warn: PATH lookup typically picks /usr/local/bin first;" >&2
-        echo "warn: a desktop-entry-launched turm will use the system copy." >&2
+        echo "warn: a desktop-entry-launched nestty will use the system copy." >&2
         echo "warn: to resolve, pick one of:" >&2
         echo "warn:   - re-run WITHOUT --user (overwrites the system copy with the same build)" >&2
-        echo "warn:   - sudo rm /usr/local/bin/turm (let the user-local copy win)" >&2
-        echo "warn:   - sudo rm $HOME/.local/bin/turm (drop the user-local copy entirely)" >&2
+        echo "warn:   - sudo rm /usr/local/bin/nestty (let the user-local copy win)" >&2
+        echo "warn:   - sudo rm $HOME/.local/bin/nestty (drop the user-local copy entirely)" >&2
         echo
     fi
 fi
@@ -109,11 +109,11 @@ if $DO_PLUGINS; then
 fi
 
 if $DO_RESTART; then
-    echo "==> pkill -x turm (you'll need to relaunch via desktop entry / shell)"
-    pkill -x turm 2>/dev/null || true
+    echo "==> pkill -x nestty (you'll need to relaunch via desktop entry / shell)"
+    pkill -x nestty 2>/dev/null || true
 else
     echo
-    echo "Restart turm to pick up the new binary:"
-    echo "  pkill -x turm"
+    echo "Restart nestty to pick up the new binary:"
+    echo "  pkill -x nestty"
     echo "  # then relaunch via your usual path (desktop entry / shell)"
 fi

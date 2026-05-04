@@ -1,4 +1,4 @@
-# turm
+# nestty
 
 Cross-platform custom terminal emulator with shared Rust core and platform-native UIs.
 
@@ -15,10 +15,10 @@ Cross-platform custom terminal emulator with shared Rust core and platform-nativ
 
 ## Project Structure
 
-- `turm-core/` — Shared Rust library (config, background, plugin, protocol, theme, error)
-- `turm-linux/` — GTK4 + VTE4 native terminal app (binary: `turm`)
-- `turm-cli/` — CLI control tool (binary: `turmctl`)
-- `turm-macos/` — Swift/AppKit app (stub)
+- `nestty-core/` — Shared Rust library (config, background, plugin, protocol, theme, error)
+- `nestty-linux/` — GTK4 + VTE4 native terminal app (binary: `nestty`)
+- `nestty-cli/` — CLI control tool (binary: `nestctl`)
+- `nestty-macos/` — Swift/AppKit app (stub)
 - `docs/` — Project documentation (architecture, decisions, troubleshooting, roadmap)
 
 ## Build & Run
@@ -28,10 +28,10 @@ Cross-platform custom terminal emulator with shared Rust core and platform-nativ
 cargo build
 
 # Run terminal
-cargo run -p turm-linux
+cargo run -p nestty-linux
 
 # Run CLI
-cargo run -p turm-cli -- <command>
+cargo run -p nestty-cli -- <command>
 ```
 
 ## Local development install
@@ -40,19 +40,19 @@ cargo run -p turm-cli -- <command>
 
 ```bash
 # Linux
-./scripts/install-dev.sh           # cargo build --release + sudo install /usr/local/bin/{turm,turmctl} + plugins
+./scripts/install-dev.sh           # cargo build --release + sudo install /usr/local/bin/{nestty,nestctl} + plugins
 ./scripts/install-dev.sh --user    # ~/.local/bin instead of /usr/local/bin (no sudo)
-./scripts/install-dev.sh --restart # also pkill -x turm afterwards
+./scripts/install-dev.sh --restart # also pkill -x nestty afterwards
 
 # macOS
-./scripts/install-macos.sh             # swift build -c release + ~/Applications/Turm.app + ~/.cargo/bin/turmctl (no sudo)
-./scripts/install-macos.sh --system    # /Applications/Turm.app instead (sudo for /Applications)
+./scripts/install-macos.sh             # swift build -c release + ~/Applications/Nestty.app + ~/.cargo/bin/nestctl (no sudo)
+./scripts/install-macos.sh --system    # /Applications/Nestty.app instead (sudo for /Applications)
 ./scripts/install-macos.sh --launch    # open the installed .app afterwards
 ```
 
 Why these exist:
-- **Linux**: `install.sh --system` puts turm at `/usr/local/bin/turm`. After that, `cargo build --release` only refreshes `target/release/turm` — the system binary stays at whatever Release version was last installed, so a fix in the working tree is silently shadowed when turm is launched via a desktop entry. The script also warns when `~/.local/bin/turm` and `/usr/local/bin/turm` are both present and differ.
-- **macOS**: `cargo install turm-cli` fails (not on crates.io) and `cargo install --path .` fails from the repo root (workspace virtual manifest). The `turm` GUI app is SwiftPM, not cargo. Before this script, `turm-macos/run.sh` was the only path and it only built an ephemeral debug bundle under `.build/debug/`. The script wraps `swift build -c release` + bundle layout + `cargo install --path turm-cli` so the user gets a real `/Applications`-style install.
+- **Linux**: `install.sh --system` puts nestty at `/usr/local/bin/nestty`. After that, `cargo build --release` only refreshes `target/release/nestty` — the system binary stays at whatever Release version was last installed, so a fix in the working tree is silently shadowed when nestty is launched via a desktop entry. The script also warns when `~/.local/bin/nestty` and `/usr/local/bin/nestty` are both present and differ.
+- **macOS**: `cargo install nestty-cli` fails (not on crates.io) and `cargo install --path .` fails from the repo root (workspace virtual manifest). The `nestty` GUI app is SwiftPM, not cargo. Before this script, `nestty-macos/run.sh` was the only path and it only built an ephemeral debug bundle under `.build/debug/`. The script wraps `swift build -c release` + bundle layout + `cargo install --path nestty-cli` so the user gets a real `/Applications`-style install.
 
 ## Install first-party plugins
 
@@ -63,7 +63,7 @@ Why these exist:
 ./scripts/install-plugins.sh todo git  # just these two
 ```
 
-Plugins live in `examples/plugins/<name>/`; turm's runtime discovers them from `~/.config/turm/plugins/<name>/` at startup. The script copies the manifest + assets and symlinks the built binary into the plugin dir. `<plugin_dir>/<exec>` takes precedence over `PATH`, which matters because turm is often launched from a desktop entry whose env doesn't include `~/.local/bin`. After installing, **restart turm** — `discover_plugins()` only runs at startup. Symptom of an outdated install: `service X is not running and X.action cannot trigger its activation (OnStartup)` from the supervisor.
+Plugins live in `examples/plugins/<name>/`; nestty's runtime discovers them from `~/.config/nestty/plugins/<name>/` at startup. The script copies the manifest + assets and symlinks the built binary into the plugin dir. `<plugin_dir>/<exec>` takes precedence over `PATH`, which matters because nestty is often launched from a desktop entry whose env doesn't include `~/.local/bin`. After installing, **restart nestty** — `discover_plugins()` only runs at startup. Symptom of an outdated install: `service X is not running and X.action cannot trigger its activation (OnStartup)` from the supervisor.
 
 ## Git Hooks
 
@@ -81,9 +81,9 @@ git config core.hooksPath .githooks
 - Rust edition 2024, Cargo workspace with `resolver = "2"`
 - GTK4 with `gnome_46` feature flag
 - VTE handles PTY on Linux (no custom PTY management)
-- Unix socket (`/tmp/turm-{PID}.sock`) for IPC
-- Config: `~/.config/turm/config.toml` (TOML)
-- Cache: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/turm/wallpapers.txt` (macOS, falls back to Linux path)
+- Unix socket (`/tmp/nestty-{PID}.sock`) for IPC
+- Config: `~/.config/nestty/config.toml` (TOML)
+- Cache: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/nestty/wallpapers.txt` (macOS, falls back to Linux path)
 - Theme: Catppuccin Mocha (hardcoded)
 - Dark theme forced via GTK settings
 
@@ -91,4 +91,4 @@ git config core.hooksPath .githooks
 
 - **Background images**: Must call `terminal.set_clear_background(false)` for VTE transparency
 - **GTK thread safety**: D-Bus → mpsc channel → glib::timeout_add_local polling
-- **Binary names**: `turm` (app) and `turmctl` (CLI) — do not rename to collide
+- **Binary names**: `nestty` (app) and `nestctl` (CLI) — do not rename to collide
