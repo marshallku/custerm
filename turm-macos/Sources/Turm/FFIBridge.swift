@@ -183,8 +183,21 @@ final class TurmEngine: @unchecked Sendable {
     /// completion-suffixed events whose source is not
     /// `COMPLETION_EVENT_SOURCE`). Defaults to `"macos.eventbus"` —
     /// `ActionRegistry.publishCompletion` overrides with `"turm.action"`.
+    ///
+    /// `context` is the Context snapshot used for `{context.X}`
+    /// interpolation + condition evaluation. Pass `nil` (or empty dict)
+    /// to dispatch without context — interpolation tokens stay literal,
+    /// condition references resolve to null. macOS callers should pass
+    /// `ContextService.snapshot()` taken AFTER `apply`-ing the current
+    /// event to satisfy the apply-before-dispatch ordering Linux uses
+    /// in `Pump::pump_all`.
     @discardableResult
-    func dispatchEvent(kind: String, source: String = "macos.eventbus", payload: [String: Any]) -> Int {
+    func dispatchEvent(
+        kind: String,
+        source: String = "macos.eventbus",
+        context: [String: Any]? = nil,
+        payload: [String: Any],
+    ) -> Int {
         guard let handle else { return 0 }
         let payloadStr: String = if let data = try? JSONSerialization.data(withJSONObject: payload),
                                     let s = String(data: data, encoding: .utf8)
@@ -193,15 +206,34 @@ final class TurmEngine: @unchecked Sendable {
         } else {
             "null"
         }
+        // Empty context dict short-circuits to nil so we pass NULL to FFI
+        // (saves a "{}" round-trip through serde — engine treats both
+        // identically but the NULL path is cheaper).
+        let contextStr: String? = if let ctx = context, !ctx.isEmpty,
+                                     let data = try? JSONSerialization.data(withJSONObject: ctx),
+                                     let s = String(data: data, encoding: .utf8)
+        {
+            s
+        } else {
+            nil
+        }
         return kind.withCString { kindPtr in
             source.withCString { sourcePtr in
                 payloadStr.withCString { payloadPtr in
-                    let n = turm_engine_dispatch_event(
-                        handle,
-                        kindPtr,
-                        sourcePtr,
-                        payloadPtr,
-                    )
+                    let dispatch: (UnsafePointer<CChar>?) -> Int32 = { ctxPtr in
+                        turm_engine_dispatch_event(
+                            handle,
+                            kindPtr,
+                            sourcePtr,
+                            ctxPtr,
+                            payloadPtr,
+                        )
+                    }
+                    let n: Int32 = if let ctx = contextStr {
+                        ctx.withCString { dispatch($0) }
+                    } else {
+                        dispatch(nil)
+                    }
                     return n < 0 ? 0 : Int(n)
                 }
             }

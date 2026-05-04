@@ -73,10 +73,18 @@ int turm_engine_set_triggers(EngineHandle *handle, const char *triggers_json);
 /// Pass "turm.action" for registry-synthesized completion events to
 /// satisfy await-promotion (see turm_core::action_registry::
 /// COMPLETION_EVENT_SOURCE). Pass NULL to default to "macos.eventbus".
+///
+/// `context_json` is an optional `Context` snapshot for `{context.X}`
+/// interpolation + condition evaluation. Wire shape matches
+/// `turm_core::context::Context` serde
+/// ({active_panel: string?, active_cwd: string?}). NULL → engine
+/// dispatches with no context (interpolation tokens preserved literally,
+/// condition references resolve to null).
 int turm_engine_dispatch_event(
     EngineHandle *handle,
     const char *event_kind,
     const char *source,
+    const char *context_json,
     const char *payload_json
 );
 

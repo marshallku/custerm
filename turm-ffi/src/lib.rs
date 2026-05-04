@@ -423,17 +423,29 @@ pub unsafe extern "C" fn turm_engine_set_triggers(
 /// pre-PR-7 stamp, retained for callers that aren't synthesizing
 /// completion events).
 ///
+/// `context_json` is an optional `Context` snapshot to use for
+/// `{context.X}` interpolation + condition evaluation. Wire shape
+/// matches `turm_core::context::Context` serde
+/// (`{active_panel: String?, active_cwd: String?}`); pass NULL to
+/// dispatch with `None` context (engine-side that means context tokens
+/// resolve to literal `{context.X}` and condition references resolve
+/// to `null`). On macOS this is filled in by `ContextService.snapshot()`
+/// from the `EventBus.onBroadcast` hook AFTER `apply` so the snapshot
+/// reflects the current event — Linux drains context first via
+/// `Pump::pump_all` for the same reason.
+///
 /// # Safety
 ///
 /// `handle` must be a valid engine pointer. `event_kind` must be
-/// NUL-terminated UTF-8. `source` and `payload_json` may each be
-/// NULL (defaults: `"macos.eventbus"` and `null` respectively).
-/// All non-NULL pointers must outlive the call.
+/// NUL-terminated UTF-8. `source`, `context_json`, and `payload_json`
+/// may each be NULL (defaults: `"macos.eventbus"`, no context, and
+/// `null` respectively). All non-NULL pointers must outlive the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn turm_engine_dispatch_event(
     handle: *mut EngineHandle,
     event_kind: *const c_char,
     source: *const c_char,
+    context_json: *const c_char,
     payload_json: *const c_char,
 ) -> i32 {
     if handle.is_null() || event_kind.is_null() {
@@ -452,6 +464,22 @@ pub unsafe extern "C" fn turm_engine_dispatch_event(
             .to_string_lossy()
             .into_owned()
     };
+    let context: Option<turm_core::context::Context> = if context_json.is_null() {
+        None
+    } else {
+        let s = unsafe { CStr::from_ptr(context_json) }.to_string_lossy();
+        // Empty / whitespace JSON also means "no context" — saves the
+        // Swift caller a NULL/empty-dict branching.
+        if s.trim().is_empty() {
+            None
+        } else {
+            // Bad JSON falls back to None rather than failing the
+            // dispatch — context is best-effort, missing fields just
+            // mean `{context.X}` interpolations stay literal. Engine
+            // already handles `None` gracefully.
+            serde_json::from_str(&s).ok()
+        }
+    };
     let payload: Value = if payload_json.is_null() {
         Value::Null
     } else {
@@ -459,7 +487,7 @@ pub unsafe extern "C" fn turm_engine_dispatch_event(
         serde_json::from_str(&s).unwrap_or(Value::Null)
     };
     let event = Event::new(kind, source_str, payload);
-    let fired = h.engine.dispatch(&event, None);
+    let fired = h.engine.dispatch(&event, context.as_ref());
     clear_last_error();
     fired as i32
 }

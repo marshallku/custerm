@@ -8,6 +8,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let socketServer = SocketServer()
     private let eventBus = EventBus()
     private let actionRegistry = ActionRegistry()
+    /// PR 9 / parity-plan Tier 2.2 — tracks active panel + per-panel cwd
+    /// for `{context.active_panel}` / `{context.active_cwd}` trigger
+    /// interpolation. Updated synchronously inside `eventBus.onBroadcast`
+    /// before each dispatch; see comment near the wire-up below for the
+    /// "apply-before-dispatch" ordering rationale (matches Linux's
+    /// `Pump::pump_all` pattern).
+    private let contextService = ContextService()
     private lazy var pluginSupervisor = PluginSupervisor(registry: actionRegistry, eventBus: eventBus)
     /// PR 5c — Rust trigger engine via FFI. Lazy because the underlying
     /// turm_engine_create() must run AFTER process startup; constructing it
@@ -63,7 +70,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // plugin actions on the very first event, config must be loaded so
         // the [[triggers]] array is available.
         turmEngine.actionRegistry = actionRegistry
-        eventBus.onBroadcast = { [weak turmEngine] kind, source, data in
+        eventBus.onBroadcast = { [weak turmEngine, contextService] kind, source, data in
             // EventBus.broadcast can fire from any thread (plugin reader
             // thread for event.publish, main actor for tab.opened, etc.).
             // dispatchEvent enters the Rust engine which has its own
@@ -72,7 +79,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // the useful signal. `source` plumbs the await-promotion
             // trust stamp through (PR 7); registry-synthesized completion
             // events arrive with source = "turm.action".
-            let n = turmEngine?.dispatchEvent(kind: kind, source: source, payload: data) ?? 0
+            //
+            // PR 9 — apply-before-dispatch ordering. Linux's
+            // `Pump::pump_all` (`turm-linux/src/window.rs:589`) explicitly
+            // drains context first, THEN dispatches triggers, so a
+            // `panel.focused` trigger condition that references
+            // `{context.active_panel}` resolves to the just-focused panel
+            // rather than the previous one. macOS gets the same ordering
+            // by applying the event to ContextService BEFORE the engine
+            // sees it, then taking the post-apply snapshot to pass
+            // through FFI. ContextService is `@unchecked Sendable` with
+            // internal NSLock so off-main callers (plugin reader threads)
+            // are safe.
+            contextService.apply(eventKind: kind, data: data)
+            let context = contextService.snapshot()
+            let n = turmEngine?.dispatchEvent(kind: kind, source: source, context: context, payload: data) ?? 0
             if n > 0 {
                 FileHandle.standardError.write(Data("[turm-engine] event \(kind) fired \(n) trigger(s)\n".utf8))
             }
@@ -372,6 +393,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 "count": actionRegistry.count,
                 "names": actionRegistry.names(),
             ])
+        }
+
+        // PR 9 — `context.snapshot` introspection. Returns the live
+        // ContextService state ({active_panel, active_cwd}) — same wire
+        // shape Linux's `context.snapshot` ships. Silent because some
+        // tooling (status bar / agents) might poll this on a timer; firing
+        // `context.snapshot.completed` per poll would dwarf real workflow
+        // events on the bus.
+        actionRegistry.registerSilent("context.snapshot") { [weak self] _, completion in
+            guard let self else {
+                completion(RPCError(code: "no_app", message: "AppDelegate gone"))
+                return
+            }
+            completion(contextService.snapshot())
         }
 
         // PR 8 — register `claude.start` through the registry so the
