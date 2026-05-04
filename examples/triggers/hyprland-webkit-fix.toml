@@ -7,11 +7,18 @@
 # What it does
 # ------------
 # Hyprland's WebKitGTK 6.0 ↔ wayland interaction leaves WebView
-# panels stuck on their last frame after a workspace cycle (verified
-# upstream — reproduces with the official MiniBrowser, zero nestty
-# code involved). Empirical mitigation: a 1px window resize round-trip
-# via `hyprctl dispatch resizeactive` re-enters WebKit's frame
-# scheduler and unfreezes rendering.
+# panels stuck on their last frame after a same-monitor workspace
+# cycle (verified upstream — reproduces with the official
+# MiniBrowser, zero nestty code involved). On the dual-monitor
+# setup we tested, cross-monitor workspace switches did NOT trigger
+# the freeze; behavior on other multi-monitor configurations isn't
+# characterized. Empirical mitigation: a 1px window resize
+# round-trip via two separate `hyprctl dispatch resizewindowpixel`
+# calls (targeting nestty by `class:` so it works regardless of
+# which window has focus on the returning workspace) unfreezes
+# rendering. The precise mechanism by which two separate dispatches
+# cure where `--batch` does not is not fully characterized — the
+# behavior is reproducible, the explanation is conjecture.
 #
 # nestty Phase WR-1 publishes `window.restored` whenever the toplevel's
 # `GDK_TOPLEVEL_STATE_SUSPENDED` bit clears (compositor told us we're
@@ -63,22 +70,46 @@ action = "system.spawn"
 event_kind = "window.restored"
 
 [triggers.params]
-# Empirically: `hyprctl --batch "<cmd1>; <cmd2>"` (single atomic
-# Hyprland round-trip) does NOT cure the freeze on Hyprland 0.54.3 —
-# the batched dispatches don't re-enter the per-frame scheduler.
-# Two SEPARATE `hyprctl dispatch resizeactive` calls chained with
-# `&&` DO cure. `&&` is a shell operator, so we wrap in `sh -c`.
+# Two cure shape decisions, both empirical (observed reliably,
+# mechanism for #2 not fully characterized):
 #
-# The argv-only no-shell rule on `system.spawn` is about preventing
-# event-payload INTERPOLATION from injecting shell — `window.restored`
-# emits an empty `{}` payload, so there's nothing to interpolate, so
-# `sh -c` here adds zero injection surface. (A trigger that does
-# interpolate event fields into shell strings IS unsafe; if you copy
-# this pattern for a different event, audit the payload first.)
+# 1. `resizewindowpixel` with `class:com.marshall.nestty` selector
+#    (NOT `resizeactive`). The trigger fires on workspace return
+#    regardless of which window has focus on that workspace — at
+#    fire time the active window is often whatever the user was
+#    last using on this workspace, not nestty. `resizeactive`
+#    would resize that other window instead, and the freeze stays
+#    on the unrelated nestty panel. `resizewindowpixel,class:` is
+#    focus-agnostic.
+#
+# 2. Two SEPARATE `hyprctl dispatch` calls chained with `&&` (NOT
+#    `hyprctl --batch "...; ..."`). `--batch` consistently fails
+#    to cure across many trials; two separate IPC calls
+#    consistently do. We have hypotheses (configure-event
+#    coalescing on the wayland client side, batched dispatch
+#    bypassing the per-frame scheduler) but none are verified.
+#
+# The second `hyprctl` line uses `dispatch -- resize...` because
+# `-1 0,...` starts with `-` and hyprctl's CLI parser would
+# otherwise treat `-1` as a flag.
+#
+# `&&` is a shell operator, so we wrap in `sh -c`. `system.spawn`
+# is argv-only by design so `{event.*}` and `{context.*}`
+# interpolations land as literal argv elements where shell
+# metacharacters can't be re-parsed. That default safety is what
+# the bare-argv form gives you. Wrapping in `sh -c` opts out:
+# every value spliced into the shell string is shell-evaluated.
+# THIS snippet stays safe only because (a) it has zero
+# `{event.X}` / `{context.X}` substitutions and (b)
+# `window.restored` emits an empty `{}` payload anyway. Don't
+# cargo-cult `sh -c` onto triggers that interpolate ANY field —
+# a `slack.mention` text field or a `{context.active_cwd}`
+# directory path can be attacker-controlled and would run
+# arbitrary code through the shell.
 argv = [
     "sh",
     "-c",
-    "hyprctl dispatch resizeactive 1 0 && hyprctl dispatch resizeactive -1 0",
+    "hyprctl dispatch resizewindowpixel '1 0,class:com.marshall.nestty' && hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.nestty'",
 ]
 
 # How to verify
@@ -95,11 +126,10 @@ argv = [
 #
 # If hyprctl isn't on PATH at nestty's launch env (e.g. nestty
 # launched from a desktop entry that strips PATH), substitute the
-# absolute path inside the same `sh -c` form (the `&&` chain is
-# what cures — do NOT swap to `--batch`, see "Why this snippet"
-# above):
+# absolute path inside the same `sh -c` form (keep the `&&` chain
+# and the `class:` selector — see decision notes above):
 #
 #   argv = [
 #       "sh", "-c",
-#       "/usr/bin/hyprctl dispatch resizeactive 1 0 && /usr/bin/hyprctl dispatch resizeactive -1 0",
+#       "/usr/bin/hyprctl dispatch resizewindowpixel '1 0,class:com.marshall.nestty' && /usr/bin/hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.nestty'",
 #   ]

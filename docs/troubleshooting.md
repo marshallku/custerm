@@ -127,7 +127,7 @@ on Hyprland and switch workspaces. Same freeze. This is zero nestty code, so the
 
 **Automated cure on Hyprland — `window.restored` + `system.spawn` trigger (Phase WR-1/WR-2):**
 
-If you're on Hyprland specifically, `hyprctl dispatch resizeactive 1 0 && hyprctl dispatch resizeactive -1 0` reliably cures the freeze (a 1px nudge that goes through Hyprland's frame scheduler). nestty exposes the building blocks:
+If you're on Hyprland specifically, two separate `hyprctl dispatch resizewindowpixel` calls (a 1px nudge) empirically unfreeze the panel — the underlying mechanism by which this works where `--batch` doesn't is not fully characterized; the behavior reproduces reliably across cycles. On the dual-monitor setup we tested, only same-monitor workspace cycles trigger the freeze; cross-monitor switches did not. nestty exposes the building blocks:
 
 - `window.restored` event fires when the toplevel's `GDK_TOPLEVEL_STATE_SUSPENDED` bit clears — i.e. you're returning to the workspace nestty lives on.
 - `system.spawn` is a trigger-only action (NOT reachable from `nestctl call`, by design) that exec's an argv vector fire-and-forget.
@@ -138,15 +138,20 @@ Drop this into `~/.config/nestty/config.toml`:
 [[triggers]]
 name = "hyprland-webkit-cure"
 action = "system.spawn"
+params = { argv = ["sh", "-c", "hyprctl dispatch resizewindowpixel '1 0,class:com.marshall.nestty' && hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.nestty'"] }
 
 [triggers.when]
 event_kind = "window.restored"
-
-[triggers.params]
-argv = ["sh", "-c", "hyprctl dispatch resizeactive 1 0 && hyprctl dispatch resizeactive -1 0"]
 ```
 
-**Why `sh -c` here is safe — and when it would NOT be:** `system.spawn` doesn't auto-wrap argv in a shell, so by default `{event.*}` and `{context.*}` interpolations land as literal argv elements where shell metacharacters can't be re-parsed. That default safety is what protects the bare-argv form. Once the user EXPLICITLY chooses `["sh", "-c", "<string>"]`, every interpolated value spliced into that string IS shell-evaluated, so the bare-argv guarantee no longer applies — every interpolation source must be audited individually. The snippet above is safe only because it satisfies BOTH (a) the trigger doesn't interpolate any `{event.X}` or `{context.X}` value into the shell string (every argv element is a literal) AND (b) `window.restored` itself emits an empty `{}` payload, so even a typo'd `{event.X}` would resolve to a literal token rather than attacker-controlled data. Do NOT copy this `sh -c` pattern to triggers that interpolate ANY field (event payload OR context fields like `{context.active_cwd}`) into the shell string — a trigger on e.g. `slack.mention` carrying a user-controlled `text` field, or even one referencing a directory path the user happens to have, would let a Slack message or a malicious dir name run arbitrary code. Use the bare argv form (`argv = ["program", "arg1", ...]`) whenever the trigger interpolates anything. `hyprctl --batch "<cmd1>; <cmd2>"` would avoid the shell entirely but does NOT cure the freeze on Hyprland 0.54.3 — only two SEPARATE `hyprctl dispatch` calls work.
+**Two empirical decisions baked into that snippet** (observed behaviors on Hyprland 0.54.3 — the underlying mechanism for the second one is not fully characterized, but the behavior reproduced reliably across dozens of cycles):
+
+- `resizewindowpixel` with `class:com.marshall.nestty` selector, NOT `resizeactive`. The trigger fires on workspace return regardless of which window has focus on that workspace — the user often returns with focus on whatever they were last using on that workspace, not nestty. `resizeactive` would resize that other window and the freeze stays put. `resizewindowpixel,class:` is focus-agnostic.
+- Two separate `hyprctl dispatch` calls chained with `&&`, NOT `hyprctl --batch "...; ..."`. `--batch` consistently fails to cure; two separate IPC calls consistently do.
+
+The second `hyprctl` invocation uses `hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.nestty'` because `-1 0,...` begins with `-` and hyprctl's CLI parser would otherwise treat `-1` as a flag — the `--` is what forces end-of-options.
+
+**Why `sh -c` here is safe — and when it would NOT be:** `system.spawn` doesn't auto-wrap argv in a shell, so by default `{event.*}` and `{context.*}` interpolations land as literal argv elements where shell metacharacters can't be re-parsed. That default safety is what protects the bare-argv form. Once the user EXPLICITLY chooses `["sh", "-c", "<string>"]`, every interpolated value spliced into that string IS shell-evaluated, so the bare-argv guarantee no longer applies — every interpolation source must be audited individually. The snippet above is safe only because it satisfies BOTH (a) the trigger doesn't interpolate any `{event.X}` or `{context.X}` value into the shell string (every argv element is a literal) AND (b) `window.restored` itself emits an empty `{}` payload, so even a typo'd `{event.X}` would resolve to a literal token rather than attacker-controlled data. Do NOT copy this `sh -c` pattern to triggers that interpolate ANY field (event payload OR context fields like `{context.active_cwd}`) into the shell string — a trigger on e.g. `slack.mention` carrying a user-controlled `text` field, or even one referencing a directory path the user happens to have, would let a Slack message or a malicious dir name run arbitrary code. Use the bare argv form (`argv = ["program", "arg1", ...]`) whenever the trigger interpolates anything.
 
 A ready-to-copy snippet lives at [`examples/triggers/hyprland-webkit-fix.toml`](../examples/triggers/hyprland-webkit-fix.toml).
 

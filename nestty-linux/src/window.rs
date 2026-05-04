@@ -368,16 +368,19 @@ impl NesttyWindow {
         // we are again. The Hyprland WebKit-panel freeze (see
         // `docs/troubleshooting.md`) leaves rendering stuck after this
         // transition; user wires a trigger on this event to run
-        // `hyprctl dispatch resizeactive 1 0; ...` and force a render
-        // cycle. Generic hook — nestty core has no Hyprland knowledge,
-        // user supplies the cure command via `[[triggers]]`.
+        // two separate `hyprctl dispatch resizewindowpixel
+        // '<delta>,class:com.marshall.nestty'` calls (the empirically
+        // verified cure form — see `examples/triggers/
+        // hyprland-webkit-fix.toml` for why `resizeactive` and
+        // `--batch` were both ruled out). Generic hook — nestty core
+        // has no Hyprland knowledge, user supplies the cure command
+        // via `[[triggers]]`.
         //
-        // Detection only — `system.spawn` (the action that runs the
-        // cure) lands in WR-2 once user empirically confirms this
-        // event fires correctly + the `--batch` form of the cure
-        // works. SUSPENDED toggling on Hyprland is already verified
-        // (see troubleshooting.md), so the only WR-1 gate is "does
-        // our 1→0 detection emit the event at the right moments."
+        // Detection only — the `system.spawn` action that runs the
+        // cure lives in WR-2 (`trigger_sink::handle_system_spawn`).
+        // SUSPENDED toggling on Hyprland is verified end-to-end (see
+        // troubleshooting.md and the cure log captured during WR-2
+        // testing).
         //
         // Connected at `realize` because `Window::surface()` returns
         // None until the window is realized; connecting at construct

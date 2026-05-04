@@ -101,17 +101,26 @@ impl LiveTriggerSink {
     /// longer applies and they own auditing every value spliced into
     /// the shell string.
     ///
-    /// Designed for the Hyprland WebKit-freeze cure. Empirical finding
-    /// from end-to-end testing on Hyprland 0.54.3: `hyprctl --batch
-    /// "<cmd1>; <cmd2>"` (single Hyprland round-trip) does NOT cure;
-    /// two SEPARATE `hyprctl dispatch resizeactive` calls chained with
-    /// `&&` DO cure. The shipped example wraps the `&&` chain in
-    /// `sh -c` (see `examples/triggers/hyprland-webkit-fix.toml`).
-    /// That stays safe only because the snippet has zero `{event.X}`
-    /// or `{context.X}` interpolations and `window.restored` itself
-    /// emits an empty `{}` payload — both conditions documented in
-    /// the example file's preamble. Triggers that interpolate ANY
-    /// field into the shell string violate the safety contract.
+    /// Designed for the Hyprland WebKit-freeze cure. Two empirical
+    /// findings from end-to-end testing on Hyprland 0.54.3, both
+    /// reflected in the shipped example
+    /// (`examples/triggers/hyprland-webkit-fix.toml`):
+    ///
+    /// 1. `hyprctl --batch "<cmd1>; <cmd2>"` does NOT cure; two
+    ///    SEPARATE `hyprctl dispatch` calls chained with `&&` DO.
+    ///    Reproducible across many trials; mechanism not
+    ///    characterized.
+    /// 2. The trigger fires on workspace return regardless of which
+    ///    window holds focus, so `resizeactive` often retargets an
+    ///    unrelated window. The example uses `resizewindowpixel
+    ///    '<delta>,class:com.marshall.nestty'` (focus-agnostic).
+    ///
+    /// The `&&` chain forces a `sh -c` wrapper. That stays safe only
+    /// because the snippet has zero `{event.X}` or `{context.X}`
+    /// interpolations and `window.restored` itself emits an empty
+    /// `{}` payload — both conditions documented in the example
+    /// file's preamble. Triggers that interpolate ANY field into the
+    /// shell string violate the safety contract.
     ///
     /// Spawned children are reaped on a worker thread so they don't
     /// become zombies; non-zero exits log to stderr.
