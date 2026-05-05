@@ -47,10 +47,8 @@ pub enum DiscordEvent {
     /// Reaction added to a message. Doesn't carry the original
     /// message body — chained `discord.get_message` fetches it.
     Reaction(ReactionFields),
-    /// Full-fidelity firehose for MESSAGE_CREATE — carries the entire
-    /// inner `d` object so an archive trigger can persist full
-    /// fidelity (embeds, attachments, components) without further
-    /// plugin work. Mirrors `slack.raw`'s posture.
+    /// Full-fidelity firehose for MESSAGE_CREATE (entire `d` object).
+    /// Mirrors `slack.raw`'s posture for archive triggers.
     Raw(RawEvent),
 }
 
@@ -60,24 +58,18 @@ pub struct MessageFields {
     pub channel_id: String,
     /// `None` for DM channels (the absence is the DM signal).
     pub guild_id: Option<String>,
-    /// Direct deep-link to the message — built from `guild_id` (or
-    /// `@me` for DMs), `channel_id`, `message_id`. Surfaced in the
-    /// payload so trigger-driven Todos can embed the link without
-    /// needing string-concat in the interpolation DSL.
+    /// Pre-built deep-link so triggers don't need string-concat in the
+    /// interpolation DSL.
     pub message_url: String,
     pub author_id: String,
-    /// Discord exposes both legacy `username` (handle, ASCII-ish) and
-    /// the newer `global_name` (display name, may be unset). We
-    /// prefer `global_name` for the diagnostic surface and fall back
-    /// to `username` so the field is always populated. Triggers that
-    /// need the canonical id should use `author_id`.
+    /// `global_name` (display) preferred, `username` (handle) fallback so
+    /// the field is always populated. Triggers needing a stable identifier
+    /// should use `author_id` instead.
     pub author_username: String,
     pub content: String,
     pub mention_everyone: bool,
-    /// Convenience flag — true iff this event satisfies the mention
-    /// filter (bot id in `mentions[]` OR `mention_everyone`). Lets a
-    /// `discord.message` trigger payload-match `mentions_bot=true`
-    /// without inspecting nested arrays.
+    /// Pre-computed: bot id in `mentions[]` OR `mention_everyone`. Lets
+    /// triggers `payload_match` without nested-array inspection.
     pub mentions_bot: bool,
 }
 
@@ -87,23 +79,16 @@ pub struct ReactionFields {
     pub channel_id: String,
     /// `None` for DM channels.
     pub guild_id: Option<String>,
-    /// Deep-link to the reacted-on message. Same format as
-    /// `MessageFields::message_url`. Lets reaction-driven triggers
-    /// embed the link in a captured Todo body so the user (or claude
-    /// in a downstream session) can re-open the source thread.
+    /// Same format as `MessageFields::message_url`.
     pub message_url: String,
     /// User who added the reaction.
     pub user_id: String,
-    /// Author of the underlying message, if Discord supplies it
-    /// (`message_author_id` field; absent for older clients or when
-    /// the message author has been deleted). Useful as a guard so
-    /// triggers don't chain `get_message` for messages by the bot
-    /// itself.
+    /// Author of the underlying message when Discord supplies it (absent
+    /// for older clients or deleted authors). Used as a guard so triggers
+    /// don't chain `get_message` against the bot's own messages.
     pub message_author_id: Option<String>,
-    /// Unicode emoji (e.g. `"🔥"` or `"📝"`) when this is a built-in
-    /// emoji, or the custom emoji's name (e.g. `"partyparrot"`) when
-    /// `emoji_id` is set. Triggers typically `payload_match` on this
-    /// to pick a single emoji.
+    /// Unicode codepoint for built-in emoji, custom name when `emoji_id`
+    /// is set. Triggers typically `payload_match` on this.
     pub emoji_name: String,
     /// Custom emoji snowflake. `None` means a unicode emoji.
     pub emoji_id: Option<String>,
@@ -116,10 +101,8 @@ pub struct RawEvent {
     pub channel_id: Option<String>,
     pub guild_id: Option<String>,
     pub message_id: Option<String>,
-    /// Verbatim DISPATCH `d` object — no field stripped. Trigger
-    /// access notes match `slack.raw`: nested ref paths in
-    /// `[triggers.condition]` and `params` work via the
-    /// trigger-engine's dot-path interpolator.
+    /// Verbatim DISPATCH `d` object. Triggers access nested fields via
+    /// the engine's dot-path interpolator (same posture as `slack.raw`).
     pub event_json: Value,
 }
 
@@ -169,10 +152,9 @@ impl DiscordEvent {
     }
 }
 
-/// Top-level entry point. `event_name` is the DISPATCH frame's `t`
-/// field (e.g. `"MESSAGE_CREATE"`); `data` is `d`. `bot_user_id` comes
-/// from the READY frame's `user.id` (authoritative for self-filter)
-/// or the stored TokenSet as a fallback.
+/// `event_name` = DISPATCH `t`; `data` = DISPATCH `d`. `bot_user_id` is
+/// the READY frame's `user.id` (authoritative) or stored TokenSet fallback,
+/// used to filter the bot's own messages/reactions.
 pub fn from_dispatch(
     event_name: &str,
     data: &Value,
@@ -199,11 +181,8 @@ pub fn from_dispatch(
     }
 }
 
-/// Build the canonical Discord deep-link for a message.
-/// Format: `https://discord.com/channels/{guild_id|@me}/{channel_id}/{message_id}`.
-/// `@me` is what Discord's web client uses for DM-channel deep-links;
-/// guild messages get the actual guild snowflake. Both forms open
-/// directly in the user's Discord client when clicked.
+/// `https://discord.com/channels/{guild_id|@me}/{channel_id}/{message_id}` —
+/// `@me` for DM channels (what Discord's web client uses).
 fn build_message_url(guild_id: Option<&str>, channel_id: &str, message_id: &str) -> String {
     let guild_segment = guild_id.unwrap_or("@me");
     format!("https://discord.com/channels/{guild_segment}/{channel_id}/{message_id}")
