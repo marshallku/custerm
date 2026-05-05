@@ -1,48 +1,11 @@
-//! nestty-ffi — C-ABI bridge from the shared Rust core to platform UIs that
-//! can't link Rust directly (currently `nestty-macos`, which is SwiftPM).
+//! C-ABI bridge from `nestty_core` to platform UIs that can't link Rust
+//! directly (currently `nestty-macos` via SwiftPM). Wraps `TriggerEngine`
+//! so the Swift host can load triggers, dispatch events, and receive
+//! action-fire callbacks without reimplementing engine semantics in Swift.
 //!
-//! ## Why this crate exists (PR 1 — Tier 2.1 spike)
-//!
-//! Before committing to wiring `TriggerEngine` / `ActionRegistry` / supervisor
-//! over FFI, we need to prove the boring boundary first: cargo can produce a
-//! staticlib, SwiftPM links it, a Swift call lands in Rust, JSON crosses the
-//! boundary in both directions, and ownership rules don't leak. This spike
-//! exposes the **smallest possible C surface** that demonstrates each of those
-//! concerns in isolation, so when something breaks we know whether it's the
-//! build wiring, the link, the calling convention, or the data marshalling.
-//!
-//! Surface (4 symbols):
-//!
-//! - `nestty_ffi_version() -> *const c_char` — points at a static `'static`
-//!   string. Caller must NOT free. Proves: lib loads, basic call works,
-//!   pointer-back-to-Rust-static is sound, no allocation involved.
-//!
-//! - `nestty_ffi_call_json(input: *const c_char) -> *mut c_char` — accepts a
-//!   borrowed JSON string, parses it, attaches `{"echoed_at": <unix epoch
-//!   ms>}`, and returns a heap-allocated JSON string the caller owns. Proves:
-//!   bidirectional JSON marshalling works, Rust-side allocation that the
-//!   Swift side later releases works, error paths produce structured errors
-//!   instead of panicking across FFI.
-//!
-//! - `nestty_ffi_free_string(*mut c_char)` — releases a string previously
-//!   returned by this crate. Required because Swift's ARC can't free Rust's
-//!   heap. Proves: ownership round-trip closes cleanly without leaks.
-//!
-//! - `nestty_ffi_last_error() -> *const c_char` — returns the most recent
-//!   error message captured by this thread (or NULL if none). Proves:
-//!   thread-local error reporting works without a return-by-pointer pattern
-//!   that Swift would have to construct C buffers for.
-//!
-//! Anything beyond this set is for follow-up PRs (PR 2+: registry seam, then
-//! supervisor, then trigger engine). Keep this file boring on purpose.
-//!
-//! ## PR 5c additions — engine surface
-//!
-//! Wraps `nestty_core::trigger::TriggerEngine` so the macOS Swift host can
-//! load triggers, dispatch events, and receive action-fire callbacks
-//! without reimplementing the engine semantics in Swift. The engine
-//! itself stays in Rust (single source of truth across Linux + macOS);
-//! this module is just the C-ABI bridge.
+//! Strings allocated on the Rust side and returned to C must be freed with
+//! `nestty_ffi_free_string`; statics and thread-local error pointers must NOT.
+//! Errors are reported via `nestty_ffi_last_error` (thread-local).
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -57,10 +20,10 @@ use nestty_core::trigger::{Trigger, TriggerEngine, TriggerSink};
 use serde_json::{Value, json};
 
 thread_local! {
-    /// Per-thread last-error slot. Cleared by every successful FFI call.
-    /// Threading model note: every entry point writes to this slot before
-    /// returning either an error or a success value, so a Swift caller that
-    /// got NULL/error can pick up the message without needing a side channel.
+    /// Per-thread last-error slot. Set by entry points whose failure modes
+    /// carry diagnostics (JSON parse, bad pointer, encoding errors); cleared
+    /// on their success paths. Trivial entry points (handle creation /
+    /// destruction, callback installation, count accessor) don't touch it.
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
@@ -77,37 +40,21 @@ fn clear_last_error() {
     LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
 }
 
-/// Returns a pointer to a static, NUL-terminated version string. Caller must
-/// NOT free. The string lives for the program's lifetime.
-///
-/// # Safety
-///
-/// The returned pointer is always non-null and valid for as long as the
-/// process lives. Reading past the NUL terminator is UB.
+/// Pointer to a static NUL-terminated version string. Caller must NOT free.
 #[unsafe(no_mangle)]
 pub extern "C" fn nestty_ffi_version() -> *const c_char {
-    // Static C string, no allocation. `c"..."` literal is a Rust 2021+ feature
-    // that produces a `&'static CStr`, so .as_ptr() is good for the program
-    // lifetime.
     c"nestty-ffi 0.1.0".as_ptr()
 }
 
-/// Accepts a borrowed JSON string and returns a heap-allocated JSON string
-/// that the caller MUST release with `nestty_ffi_free_string`.
-///
-/// On the success path the returned JSON contains the input plus an
-/// `echoed_at` Unix-epoch-millis field, so a Swift caller can prove the
-/// round-trip with a value that's both Rust-generated AND not constant.
-///
-/// On the error path returns NULL and stores a human-readable message in
-/// `LAST_ERROR` retrievable via `nestty_ffi_last_error`.
+/// Echo-with-`echoed_at`-timestamp round-trip. Returns a heap-allocated
+/// JSON string the caller must free with `nestty_ffi_free_string`; NULL on
+/// failure with the message stored in `LAST_ERROR`.
 ///
 /// # Safety
 ///
-/// `input` must be a valid pointer to a NUL-terminated UTF-8 string. The
-/// pointer must remain valid for the duration of this call. The returned
-/// pointer (when non-null) must be passed to `nestty_ffi_free_string` exactly
-/// once.
+/// `input` must be a valid pointer to a NUL-terminated UTF-8 string for the
+/// duration of the call. The returned pointer (if non-null) must be passed
+/// to `nestty_ffi_free_string` exactly once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nestty_ffi_call_json(input: *const c_char) -> *mut c_char {
     if input.is_null() {
@@ -172,14 +119,12 @@ pub unsafe extern "C" fn nestty_ffi_call_json(input: *const c_char) -> *mut c_ch
     cs.into_raw()
 }
 
-/// Releases a string previously returned by a nestty-ffi function that
-/// allocates (currently `nestty_ffi_call_json`).
+/// Free a string previously returned by a nestty-ffi function.
 ///
 /// # Safety
 ///
-/// `s` must be a pointer previously returned by a nestty-ffi function and
-/// not yet freed, OR a null pointer (in which case this is a no-op).
-/// Passing any other pointer is UB.
+/// `s` must be a pointer returned by a nestty-ffi function and not yet
+/// freed, or NULL (no-op). Any other pointer is UB.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nestty_ffi_free_string(s: *mut c_char) {
     if s.is_null() {
@@ -191,15 +136,13 @@ pub unsafe extern "C" fn nestty_ffi_free_string(s: *mut c_char) {
     let _ = unsafe { CString::from_raw(s) };
 }
 
-/// Returns the most recent error message recorded on the calling thread,
-/// or NULL if no error has been recorded since the last successful call.
+/// Most recent error message on the calling thread, or NULL.
 ///
 /// # Safety
 ///
-/// The returned pointer is borrowed from a thread-local slot and remains
-/// valid only until the next FFI call on the same thread. Callers that
-/// need to retain the message must copy it (e.g. Swift `String(cString:)`).
-/// The pointer must NOT be passed to `nestty_ffi_free_string`.
+/// The pointer is borrowed from a thread-local; valid only until the next
+/// FFI call on the same thread. Caller must copy if retention is needed
+/// (e.g. Swift `String(cString:)`). Must NOT be passed to `nestty_ffi_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn nestty_ffi_last_error() -> *const c_char {
     LAST_ERROR.with(|slot| match slot.borrow().as_ref() {
@@ -209,52 +152,28 @@ pub extern "C" fn nestty_ffi_last_error() -> *const c_char {
 }
 
 // ============================================================================
-// PR 5c — Engine FFI surface
+// Engine FFI surface
 // ============================================================================
 
-/// Opaque handle wrapping `Arc<TriggerEngine>` plus the C-side action
-/// callback. Kept at module level (not behind `LAST_ERROR`-style thread
-/// locals) so the Swift host can hold a single engine instance for the
-/// lifetime of the app and serialize calls into it through its own
-/// `DispatchQueue`. The struct is `pub` for the FFI but its body is
-/// opaque from C — callers only ever see `*mut EngineHandle`.
+/// Opaque from C — callers only ever see `*mut EngineHandle`.
 pub struct EngineHandle {
     engine: Arc<TriggerEngine>,
-    /// We keep the FfiSink Arc here so it shares lifetime with the
-    /// engine — engine internally also holds an Arc to the same sink
-    /// via `Arc<dyn TriggerSink>` (cloned at `TriggerEngine::new`),
-    /// but holding our own ref makes "callback is set" testable.
     _sink: Arc<FfiSink>,
 }
 
-/// `TriggerSink` impl that forwards action dispatch into a C function
-/// pointer registered by the Swift host. Fire-and-forget — we don't
-/// wait for Swift's ActionRegistry to actually run the action. This
-/// matches Linux's `LiveTriggerSink` shape (returns `{queued: true}`
-/// immediately; real result arrives async or via completion-event
-/// fan-out later). For PR 5c the spike doesn't exercise the await
-/// primitive, so the placeholder result is enough.
+/// Forwards trigger action dispatch into a host-registered C callback.
+/// Fire-and-forget: returns `{queued: true}` synchronously; real result
+/// arrives async via completion-event fan-out (same shape as `LiveTriggerSink`).
 struct FfiSink {
-    /// Atomic-pointer-like cell so the callback can be installed AFTER
-    /// `nestty_engine_create`. Stored as `usize` (not `AtomicPtr`) because
-    /// the C function-pointer type is fixed at compile time and we
-    /// only need swap-on-set, not lock-free updates.
     callback: std::sync::Mutex<Option<ActionCallback>>,
-    /// Swift-owned context pointer (typically `Unmanaged<NesttyEngine>.toOpaque()`).
-    /// Stored as `usize` so the struct stays `Send + Sync` automatically;
-    /// we cast back to `*mut c_void` only at invocation time. Lifetime
-    /// is the host's responsibility — the host must keep its receiver
-    /// alive at least until `nestty_engine_destroy` returns.
+    /// Stored as `usize` (not `*mut c_void`) so `FfiSink` is `Send + Sync`.
+    /// Lifetime is the host's responsibility (kept alive until destroy).
     user_data: std::sync::Mutex<usize>,
 }
 
-/// C-callable signature the Swift host registers via
-/// `nestty_engine_set_action_callback`. The engine calls this on
-/// whatever thread `nestty_engine_dispatch_event` was invoked from
-/// (Swift's serial DispatchQueue today). The callback receives
-/// borrowed strings — must NOT free them. To bridge into a Swift
-/// closure the host typically copies via `String(cString:)` and
-/// re-dispatches to the main actor.
+/// Host-registered action callback. Invoked on whichever thread called
+/// `nestty_engine_dispatch_event`. The `action_name` and `params_json`
+/// strings are borrowed — callback must NOT free them; copy if retention needed.
 pub type ActionCallback = unsafe extern "C" fn(
     user_data: *mut c_void,
     action_name: *const c_char,
@@ -311,14 +230,9 @@ impl TriggerSink for FfiSink {
     }
 }
 
-/// Construct a fresh trigger engine + FfiSink. No triggers loaded yet —
-/// host calls `nestty_engine_set_triggers` next. No callback registered —
-/// host calls `nestty_engine_set_action_callback` next.
-///
-/// # Safety
-///
-/// The returned pointer must be passed to `nestty_engine_destroy` exactly
-/// once, after no concurrent FFI call into the engine is still in flight.
+/// Construct a fresh engine. The returned pointer must be passed to
+/// `nestty_engine_destroy` exactly once, after all in-flight FFI calls
+/// into the engine have returned.
 #[unsafe(no_mangle)]
 pub extern "C" fn nestty_engine_create() -> *mut EngineHandle {
     let sink = Arc::new(FfiSink {
@@ -333,14 +247,10 @@ pub extern "C" fn nestty_engine_create() -> *mut EngineHandle {
     Box::into_raw(handle)
 }
 
-/// Free the engine handle. After this call any further FFI use of the
-/// pointer is UB.
-///
 /// # Safety
 ///
-/// Pointer must come from `nestty_engine_create` and not have been freed
-/// already. Caller must ensure no other thread is mid-call into the
-/// engine when destroy runs.
+/// `handle` must come from `nestty_engine_create` and not have been freed.
+/// Caller must ensure no other thread is mid-call into the engine.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nestty_engine_destroy(handle: *mut EngineHandle) {
     if handle.is_null() {
@@ -351,14 +261,13 @@ pub unsafe extern "C" fn nestty_engine_destroy(handle: *mut EngineHandle) {
     let _ = unsafe { Box::from_raw(handle) };
 }
 
-/// Install or replace the action callback. NULL `callback` clears the
-/// slot (engine reverts to "no callback registered" log + skip).
+/// Install or replace the action callback. `callback = NULL` clears the slot.
 ///
 /// # Safety
 ///
-/// `handle` must be a valid pointer from `nestty_engine_create`. `user_data`
-/// must remain alive until either (a) replaced by a subsequent
-/// `set_action_callback` call, or (b) `nestty_engine_destroy` returns.
+/// `handle` must come from `nestty_engine_create`. `user_data` must remain
+/// alive until either replaced by a subsequent call OR `nestty_engine_destroy`
+/// returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nestty_engine_set_action_callback(
     handle: *mut EngineHandle,
@@ -375,19 +284,16 @@ pub unsafe extern "C" fn nestty_engine_set_action_callback(
 }
 
 /// Parse a JSON array of triggers and replace the engine's trigger set.
-/// Returns the number of triggers loaded on success, -1 on JSON parse
-/// failure (use `nestty_ffi_last_error` for the message).
-///
-/// JSON shape mirrors the TOML `[[triggers]]` table — each element
-/// matches `nestty_core::trigger::Trigger`'s Deserialize impl. Hot-reload
-/// just calls this again with the new array; the engine atomically
-/// swaps the trigger list and drops any in-flight await state.
+/// JSON shape matches `nestty_core::trigger::Trigger`'s Deserialize impl
+/// (mirrors TOML `[[triggers]]`). Returns the loaded count, or -1 on parse
+/// failure (message via `nestty_ffi_last_error`). Hot-reload semantics —
+/// including the cross-lock race on await state — are documented at
+/// `TriggerEngine::set_triggers`.
 ///
 /// # Safety
 ///
-/// `handle` must be a valid engine pointer. `triggers_json` must be a
-/// NUL-terminated UTF-8 string. Both must remain valid for the duration
-/// of the call.
+/// `handle` must come from `nestty_engine_create`. `triggers_json` must be
+/// a NUL-terminated UTF-8 string. Both must remain valid for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nestty_engine_set_triggers(
     handle: *mut EngineHandle,
@@ -413,37 +319,26 @@ pub unsafe extern "C" fn nestty_engine_set_triggers(
     count
 }
 
-/// Dispatch an event into the engine. Engine matches against loaded
-/// triggers and fires the C action callback for each match. Returns
-/// the number of triggers that fired.
+/// Dispatch an event; returns the count of triggers that fired.
 ///
-/// `source` controls the trust-boundary stamp on the synthesized
-/// `Event` and MUST be threaded through faithfully — Linux's
-/// `try_promote_or_drop_preflight` (in `nestty_core::trigger`) gates
-/// await-chain promotion on `event.source == COMPLETION_EVENT_SOURCE`
-/// (`"nestty.action"`), so a registry-synthesized completion event
-/// stamped with any other source will silently fail to promote await
-/// state machines. Pass NULL to default to `"macos.eventbus"` (the
-/// pre-PR-7 stamp, retained for callers that aren't synthesizing
-/// completion events).
+/// `source` stamps the synthesized `Event`. **Trust-boundary requirement**:
+/// when synthesizing an `<action>.completed` / `<action>.failed` event for
+/// await-chain promotion, `source` MUST be `COMPLETION_EVENT_SOURCE`
+/// (`"nestty.action"`). Any other value causes `try_promote_or_drop_preflight`
+/// to return early and silently fail to advance await state. NULL defaults
+/// to `"macos.eventbus"`, which is correct for plain bus events but wrong
+/// for completion-event synthesis.
 ///
-/// `context_json` is an optional `Context` snapshot to use for
-/// `{context.X}` interpolation + condition evaluation. Wire shape
-/// matches `nestty_core::context::Context` serde
-/// (`{active_panel: String?, active_cwd: String?}`); pass NULL to
-/// dispatch with `None` context (engine-side that means context tokens
-/// resolve to literal `{context.X}` and condition references resolve
-/// to `null`). On macOS this is filled in by `ContextService.snapshot()`
-/// from the `EventBus.onBroadcast` hook AFTER `apply` so the snapshot
-/// reflects the current event — Linux drains context first via
-/// `Pump::pump_all` for the same reason.
+/// `context_json` is a `nestty_core::context::Context` snapshot
+/// (`{active_panel: String?, active_cwd: String?}`); NULL or empty means
+/// no context (literal `{context.X}` tokens, null condition refs). Bad
+/// JSON falls back to no context rather than failing the dispatch.
 ///
 /// # Safety
 ///
-/// `handle` must be a valid engine pointer. `event_kind` must be
-/// NUL-terminated UTF-8. `source`, `context_json`, and `payload_json`
-/// may each be NULL (defaults: `"macos.eventbus"`, no context, and
-/// `null` respectively). All non-NULL pointers must outlive the call.
+/// `handle` must come from `nestty_engine_create`. `event_kind` must be
+/// NUL-terminated UTF-8. `source`, `context_json`, `payload_json` may each
+/// be NULL. All non-NULL pointers must outlive the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nestty_engine_dispatch_event(
     handle: *mut EngineHandle,
@@ -496,12 +391,11 @@ pub unsafe extern "C" fn nestty_engine_dispatch_event(
     fired as i32
 }
 
-/// Number of triggers currently loaded. Diagnostic — useful for
-/// `system.list_triggers`-equivalent introspection.
+/// Diagnostic accessor.
 ///
 /// # Safety
 ///
-/// `handle` must be a valid engine pointer.
+/// `handle` must come from `nestty_engine_create`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nestty_engine_count_triggers(handle: *mut EngineHandle) -> i32 {
     if handle.is_null() {
