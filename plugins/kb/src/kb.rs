@@ -25,11 +25,8 @@ const SNIPPET_RADIUS: usize = 60;
 pub struct Kb {
     /// Logical root the user configured (e.g. `~/docs`).
     root: PathBuf,
-    /// Same root after `canonicalize()` — used to enforce the
-    /// protocol's "id cannot escape KB root" rule against symlinks.
-    /// Set at construction; if `canonicalize()` failed (root didn't
-    /// exist when we constructed Kb) we fall back to `root` and rely
-    /// on `create_dir_all` having put it in place.
+    /// Resolved root used to enforce "id cannot escape KB root" against
+    /// symlinks. Falls back to `root` if `canonicalize()` failed at construction.
     root_canonical: PathBuf,
 }
 
@@ -95,25 +92,13 @@ impl Kb {
         &self.root
     }
 
-    /// Resolve a logical id under the KB root and verify the result
-    /// stays inside the canonicalized root. Defends against symlink
-    /// escapes (a `notes` symlink pointing at `/etc` would otherwise
-    /// turn `kb.read "notes/passwd"` into a read of `/etc/passwd`
-    /// even though `validate_id` saw nothing wrong with the id).
-    ///
-    /// `must_exist=true` requires the leaf itself to be present (used
-    /// by `kb.read` / `kb.append` without ensure). Otherwise we
-    /// canonicalize the existing prefix of the path and check that
-    /// instead — this lets `kb.ensure` / `kb.append+ensure` create
-    /// new files while still catching escapes via existing parent
-    /// symlinks.
-    ///
-    /// There is a residual TOCTOU window between the canonicalize
-    /// check and the subsequent open/write — if a symlink is swapped
-    /// in between those steps the check is bypassed. For a personal
-    /// single-user system that's acceptable; tightening would require
-    /// `openat2(RESOLVE_BENEATH)` which is Linux 5.6+ and a heavier
-    /// wrapper.
+    /// Verifies the resolved path stays inside `root_canonical`, defending
+    /// against symlink escapes that `validate_id` can't catch (e.g. a `notes`
+    /// symlink pointing at `/etc`). `must_exist=true` canonicalizes the leaf
+    /// itself; otherwise canonicalizes the existing ancestor and appends the
+    /// tail so `kb.ensure` can create new files while still catching parent
+    /// symlinks. Residual TOCTOU window between check and open is acceptable
+    /// for single-user use; tightening would need `openat2(RESOLVE_BENEATH)`.
     fn resolve_within_root(&self, id: &str, must_exist: bool) -> Result<PathBuf, KbErr> {
         // Refuse if any ancestor of the id (within the KB root) is a
         // symlink. Without this, `alias -> notes` would let
@@ -203,20 +188,12 @@ impl Kb {
         Ok(candidate)
     }
 
-    /// Verify that no component of a logical id/folder path resolves
-    /// through a symlink. Traverses segment by segment from KB root
-    /// outward; if any existing segment is a symlink, refuse with
-    /// `forbidden`. Non-existent tail segments are fine — they just
-    /// haven't been created yet (the next path component would have
-    /// to be created on top, which `kb.ensure` does in the canonical
-    /// directory the user expects).
-    ///
-    /// This is the load-bearing check that makes the protocol's
-    /// "logical id is the stable handle" guarantee real. Without it,
-    /// `alias -> notes` would let `kb.ensure("alias/foo.md")` write
-    /// a file that later searches as `notes/foo.md` (different id),
-    /// and `alias -> .raw/slack` would let callers bypass the `.raw/`
-    /// search-exclusion through the alias-side id.
+    /// Refuses any logical path whose existing ancestors contain a symlink.
+    /// Non-existent tail segments are fine. Without this, `alias -> notes`
+    /// would let `kb.ensure("alias/foo.md")` write a file that later searches
+    /// as `notes/foo.md` (different id, breaks the "id is the stable handle"
+    /// contract), and `alias -> .raw/slack` would bypass the `.raw/`
+    /// search-exclusion via the alias-side id.
     fn check_no_symlink_ancestors(&self, logical: &str) -> Result<(), KbErr> {
         let mut cursor = self.root.clone();
         for comp in Path::new(logical).components() {
@@ -658,9 +635,7 @@ fn require_string(params: &Value, key: &str) -> Result<String, KbErr> {
     Ok(s.to_string())
 }
 
-/// Optional string field with a default. Missing or `null` → default.
-/// Wrong type → `invalid_params` (silent coercion would let a caller
-/// pass `42` and get an empty file, which is never what they meant).
+/// Wrong type → `invalid_params` (no silent coercion).
 fn require_optional_string(params: &Value, key: &str, default: &str) -> Result<String, KbErr> {
     match params.get(key) {
         None | Some(Value::Null) => Ok(default.to_string()),
@@ -678,16 +653,11 @@ fn require_optional_bool(params: &Value, key: &str, default: bool) -> Result<boo
     }
 }
 
-/// Validates an id string against protocol-level constraints. The id
-/// error taxonomy is `invalid_id` for shape problems, `forbidden` for
-/// trust-boundary violations.
-///
-/// The id MUST be in canonical form: forward-slash-separated, no
-/// empty segments (no `//`), no `.` segments, no trailing slash, no
-/// leading slash. This is what makes `id` a stable round-trip handle
-/// — `notes/foo.md` and `notes//foo.md` and `./notes/foo.md` would
-/// all refer to the same file but differ as strings, and search
-/// would emit the canonical form, breaking the round-trip contract.
+/// Canonical id form: `/`-separated, no empty / `.` / trailing / leading
+/// segments. This is what makes id a stable round-trip handle — multiple
+/// surface forms (`notes//foo.md`, `./notes/foo.md`) would all resolve to
+/// the same file but break search-emit equality. Errors: `invalid_id` for
+/// shape, `forbidden` for trust-boundary violations (`..`, absolute, prefix).
 fn validate_id(id: &str) -> Result<(), KbErr> {
     if id.is_empty() {
         return Err(("invalid_id".into(), "id cannot be empty".into()));
@@ -738,14 +708,10 @@ fn validate_id(id: &str) -> Result<(), KbErr> {
     Ok(())
 }
 
-/// Validates a `kb.search` folder parameter. Same trust-boundary
-/// rules as `validate_id` (no `..`, no absolute, no leading slash =>
-/// `forbidden`) and same canonicalization rules (no empty segments,
-/// no `.` segments). Trailing slash IS allowed for folder (the
-/// caller is more naturally going to type `meetings/` than
-/// `meetings`), and we strip it at the call site after validation.
-/// Shape errors surface as `invalid_params` (the `kb.search`
-/// documented error set doesn't include `invalid_id`).
+/// Same trust-boundary + canonical-form rules as `validate_id`, but trailing
+/// slash IS allowed (callers naturally type `meetings/`); call site trims it.
+/// Shape errors surface as `invalid_params` since `kb.search` doesn't define
+/// `invalid_id`.
 fn validate_folder(folder: &str) -> Result<(), KbErr> {
     if folder.is_empty() {
         return Err(invalid_params("folder cannot be empty"));
@@ -815,15 +781,10 @@ fn io_error(msg: impl Into<String>) -> KbErr {
 
 // -------- helpers: filesystem --------
 
-/// Walk a directory tree depth-first. The visitor returns one of:
-/// - `Recurse` — drill into the directory.
-/// - `Skip` — don't visit this node (subtree pruned).
-/// - `Continue` — non-directory was processed; carry on.
-///
-/// Hands the visitor the entry's `FileType` we already obtained via
-/// `symlink_metadata`, so callers can decide is-dir/is-file without a
-/// second `stat` (which would follow symlinks and reopen a TOCTOU
-/// window if the entry was swapped between the two stats).
+/// Visitor return for `walk`. Handed the `FileType` from `DirEntry::file_type`
+/// (uses readdir's `d_type` when available, falls back to a `lstat` otherwise)
+/// so the visitor can decide is-dir/is-file without a second stat that would
+/// reopen a TOCTOU window if the entry was swapped between calls.
 enum WalkAction {
     Recurse,
     Skip,
@@ -870,12 +831,9 @@ fn create_parents(path: &Path) -> Result<(), KbErr> {
     Ok(())
 }
 
-/// Create a file with `content` atomically, satisfying both protocol
-/// requirements: exactly-one-creator across concurrent calls AND no
-/// torn reads from a concurrent `kb.read`. Algorithm: write to a
-/// sibling temp file, then `renameat2(..., RENAME_NOREPLACE)` it into
-/// place. The atomic rename gives no-torn-read; the no-replace flag
-/// gives exactly-one-creator (losers get EEXIST).
+/// Sibling-temp + atomic create-or-fail rename. Provides both protocol
+/// invariants: exactly-one-creator across concurrent calls (rename's
+/// no-replace flag → losers get EEXIST) AND no torn reads (atomic publish).
 fn atomic_create_with_content(path: &Path, content: &[u8]) -> Result<bool, KbErr> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let temp_dir = parent
@@ -928,10 +886,7 @@ fn atomic_create_with_content(path: &Path, content: &[u8]) -> Result<bool, KbErr
     }
 }
 
-/// Process-local monotonic counter for temp file names. Collisions
-/// between processes are still prevented by the `O_EXCL` open in
-/// `atomic_create_with_content`; this just avoids the obvious case of
-/// the same process attempting two creates in a tight loop.
+/// Process-local; cross-process temp collisions are caught by `O_EXCL`.
 fn next_temp_seq() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1003,14 +958,12 @@ fn extract_title(content: &str, rel: &Path) -> Option<Value> {
         .map(|s| Value::String(s.to_string_lossy().into_owned()))
 }
 
-/// Parse a flat YAML frontmatter block (`---\n...\n---\n` at file
-/// start) into a JSON object. Handles the cases the meeting-prep and
-/// ingestion plugins actually emit (scalar values, simple `[a, b]`
-/// arrays, quoted strings, booleans, integers). Anything more complex
-/// — nested objects, multi-line strings, anchors — gets returned as a
-/// plain string verbatim, which is never wrong, just less useful.
-/// Returns `null` if the document doesn't start with `---\n` (or
-/// `---\r\n` for files written by tools that emit CRLF line endings).
+/// Subset YAML: each line is `key: value`; supported values are scalars,
+/// `[a, b]` arrays, quoted strings, booleans, integers. Nested mappings and
+/// multi-line forms (`|`, `>`) are NOT supported — they are silently
+/// misparsed (e.g. a `parent:` line becomes `null` and indented children
+/// flatten into top-level keys). Returns `None` when the opening `---`
+/// fence is absent OR the closing fence is missing.
 fn parse_frontmatter(content: &str) -> Option<Value> {
     let body = content
         .strip_prefix("---\n")
