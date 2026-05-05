@@ -348,20 +348,15 @@ fn handle_action(
     }
 }
 
-/// Promote `jira::http_*`'s prefix-encoded error string to the
-/// action's `(code, message)` tuple. Mirrors slack/main.rs:442 in
-/// spirit but uses an EXPLICIT allowlist instead of "any bare
-/// snake_case prefix" — the looser rule would let internal error
-/// strings like `"json parse: ..."`, `"project key: ..."`,
-/// `"transition response missing id"` escape as ad-hoc codes
-/// (`"json"`, `"project"`, `"transition"`) and break the stable
-/// trigger-matchable contract. Anything unknown collapses to
-/// `io_error` with the full string preserved in `message`.
+/// Promotes `jira::http_*`'s prefix-encoded error string to the
+/// action's `(code, message)` tuple. EXPLICIT allowlist (vs slack's
+/// "any bare snake_case prefix") so internal strings like `"json parse:
+/// ..."`, `"project key: ..."`, `"transition response missing id"`
+/// can't escape as ad-hoc codes (`json`/`project`/`transition`) and
+/// break the trigger-matchable contract. Unknown collapses to `io_error`.
 fn map_jira_error(err: String) -> (String, String) {
-    /// Public error-code surface for jira.* actions. Triggers and
-    /// `nestctl call` clients can pattern-match on these. Adding a
-    /// new code is a documented contract change — keep this list
-    /// in sync with the `[I]` notes in roadmap.md Phase 16.2.
+    /// Public error-code surface — triggers and `nestctl` clients
+    /// pattern-match on these. Adding a new code is a contract change.
     const KNOWN_CODES: &[&str] = &[
         "unauthorized",
         "forbidden",
@@ -548,10 +543,8 @@ fn optional_string(params: &Value, name: &str) -> Result<Option<String>, (String
     }
 }
 
-/// JQL string-literal escape: backslash and double-quote. JQL allows
-/// embedded `"` inside a quoted string only when escaped as `\"`,
-/// and `\` becomes `\\`. Other characters pass through verbatim
-/// (JQL doesn't care about newlines / control chars in literals).
+/// JQL string-literal escape: `\` → `\\`, `"` → `\"`. Other chars pass
+/// through (JQL is permissive about newlines / control chars in literals).
 fn jql_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -564,16 +557,11 @@ fn jql_escape(s: &str) -> String {
     out
 }
 
-/// Resolved credentials with their source label, mirroring
-/// slack::current_credentials. Returned as `None` when neither env
-/// nor store has a usable set.
-///
-/// `account_id_hint` carries the stored TokenSet's account_id when
-/// (and ONLY when) source=="store" — captured atomically with the
-/// other credential fields. The poller uses this for its
-/// my_account_id resolution so that hot re-auth between
-/// `current_credentials()` and a follow-up `store.load()` can't
-/// produce a credentials/account_id mismatch.
+/// `account_id_hint` is captured atomically with the other credential
+/// fields (only set when `source == "store"`). The poller's
+/// my_account_id resolution uses it so a hot re-auth between
+/// `current_credentials` and a follow-up `store.load()` can't produce
+/// a credentials/account_id mismatch.
 pub struct ResolvedCreds {
     pub source: &'static str,
     pub base_url: String,
@@ -640,9 +628,8 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
     })
 }
 
-/// Build the `jira.auth_status` payload. Pulled into a function so
-/// slice 16.2's polling loop and any future `nestctl` wrapper can
-/// reuse the same shape verbatim.
+/// Shared `jira.auth_status` payload — re-used by the polling loop and
+/// any future client wrapper to keep the shape verbatim.
 fn auth_status_payload(config: &Config, store: &Arc<dyn TokenStore>) -> Value {
     // When env validation produced a fatal_error we MUST NOT report
     // authenticated=true based on a fall-through default-workspace
