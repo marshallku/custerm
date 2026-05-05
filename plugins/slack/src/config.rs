@@ -24,29 +24,21 @@ pub struct Config {
     /// Initial reconnect delay; exponential backoff up to `reconnect_max`.
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
-    /// Set when env validation surfaces a malformed value (bad token
-    /// prefix, invalid workspace label, malformed boolean). Distinct
-    /// from "tokens missing", which is OK — we fall back to the
-    /// store. A fatal error means the runtime config is unsafe to
-    /// use (e.g. bad workspace label would steer plaintext writes
-    /// outside the config dir, bad token prefix is a user typo we
-    /// must not mask with stored defaults). Socket Mode refuses to
-    /// connect when this is set, and `slack.auth_status` surfaces
-    /// the message so callers can see WHY the plugin is idle
-    /// without grep'ing logs.
+    /// Set on malformed env (bad token prefix, invalid workspace label,
+    /// malformed boolean). Distinct from "tokens missing" (OK — store
+    /// fallback). When set: Socket Mode refuses to connect and
+    /// `slack.auth_status` surfaces the message. Bad workspace would
+    /// steer plaintext writes outside the config dir; bad token prefix
+    /// is a user typo we must not mask with stored defaults.
     pub fatal_error: Option<String>,
 }
 
 impl Config {
-    /// Read all settings from env. Token env vars are now OPTIONAL:
-    /// Socket Mode falls back to the keyring-stored TokenSet when env
-    /// tokens are missing, so a one-time `nestty-plugin-slack auth` is
-    /// enough — subsequent restarts don't need the env again. If env
-    /// tokens ARE supplied they take precedence (useful for testing
-    /// against a different workspace without touching the store).
-    /// Invalid prefix on a present env token is still a hard error
-    /// because that's a user mistake worth surfacing rather than
-    /// silently masking with the stored token.
+    /// Token env vars are OPTIONAL — Socket Mode falls back to the
+    /// keyring-stored TokenSet, so one-time `auth` is enough. Env wins
+    /// when set (cross-workspace testing). Invalid prefix on a *present*
+    /// env token is still a hard error: a user typo must not be masked
+    /// by stored defaults.
     pub fn from_env() -> Result<Self, String> {
         let bot_token = std::env::var("NESTTY_SLACK_BOT_TOKEN").unwrap_or_default();
         if !bot_token.is_empty() && !bot_token.starts_with("xoxb-") {
@@ -80,12 +72,10 @@ impl Config {
         })
     }
 
-    /// Used when env validation fails (bad workspace label, etc.)
-    /// so the supervisor handshake still completes. All token-using
-    /// actions / Socket Mode are no-ops in this state. Includes the
-    /// fatal error message so callers get a useful diagnostic
-    /// instead of a silent fall-through to `default` workspace
-    /// stored credentials — that's the round-2 cross-review fix.
+    /// Builds a Config in fatal-error state so the supervisor
+    /// handshake still completes; token-using actions and Socket Mode
+    /// are no-ops. Carrying the message prevents silent fall-through
+    /// to `default`-workspace stored credentials.
     pub fn minimal_with_error(error: String) -> Self {
         Self {
             bot_token: String::new(),
@@ -99,17 +89,14 @@ impl Config {
         }
     }
 
-    /// True when the env supplied no usable token overrides. Doesn't
-    /// imply the plugin can't connect — Socket Mode also tries the
-    /// store. Used only for diagnostic surfacing in `auth_status`.
+    /// Diagnostic surface only — Socket Mode also tries the store.
     pub fn env_tokens_empty(&self) -> bool {
         self.bot_token.is_empty() || self.app_token.is_empty()
     }
 }
 
-/// Same charset as calendar's account-label validation (alphanumeric +
-/// `_-.@`). Rejects path separators / `..` / control chars so the
-/// label cannot escape the plaintext-store directory or collide with
+/// `[A-Za-z0-9_\-.@]+` minus reserved `.`/`..` — trust-boundary so
+/// the label can't escape the plaintext-store dir or collide with
 /// reserved keyring entries.
 pub fn validate_workspace_label(s: &str) -> Result<(), String> {
     if s.is_empty() {
