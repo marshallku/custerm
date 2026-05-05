@@ -11,9 +11,6 @@
 
 use serde_json::{Value, json};
 
-/// Returned from `/rest/api/3/myself` on a successful Basic-auth
-/// request. Used during `auth` to (a) prove the credentials work and
-/// (b) capture the account_id needed for mention detection later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInfo {
     pub account_id: String,
@@ -21,17 +18,12 @@ pub struct UserInfo {
     pub email_address: String,
 }
 
-/// Build the `Authorization: Basic <b64(email:api_token)>` header
-/// value. Pulled into its own function (rather than inlined) so tests
-/// can verify the encoding without making a network call.
 pub fn basic_auth_header(email: &str, api_token: &str) -> String {
     let raw = format!("{email}:{api_token}");
     format!("Basic {}", base64_encode(raw.as_bytes()))
 }
 
-/// Validate credentials against Jira Cloud by calling `GET /rest/api/3/myself`.
-/// Returns the user's accountId/displayName/email on 200, classified
-/// error string on any failure.
+/// `GET /rest/api/3/myself` — credential probe.
 pub fn validate_credentials(
     base_url: &str,
     email: &str,
@@ -42,8 +34,6 @@ pub fn validate_credentials(
     parse_myself(&body)
 }
 
-/// Parse a `/myself` response. Pulled out of the network path so tests
-/// can drive it with canonical fixtures.
 pub fn parse_myself(body: &Value) -> Result<UserInfo, String> {
     let account_id = body
         .get("accountId")
@@ -67,10 +57,6 @@ pub fn parse_myself(body: &Value) -> Result<UserInfo, String> {
     })
 }
 
-/// Resolved credentials (env- or store-sourced). Threaded through every
-/// API call so the caller doesn't have to remember which arg goes where.
-/// Borrowed (`&str`) rather than owned because the caller already holds
-/// the strings on the stack — no need for the helpers to clone.
 #[derive(Debug, Clone, Copy)]
 pub struct Creds<'a> {
     pub base_url: &'a str,
@@ -78,11 +64,8 @@ pub struct Creds<'a> {
     pub api_token: &'a str,
 }
 
-/// `Authorization: Basic ...` GET, JSON response. Status-code
-/// classification matches Slack's bare-snake-case convention so the
-/// dispatcher can promote the prefix to a top-level error code.
-/// Captures `Retry-After` on 429 so callers can branch on it
-/// (currently surfaced verbatim in the error suffix).
+/// JSON GET. Errors use snake_case prefixes for trigger pattern-matching;
+/// `Retry-After` is appended verbatim on 429.
 pub fn http_get(url: &str, email: &str, api_token: &str) -> Result<Value, String> {
     let resp = match ureq::get(url)
         .set("Authorization", &basic_auth_header(email, api_token))
@@ -102,10 +85,8 @@ pub fn http_get(url: &str, email: &str, api_token: &str) -> Result<Value, String
         .map_err(|e| format!("json parse: {e}"))
 }
 
-/// `Authorization: Basic ...` POST with a JSON body. Returns the
-/// parsed response body on 2xx; on 204 No Content (transition succeeds
-/// with no payload) returns `Value::Null` so callers can ignore the
-/// shape. Same status-code classification as `http_get`.
+/// JSON POST. `204 No Content` returns `Value::Null`. Same error
+/// classification as `http_get`.
 pub fn http_post(creds: Creds, url: &str, body: &Value) -> Result<Value, String> {
     let resp = match ureq::post(url)
         .set(
@@ -132,12 +113,9 @@ pub fn http_post(creds: Creds, url: &str, body: &Value) -> Result<Value, String>
         .map_err(|e| format!("json parse: {e}"))
 }
 
-/// Map HTTP status to a snake_case error prefix. The dispatcher
-/// (`main::handle_action`) inspects the leading token before the first
-/// space/parens and promotes pure `[a-z_]+` prefixes to the action's
-/// `code` field, leaving the rest in `message` — same posture as
-/// Slack's response classifier so triggers can pattern-match without
-/// substring searches.
+/// Map HTTP status to a snake_case error prefix. The action dispatcher
+/// promotes the leading `[a-z_]+` token to the response's `code` field so
+/// triggers can pattern-match without substring searches.
 pub fn classify_status(code: u16, body: &str, retry_after: Option<&str>) -> String {
     match code {
         401 => format!("unauthorized HTTP 401: {body}"),
@@ -151,9 +129,6 @@ pub fn classify_status(code: u16, body: &str, retry_after: Option<&str>) -> Stri
     }
 }
 
-/// Concatenate a base URL with a `/rest/api/...` suffix without
-/// producing `//` in the middle. Both inputs may have or lack a
-/// trailing/leading slash; result has exactly one separator.
 pub fn join_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     let path = path.trim_start_matches('/');
@@ -164,29 +139,18 @@ pub fn join_url(base: &str, path: &str) -> String {
 //                     High-level API methods
 // ============================================================
 
-/// Result of a paginated `/rest/api/3/search/jql` call.
-///
-/// **API endpoint note**: Atlassian deprecated the legacy
-/// `GET /rest/api/3/search` in 2024 with sunset by 2025; new code
-/// must use `POST /rest/api/3/search/jql` which uses cursor-based
-/// pagination (nextPageToken) instead of offset-based (startAt).
-/// The new endpoint also drops the `total` field from responses
-/// since cursor pagination doesn't need it.
+/// Result of a paginated `POST /rest/api/3/search/jql`. The legacy
+/// `GET /rest/api/3/search` was deprecated by Atlassian in 2024 (sunset
+/// 2025); this client uses the cursor-paginated POST endpoint instead.
 #[derive(Debug)]
 pub struct SearchResponse {
     pub issues: Vec<Value>,
-    /// Cursor for the NEXT page. `None` when no more pages
-    /// (`isLast: true` in the response, or the field is absent).
+    /// `None` when no more pages (`isLast: true` or token absent).
     pub next_page_token: Option<String>,
 }
 
-/// Run `POST /rest/api/3/search/jql` with the given JQL, paginated
-/// by `next_page_token`. Pass `None` for the first page; pass the
-/// previous response's `next_page_token` for subsequent pages.
-///
-/// `fields` filters the response shape — passing the explicit list
-/// the caller actually uses cuts payload size by ~80% in typical
-/// cases. Pass `["*all"]` to get every field (including customs).
+/// `fields` filters the response shape; pass `["*all"]` for every field
+/// including customs.
 pub fn search(
     creds: Creds,
     jql: &str,
@@ -214,20 +178,15 @@ pub fn search(
     parse_search_response(&resp)
 }
 
-/// Pulled out of the network path so tests can drive it with canonical
-/// fixtures. The new `/search/jql` endpoint signals "more pages exist"
-/// via the presence of `nextPageToken` (and `isLast: false`); when
-/// `isLast: true` or the token is absent, we're done.
+/// Pagination ends on `isLast: true`, or when `nextPageToken` is absent.
+/// Missing `isLast` defaults to `false` (defensive: Atlassian may simplify
+/// the response shape).
 pub fn parse_search_response(body: &Value) -> Result<SearchResponse, String> {
     let issues = body
         .get("issues")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    // `isLast` is the canonical signal in the new API. Fall back to
-    // checking for nextPageToken presence when `isLast` is absent
-    // (defensive — Atlassian's docs hint they may simplify the
-    // response shape further).
     let is_last = body.get("isLast").and_then(Value::as_bool).unwrap_or(false);
     let next_page_token = if is_last {
         None
@@ -242,17 +201,10 @@ pub fn parse_search_response(body: &Value) -> Result<SearchResponse, String> {
     })
 }
 
-/// Get a single issue by key. Returns the full payload — all fields
-/// (including customs) plus changelog. The verbatim Jira shape, NOT
-/// the trigger-envelope shape (action callers who want envelope can
-/// use `list_my_tickets` which returns one envelope per ticket).
-///
-/// **Comment cap caveat**: Jira's `/issue/{key}` endpoint always
-/// returns up to 50 comments inline regardless of `fields=` — there
-/// is no `?maxComments` knob. Callers needing >50 comments would
-/// fetch the rest via the `/issue/{key}/comment` paginated endpoint
-/// (currently only the poller uses it; a dedicated `jira.get_comments`
-/// action could land in a follow-up if needed).
+/// Returns the verbatim Jira issue payload (all fields + changelog), not the
+/// trigger-envelope shape. **Comment cap**: `/issue/{key}` returns up to 50
+/// comments inline with no `?maxComments` knob; callers needing more must
+/// page via `/issue/{key}/comment`.
 pub fn get_issue(creds: Creds, key: &str) -> Result<Value, String> {
     validate_issue_key(key)?;
     let url = format!(
@@ -263,17 +215,10 @@ pub fn get_issue(creds: Creds, key: &str) -> Result<Value, String> {
     http_get(&url, creds.email, creds.api_token)
 }
 
-/// Create an issue. `description` is plain text and gets ADF-wrapped
-/// here. `assignee` is an Atlassian accountId (NOT email — Jira Cloud
-/// dropped email-based assignment in 2018 for GDPR compliance).
-/// `issue_type` is required for company-managed (classic) projects and
-/// surfaces as Jira's `400 issuetype is required` otherwise; defaults
-/// to `"Task"` when omitted because that's the universal fallback every
-/// out-of-the-box project schema accepts. Caller can pass `"Bug"`,
-/// `"Story"`, `"Subtask"`, or any custom type configured in their
-/// project. Team-managed (next-gen) projects without a "Task" type
-/// may still 400 — the error surfaces verbatim so the user knows to
-/// pass `issue_type` explicitly.
+/// `description` is ADF-wrapped here. `assignee_account_id` must be an
+/// Atlassian accountId (Jira Cloud dropped email-based assignment in 2018).
+/// `issue_type` defaults to `"Task"` — team-managed projects without that
+/// type will 400 verbatim, signalling the caller to pass it explicitly.
 pub fn create_issue(
     creds: Creds,
     project_key: &str,
@@ -308,9 +253,6 @@ pub fn create_issue(
     http_post(creds, &url, &body)
 }
 
-/// List the available transitions for an issue. Returned shape:
-/// `[{id, name, to: {name, id}}]` — minimum needed for the
-/// case-insensitive name lookup in `transition()`.
 pub fn list_transitions(creds: Creds, key: &str) -> Result<Vec<Value>, String> {
     validate_issue_key(key)?;
     let url = format!(
@@ -326,14 +268,10 @@ pub fn list_transitions(creds: Creds, key: &str) -> Result<Vec<Value>, String> {
         .unwrap_or_default())
 }
 
-/// Transition an issue. Looks up the matching transition by destination
-/// status name (case-insensitive) so callers can pass `"In Progress"`
-/// without knowing Jira's internal numeric transition ids (which differ
-/// per workflow). Returns the resolved (from, to) pair on success;
-/// surfaces `transition_not_available` when the requested status name
-/// has no matching transition (most common cause: the user lacks the
-/// permission OR the workflow doesn't allow that step from the current
-/// state).
+/// Looks up the transition by destination status name (case-insensitive) so
+/// callers can pass `"In Progress"` without knowing Jira's per-workflow
+/// numeric ids. Returns `(from, to)` on success; `transition_not_available`
+/// when no transition reaches the requested status from the current state.
 pub fn transition(
     creds: Creds,
     key: &str,
@@ -392,10 +330,8 @@ pub fn transition(
     Ok((from_status, resolved_to))
 }
 
-/// Add a plain-text comment. Body is ADF-wrapped automatically.
-/// Returns the new comment's id (Jira's response carries the full
-/// comment object; we hand back just the id since that's the dedup
-/// key the rest of the system uses).
+/// Body is ADF-wrapped here. Returns the new comment's id (the system's
+/// dedup key for comments).
 pub fn add_comment(creds: Creds, key: &str, body_text: &str) -> Result<String, String> {
     validate_issue_key(key)?;
     let url = format!(
@@ -417,10 +353,8 @@ pub fn add_comment(creds: Creds, key: &str, body_text: &str) -> Result<String, S
 //                     Validators / encoders
 // ============================================================
 
-/// Issue keys are `[A-Z][A-Z0-9_]*-[0-9]+` per Jira's documentation.
-/// Validate so a malformed key (or an attempt to splice a path
-/// fragment via `key = "FOO/../bar"`) can't escape into the request
-/// URL. Same trust-boundary posture as Slack's `is_valid_slack_id`.
+/// `[A-Z][A-Z0-9_]*-[0-9]+`. Trust-boundary defense: a malformed key can't
+/// splice path fragments (`"FOO/../bar"`) into the request URL.
 pub fn validate_issue_key(s: &str) -> Result<(), String> {
     if s.is_empty() {
         return Err("issue key: cannot be empty".to_string());
@@ -458,10 +392,7 @@ pub fn validate_issue_key(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Project keys are `[A-Z][A-Z0-9_]*`. Same trust-boundary defense
-/// as `validate_issue_key`. Mirrors the env-time check in
-/// `config::validate_project_key` (same rules) but lives here so the
-/// `create_issue` helper can validate without depending on `config`.
+/// `[A-Z][A-Z0-9_]*`. Same trust-boundary defense as `validate_issue_key`.
 pub fn validate_project_key(s: &str) -> Result<(), String> {
     if s.is_empty() {
         return Err("project key: cannot be empty".to_string());
@@ -482,17 +413,11 @@ pub fn validate_project_key(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Wrap a plain-text string in Atlassian Document Format. Jira Cloud
-/// rejected legacy Wiki Markup format on 2020-06; `description` and
-/// `comment.body` now require ADF. Each non-empty line of input
-/// becomes its own `paragraph` node — Jira renders `\n\n` as the
-/// natural paragraph break, but we pre-split so single newlines
-/// produce visible breaks too (matching how a user types in vim/an
-/// editor expects).
-///
-/// Empty input maps to a single empty paragraph rather than an empty
-/// document (Jira's REST validates that `content` has at least one
-/// node — an empty doc returns 400).
+/// Wrap plain text in ADF (Atlassian Document Format). Jira Cloud rejected
+/// Wiki Markup in 2020-06; `description` and `comment.body` require ADF.
+/// Each non-empty line becomes its own `paragraph` so single newlines
+/// produce visible breaks. Empty input → single empty paragraph (Jira
+/// rejects an empty `content` array with 400).
 pub fn text_to_adf(text: &str) -> Value {
     let mut content = Vec::new();
     if text.is_empty() {
@@ -516,11 +441,7 @@ pub fn text_to_adf(text: &str) -> Value {
     })
 }
 
-/// Minimal RFC 3986 percent-encode for query/path segments. Same
-/// posture as calendar's hand-rolled `urlencode` — we control all
-/// inputs (validated keys, JQL we built ourselves, integer offsets)
-/// so there's no exotic-byte concern that would justify pulling in
-/// the `url::form_urlencoded` crate.
+/// Minimal RFC 3986 percent-encode for path/query segments.
 pub fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
@@ -537,11 +458,9 @@ pub fn urlencode(s: &str) -> String {
     out
 }
 
-/// Build the JQL string the polling loop uses. Shape:
-/// `(assignee = currentUser() OR watcher = currentUser()) AND updated > -<n>h[ AND project in (X, Y)]`.
-/// Project keys go through `validate_project_key` at config load
-/// (`parse_projects`) so the values spliced here are guaranteed
-/// charset-safe — no JQL injection risk from user-supplied content.
+/// `(assignee = currentUser() OR watcher = currentUser()) AND updated > -<n>h
+/// [AND project in (X, Y)]`. Project keys spliced here are charset-validated
+/// at config load — no JQL injection from user-supplied content.
 pub fn build_polling_jql(lookback_hours: u32, projects: Option<&[String]>) -> String {
     let mut jql = format!(
         "(assignee = currentUser() OR watcher = currentUser()) AND updated > -{lookback_hours}h"
@@ -562,10 +481,7 @@ pub fn build_polling_jql(lookback_hours: u32, projects: Option<&[String]>) -> St
     jql
 }
 
-/// RFC 4648 base64 (with `=` padding). Hand-rolled because this is
-/// the only base64 use-site in the plugin and pulling in the `base64`
-/// crate for ~10 LOC of work isn't worth a dep. Same posture as
-/// calendar's hand-rolled `urlencode`.
+/// RFC 4648 base64 with `=` padding.
 pub fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);

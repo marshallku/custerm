@@ -170,6 +170,28 @@ params = { command = "echo {event.text} >> ~/pings.log" }
 
 Parameter interpolation (`{event.foo}`, `{context.bar}`) handles dynamic action arguments. Conditional firing — "skip if I declined", "skip the weekly 1:1" — is expressed by an optional `condition` clause on each trigger, evaluated AFTER `when` matches. The expression DSL supports `== != < <= > >= && || !` plus parens, references like `event.X.Y` / `context.X`, and string/number/bool/null literals. Conditions are compiled once at config load; a parse failure drops THAT trigger only. See `nestty-core/src/condition.rs` for the full grammar and Phase 10.2 in roadmap.md for the rollout history.
 
+### Async correlation (`await` clauses)
+
+A trigger may declare an `await` clause to hold a chain until a follow-up event arrives. The engine uses a two-phase state machine:
+
+1. **Preflight** — when an await-bearing trigger fires its action, an entry lands in `preflight_awaits`. Promotion waits for `<action>.completed` because `LiveTriggerSink` returns `Ok({queued: true})` synchronously for blocking/plugin actions BEFORE the action actually runs. Arming on the sink's bare `Ok` would queue an await even when the action later fails async.
+2. **Pending** — on `<action>.completed`, the entry promotes to `pending_awaits` and watches for a follow-up event matching the configured `event_kind` + `payload_match`. On match, the engine publishes a synthesized `<trigger_name>.awaited` event for downstream chains.
+
+**Trust boundary**: only events whose `source == "nestty.action"` (the action registry's completion fan-out, see `action_registry::COMPLETION_EVENT_SOURCE`) advance the state machine. An unrelated bus producer that publishes a `.completed`-suffixed event cannot mutate await state.
+
+**Invocation correlation hazard (FIFO scope, slice-2 follow-up)**: the match key is the action name `X` only — neither `<X>.completed` nor `<X>.failed` carries an originating trigger or invocation id, so we cannot per-invocation correlate. FIFO scope is therefore "across all preflights for action X — regardless of trigger AND regardless of invocation":
+
+- Two different await-bearing triggers that share an action share one FIFO queue. A completion from trigger B can promote trigger A's preflight if A queued first.
+- A single trigger fired multiple times concurrently can mis-correlate. If trigger T fires three times (preflights p1, p2, p3) and completions arrive in order c1, c2, c3, FIFO matches them correctly. If completions arrive c2, c1, c3, FIFO promotes p1 with c2's payload, p2 with c1's, p3 with c3's — wrong invocation correlation, but each preflight does end up promoted exactly once.
+
+In practice most use cases have at most one in-flight invocation per action at a time (Slack-ask-and-wait, for example, isn't repeatedly fired). The mis-correlation only hurts when the SAME action is dispatched multiple times in fast succession AND awaited follow-up payloads need to match the specific invocation. Closing this fully requires per-invocation correlation tokens in `<X>.completed`/`.failed` payloads (`action_registry` change).
+
+**Single-consumption matching**: an incoming event resolves at most one pending entry. When two pendings share identical match criteria, only the oldest fires — the runner-up keeps waiting. Broadcasting one reply to multiple concurrent prompts would silently double-fire downstream chains.
+
+**Timeouts**: the deadline is set at preflight registration and carries unchanged through promotion. Total wait (preflight + pending) shares one window. `on_timeout = abort` drops silently; `on_timeout = fire_with_default` synthesizes the awaited event with `null` so downstream chains run with a missing-data fallback.
+
+**Hot-reload**: `set_triggers` swaps the trigger list under a single `RwLock` write (atomic per-list — concurrent dispatch sees old or new, never half-applied) and then clears both await pools under separate locks. `dispatch` clones the trigger snapshot before registering preflights, so any number of in-flight dispatches that captured the OLD snapshot can still register old-generation preflights after the clears. Hot-reload is best-effort cleanup, not a hard isolation boundary — old `<trigger_name>.awaited` events may still fire for events already in flight at swap time. Acceptable because triggers are user-authored config, not a hot data path. Volatile state is restart-loses; reload-loses is the same contract.
+
 ## Mapping to existing code
 
 | Current | Becomes |

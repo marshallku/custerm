@@ -24,10 +24,6 @@ use serde_json::{Map, Value};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-/// Pluggable action invoker for the trigger engine. Default impl on
-/// `ActionRegistry` covers registry-only reach. Platform integrations can
-/// implement this to widen reach (e.g. routing unregistered actions through
-/// `socket::dispatch` so legacy match-arm commands become trigger-reachable).
 pub trait TriggerSink: Send + Sync {
     fn dispatch_action(&self, action: &str, params: Value) -> ActionResult;
 }
@@ -45,55 +41,26 @@ pub struct Trigger {
     pub action: String,
     #[serde(default)]
     pub params: Value,
-    /// Optional boolean expression evaluated AFTER `when` matches.
-    /// See `crate::condition` for grammar. Compiled once at
-    /// `set_triggers` time; a parse error drops the offending trigger
-    /// (the rest of the set still loads). At evaluation time, an
-    /// `Err` from the evaluator (type mismatch on ordering, etc.)
-    /// is logged and treated as "trigger does not match" — never
-    /// fires the action on a misconfigured condition.
+    /// Optional predicate evaluated AFTER `when` matches. See `crate::condition`
+    /// for grammar; eval errors are logged and treated as no-match.
     #[serde(default)]
     pub condition: Option<String>,
-    /// Phase 14.2 async-correlation primitive. When set, after the
-    /// action fires the engine registers a "pending await" entry and
-    /// holds the chain until a follow-up event matching
-    /// `await.event_kind` + interpolated `await.payload_match`
-    /// arrives within `await.timeout_seconds`. On match, a
-    /// synthesized `<trigger_name>.awaited` event is published with
-    /// the matched event's payload nested under `await:`. Downstream
-    /// triggers reference that synthesized event_kind to continue
-    /// the chain.
+    /// Optional async-correlation clause; see `AwaitClause` and
+    /// docs/workflow-runtime.md "Async correlation".
     #[serde(default)]
     pub r#await: Option<AwaitClause>,
 }
 
-/// Configuration for the await-primitive on a trigger. Lives next to
-/// `Trigger` rather than as a separate top-level concept because each
-/// await is intrinsically scoped to one trigger row — there's no
-/// shared registry of "wait specs" that triggers can reference.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AwaitClause {
-    /// Glob-pattern for the event kind we're waiting for. Same matcher
-    /// as `WhenSpec.event_kind`, supports `*`.
     pub event_kind: String,
-    /// Field equality requirements on the awaited event's payload.
-    /// Each value is interpolated against the ORIGINAL event (the
-    /// one that fired this trigger) before matching, so a clause
-    /// like `payload_match = { user = "{event.user}" }` filters
-    /// awaited events to those that match the originating user.
-    /// `action_result` is intentionally NOT exposed here in v1 —
-    /// the sink's return value is unreliable for blocking actions
-    /// (LiveTriggerSink returns `{queued: true}` and the real result
-    /// arrives asynchronously). v2 may grow that via
-    /// `<action>.completed` correlation.
+    /// Field equality on the awaited event's payload. Each value is
+    /// interpolated against the originating event before matching.
     #[serde(default)]
     pub payload_match: Map<String, Value>,
-    /// Maximum seconds to wait. After expiry, `on_timeout` decides.
     pub timeout_seconds: u64,
-    /// `abort` (default): drop the pending entry, no further events
-    /// fire. `fire_with_default`: synthesize the awaited event with
-    /// nulls in the `await` slot so downstream triggers run with
-    /// degraded data — caller's responsibility to handle null.
+    /// `abort` drops the pending entry; `fire_with_default` synthesizes the
+    /// awaited event with `null` so downstream chains run with missing data.
     #[serde(default)]
     pub on_timeout: TimeoutPolicy,
 }
@@ -108,20 +75,15 @@ pub enum TimeoutPolicy {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WhenSpec {
-    /// Glob pattern matched against `event.kind`. Required.
+    /// Glob pattern matched against `event.kind`.
     pub event_kind: String,
-    /// Any other keys in the `when` table are treated as payload-field
-    /// equality requirements. `{ event_kind = "slack.mention", channel = "alerts" }`
-    /// matches `slack.mention` events whose payload has `channel == "alerts"`.
+    /// `#[serde(flatten)]`: any other keys in the `[when]` table become
+    /// payload-equality requirements (e.g. `channel = "alerts"`).
     #[serde(flatten)]
     pub payload_match: Map<String, Value>,
 }
 
 impl Trigger {
-    /// Match `when` (event_kind glob + payload-equality) only. The
-    /// `condition` clause is evaluated separately by `TriggerEngine`
-    /// against the pre-compiled AST so we don't re-parse on every
-    /// fired event. Useful as a primitive for tests + diagnostics.
     pub fn matches(&self, event: &Event) -> bool {
         if !pattern_matches(&self.when.event_kind, &event.kind) {
             return false;
@@ -140,37 +102,20 @@ impl Trigger {
     }
 }
 
-/// Engine-internal compiled form. `set_triggers` parses each
-/// `Trigger.condition` string into an AST once so per-event dispatch
-/// stays cheap. Triggers whose condition fails to parse are dropped
-/// at compile time with a `log::warn` — the rest of the set still
-/// loads.
+/// Engine-internal compiled form: each `Trigger.condition` is parsed once.
+/// Parse failures drop only the offending trigger (logged).
 #[derive(Debug, Clone)]
 struct CompiledTrigger {
     trigger: Trigger,
     condition: Option<condition::Expr>,
 }
 
-/// In-flight async-correlation entry tracked by the engine after a
-/// trigger with an `await` clause fires its action.
-///
-/// **Two-phase state machine**: a trigger's action dispatch lands in
-/// `preflight_awaits` first; promotion to `pending_awaits` waits for
-/// the `<action>.completed` event (Phase 14.1 fan-out). Why: blocking
-/// and plugin actions return `Ok({queued: true})` synchronously from
-/// `LiveTriggerSink` BEFORE the action actually runs, so arming a
-/// pending entry on the sink's `Ok` would queue an await even when
-/// the action later fails async. `<action>.completed` is the only
-/// signal that's true for both sync registry calls AND async-blocking
-/// calls — `publish_completion` fires it in both paths. Legacy
-/// match-arm actions that don't go through the registry don't fire
-/// `.completed`, so awaits on them never arm — documented limitation,
-/// same audience as Phase 14.1.
+/// Two-phase state for await-bearing triggers. Dispatch lands here first;
+/// promotion to `PendingAwait` waits for `<action>.completed`, because blocking
+/// and plugin sinks return `Ok({queued: true})` synchronously BEFORE the
+/// action actually runs. See docs/workflow-runtime.md "Async correlation".
 struct PreflightAwait {
     trigger_name: String,
-    /// Action name we're waiting for completion of. The completion
-    /// event kind is `format!("{action}.completed")`; failure is
-    /// `format!("{action}.failed")`.
     action: String,
     await_event_kind: String,
     payload_match: Map<String, Value>,
@@ -179,23 +124,14 @@ struct PreflightAwait {
     on_timeout: TimeoutPolicy,
 }
 
-/// Holds the data needed to (1) match incoming events against the
-/// await's payload_match, (2) build the synthesized
-/// `<trigger_name>.awaited` payload when a match arrives or timeout
-/// fires. Promoted from `PreflightAwait` once `<action>.completed`
-/// confirms the dispatched action actually succeeded.
 struct PendingAwait {
-    /// Used both to namespace the synthesized event kind
-    /// (`<trigger_name>.awaited`) and as a debugging label.
     trigger_name: String,
     await_event_kind: String,
-    /// Payload-equality requirements with literal `Value`s — already
-    /// interpolated against the original event at registration time.
-    /// Comparing JSON `Value`s lets us match scalars exactly (string
-    /// vs number vs bool) without re-interpolating per incoming event.
+    /// Already interpolated against the original event at registration time;
+    /// per-incoming-event match is pure JSON-value equality.
     payload_match: Map<String, Value>,
-    /// Original event payload, carried forward into the synthesized
-    /// event so downstream interpolation still sees `{event.<orig>}`.
+    /// Carried forward so the synthesized `<trigger_name>.awaited` event keeps
+    /// `{event.<orig>}` interpolation working downstream.
     original_payload: Value,
     deadline: Instant,
     on_timeout: TimeoutPolicy,
@@ -204,25 +140,10 @@ struct PendingAwait {
 pub struct TriggerEngine {
     triggers: RwLock<Vec<CompiledTrigger>>,
     sink: Arc<dyn TriggerSink>,
-    /// Phase 14.2 async-correlation state — preflight half. Entry
-    /// added when a trigger with `await` fires; promoted to
-    /// `pending_awaits` when `<action>.completed` arrives, dropped
-    /// when `<action>.failed` arrives or the sweep timer expires.
     preflight_awaits: RwLock<Vec<PreflightAwait>>,
-    /// Phase 14.2 async-correlation state — armed half. Pending
-    /// entries accumulate after promotion from preflight and drain
-    /// when matching events arrive or `sweep_pending_awaits` removes
-    /// expired ones. Bounded in practice by the number of in-flight
-    /// workflows; we don't cap length here, so a runaway producer of
-    /// await-bearing triggers would grow unboundedly — acceptable
-    /// for now since the only producer is user-authored config.
     pending_awaits: RwLock<Vec<PendingAwait>>,
-    /// Optional bus for publishing synthesized `<trigger_name>.awaited`
-    /// events. None makes the engine unable to emit awaited events —
-    /// triggers with `await` clauses still register pending entries
-    /// but no downstream chains can fire. Opt-in (matches
-    /// `ActionRegistry::with_completion_bus` shape) so test harnesses
-    /// don't need to construct a bus.
+    /// Bus for publishing `<trigger_name>.awaited`. `None` disables emission;
+    /// pending entries still register but no downstream chains can fire.
     publish_bus: Option<Arc<EventBus>>,
 }
 
@@ -237,10 +158,6 @@ impl TriggerEngine {
         }
     }
 
-    /// Same as `new` but threads in an `EventBus` so the engine can
-    /// publish synthesized `<trigger_name>.awaited` events for the
-    /// async-correlation primitive (Phase 14.2). Production code on
-    /// nestty-linux uses this; pure unit tests use `new`.
     pub fn with_publish_bus(sink: Arc<dyn TriggerSink>, bus: Arc<EventBus>) -> Self {
         Self {
             triggers: RwLock::new(Vec::new()),
@@ -251,14 +168,16 @@ impl TriggerEngine {
         }
     }
 
-    /// Replace the trigger list atomically. Used on startup and on config
-    /// hot-reload. Concurrent dispatch sees either the old or the new full
-    /// list, never a half-applied state.
-    ///
-    /// Each trigger's `condition` (if present) is compiled here.
-    /// A parse failure drops THAT trigger and is logged; the rest of
-    /// the set still loads so a single typo can't disable the entire
-    /// trigger config.
+    /// Trigger-list swap is atomic per-list (concurrent dispatch sees the old
+    /// or new full list, never half-applied). Per-trigger `condition` parse
+    /// failures drop only the offending trigger. Await pools are also cleared,
+    /// but under separate locks — and `dispatch` clones the trigger snapshot
+    /// before registering preflights, so any number of in-flight dispatches
+    /// that captured the OLD snapshot can still register old-generation
+    /// preflights after the clear. Hot-reload is best-effort cleanup, not a
+    /// hard isolation boundary; old `<name>.awaited` events may still fire
+    /// for events already in flight at swap time. Acceptable because triggers
+    /// are user-authored config, not a hot data path.
     pub fn set_triggers(&self, triggers: Vec<Trigger>) {
         let compiled: Vec<CompiledTrigger> = triggers
             .into_iter()
@@ -283,14 +202,6 @@ impl TriggerEngine {
             })
             .collect();
         *self.triggers.write().unwrap() = compiled;
-        // Phase 14.2: hot-reload is documented as all-or-nothing
-        // (docs/core-lib.md), so any await state from the OLD trigger
-        // set must die with the swap — otherwise a removed-or-renamed
-        // trigger could still emit `<old_name>.awaited` after the
-        // new config takes effect. Volatile state was already
-        // documented as restart-loses; reload-loses is the same
-        // contract. Pre-Phase-14.2 callers (no `await` clauses) are
-        // unaffected because both vectors are always empty.
         self.preflight_awaits.write().unwrap().clear();
         self.pending_awaits.write().unwrap().clear();
     }
@@ -308,29 +219,16 @@ impl TriggerEngine {
             .collect()
     }
 
-    /// Match every trigger against `event`, interpolate params, invoke
-    /// the corresponding action via the configured `TriggerSink`. Sink
-    /// errors returned synchronously are logged here. Returns the number
-    /// of triggers that fired (counts a synchronous `Ok` from the sink —
-    /// note that some sinks, e.g. `LiveTriggerSink`'s legacy fallthrough,
-    /// return `Ok` on queueing without waiting for the underlying action's
-    /// outcome; those failures are surfaced asynchronously by the sink
-    /// itself).
+    /// Returns the count of triggers that fired (synchronous `Ok` from the
+    /// sink). Some sinks return `Ok` on queueing without waiting for the
+    /// underlying action — those failures are surfaced asynchronously by
+    /// the sink itself (non-`register_silent` registry actions auto-publish
+    /// `<action>.failed` on the bus; silent registry actions and legacy
+    /// match-arm sinks log instead).
     pub fn dispatch(&self, event: &Event, context: Option<&Context>) -> usize {
-        // Phase 14.2: do the await-state passes BEFORE iterating
-        // triggers. Order matters because a trigger that fires its
-        // own action X on the same event we just used to promote
-        // could otherwise have its freshly-registered preflight
-        // immediately consumed by the same `X.completed` event,
-        // arming a downstream await against the WRONG action call.
-        // Pass order:
-        //   1. promote/drop pre-existing preflights against this
-        //      event (handles `<X>.completed` / `<X>.failed` events).
-        //   2. match this event against pre-existing pending awaits
-        //      and emit `<trigger_name>.awaited` for any hit.
-        //   3. iterate triggers, register fresh preflights for
-        //      await-bearing matches — these will only see FUTURE
-        //      completion events, never the one we just processed.
+        // Await-state passes run BEFORE iterating triggers: a trigger that
+        // fires action X on this event must not have its fresh preflight
+        // consumed by the same `X.completed` event we just used to promote.
         self.try_promote_or_drop_preflight(event);
         self.try_match_pending_awaits(event);
 
@@ -344,11 +242,8 @@ impl TriggerEngine {
             if !trigger.matches(event) {
                 continue;
             }
-            // Condition check: bail before the action invocation if
-            // the user-supplied predicate is false or evaluation
-            // errored. An eval error is treated as "doesn't match"
-            // rather than firing on a misconfigured condition — the
-            // safer default.
+            // Eval error is treated as no-match — safer than firing on a
+            // misconfigured condition.
             if let Some(expr) = &ct.condition {
                 match condition::eval(expr, event, context) {
                     Ok(true) => {}
@@ -373,14 +268,6 @@ impl TriggerEngine {
                         trigger.action,
                         event.kind
                     );
-                    // Phase 14.2: stage a PREFLIGHT entry. Don't arm
-                    // pending_awaits directly off the sink's `Ok` —
-                    // blocking/plugin actions return
-                    // `Ok({queued: true})` synchronously BEFORE the
-                    // action actually succeeds. The preflight is
-                    // promoted to pending_awaits when
-                    // `<action>.completed` arrives (or dropped on
-                    // `<action>.failed`).
                     if let Some(aw) = &trigger.r#await {
                         self.register_preflight_await(trigger, aw, event, context);
                     }
@@ -400,11 +287,8 @@ impl TriggerEngine {
         fired
     }
 
-    /// Stage a preflight-await entry. Interpolates the `payload_match`
-    /// against the originating event NOW, so once the action's
-    /// `.completed` event promotes this entry, the per-incoming-event
-    /// comparison is a pure JSON value check (no per-event
-    /// interpolation overhead).
+    /// Interpolates `payload_match` against the originating event NOW so
+    /// per-incoming-event comparison is pure JSON-value equality.
     fn register_preflight_await(
         &self,
         trigger: &Trigger,
@@ -414,13 +298,9 @@ impl TriggerEngine {
     ) {
         let mut interpolated_match = Map::new();
         for (k, v) in &aw.payload_match {
-            // Use `interpolate_value_typed` so a single-token string like
-            // `"{event.count}"` resolves to the raw JSON value (preserves
-            // numbers, booleans, nulls instead of coercing to string).
-            // Awaited events compare via JSON value equality; without
-            // this, `payload_match = { count = "{event.count}" }` would
-            // compare `Value::String("42")` to `Value::Number(42)` and
-            // never match.
+            // Typed interpolation: a single-token string like `"{event.count}"`
+            // resolves to the raw JSON value so number→string coercion can't
+            // break payload-match equality.
             interpolated_match.insert(k.clone(), interpolate_value_typed(v, event, context));
         }
         let preflight = PreflightAwait {
@@ -435,55 +315,15 @@ impl TriggerEngine {
         self.preflight_awaits.write().unwrap().push(preflight);
     }
 
-    /// Promote first matching preflight to pending on `<X>.completed`,
-    /// drop first matching preflight on `<X>.failed`. **Trust check**:
-    /// only events sourced from `nestty.action` (the action_registry's
-    /// completion fan-out — see `action_registry::COMPLETION_EVENT_SOURCE`)
-    /// can advance the state machine. An unrelated bus producer that
-    /// happens to publish `<something>.completed` with the same suffix
-    /// is ignored, so an event from outside the registry can't mutate
-    /// our await state.
-    ///
-    /// Match key is
-    /// the action name `X` ONLY — neither `<X>.completed` nor
-    /// `<X>.failed` carries the originating event/trigger id, so we
-    /// can't per-invocation correlate. **FIFO scope is "across ALL
-    /// preflights for action X — regardless of trigger AND
-    /// regardless of invocation"**:
-    ///
-    /// - Two different await-bearing triggers that share an action
-    ///   share a single FIFO queue at the action level. A completion
-    ///   from trigger B's invocation can promote trigger A's
-    ///   preflight if A queued first.
-    /// - Even a single trigger fired multiple times concurrently
-    ///   can mis-correlate. If trigger T fires three times in quick
-    ///   succession (preflights p1, p2, p3) and completions arrive
-    ///   in order c1, c2, c3, FIFO matches them correctly. If
-    ///   completions arrive c2, c1, c3, FIFO promotes p1 with c2's
-    ///   payload, p2 with c1's, p3 with c3's — wrong invocation
-    ///   correlation, but at least each preflight does end up
-    ///   promoted exactly once.
-    ///
-    /// In practice most use cases have at most one in-flight
-    /// invocation per action at a time (Slack-ask-and-wait, for
-    /// example, isn't repeatedly fired). The mis-correlation only
-    /// hurts when the SAME action is dispatched multiple times in
-    /// fast succession AND the awaited follow-up payloads need to
-    /// match the specific invocation.
-    ///
-    /// Closing this fully needs per-invocation correlation tokens in
-    /// `<X>.completed`/`.failed` payloads (action_registry change).
-    /// Tracked as a slice-2 follow-up.
+    /// Promote first matching preflight to pending on `<X>.completed`, drop
+    /// it on `<X>.failed`. Trust gate: only `event.source ==
+    /// COMPLETION_EVENT_SOURCE` advances state. FIFO match by action name
+    /// has a known invocation-correlation hazard when the same action runs
+    /// concurrently — see docs/workflow-runtime.md "Async correlation".
     fn try_promote_or_drop_preflight(&self, event: &Event) {
-        // Trust check: only the action_registry's synthesized
-        // completion fan-out can advance the state machine. An
-        // unrelated producer publishing a `.completed`-suffixed
-        // event would otherwise silently mutate await state.
         if event.source != crate::action_registry::COMPLETION_EVENT_SOURCE {
             return;
         }
-        // Strip `.completed` / `.failed` suffix to recover the action
-        // name. Anything else is irrelevant to this stage.
         let (action, success) = if let Some(action) = event.kind.strip_suffix(".completed") {
             (action, true)
         } else if let Some(action) = event.kind.strip_suffix(".failed") {
@@ -519,15 +359,9 @@ impl TriggerEngine {
         });
     }
 
-    /// Walk pending awaits and fire `<trigger_name>.awaited` for the
-    /// FIRST one whose `event_kind` + `payload_match` accept this
-    /// event. Single-consumption: one incoming event resolves at most
-    /// one pending entry. When two pendings share identical match
-    /// criteria (same Slack user filter, etc.), only the oldest fires
-    /// — the runner-up keeps waiting for its own follow-up. This is
-    /// the conservative choice; broadcasting one reply to multiple
-    /// concurrent prompts would silently double-fire downstream
-    /// chains, which is much harder to debug.
+    /// Single-consumption: one incoming event resolves at most one pending
+    /// entry. When pendings share identical match criteria, only the oldest
+    /// fires — broadcasting would silently double-fire downstream chains.
     fn try_match_pending_awaits(&self, event: &Event) {
         let mut to_emit: Option<(String, Value)> = None;
         {
@@ -555,10 +389,8 @@ impl TriggerEngine {
             if let Some(idx) = matched_idx {
                 let p = pending.remove(idx);
                 let synthesized = build_awaited_payload(&p.original_payload, &event.payload);
-                // Don't publish under the lock — bus.publish may
-                // re-enter dispatch (subscribers receive synchronously
-                // today, but a subscriber calling back into the engine
-                // would deadlock against this write lock).
+                // Don't publish under the lock — a subscriber calling back
+                // into the engine would deadlock against this write lock.
                 to_emit = Some((awaited_kind_for(&p.trigger_name), synthesized));
             }
         }
@@ -569,21 +401,9 @@ impl TriggerEngine {
         }
     }
 
-    /// Drop expired entries from BOTH preflight and pending await
-    /// pools. The deadline is set at preflight registration time and
-    /// carries unchanged through promotion to pending — total wait
-    /// (preflight + pending) shares one timeout window. For entries
-    /// with `on_timeout = FireWithDefault`, publish a synthesized
-    /// `<trigger_name>.awaited` event with `null` in the await slot
-    /// so downstream chains can run with a missing-data fallback.
-    /// A preflight that expires before `<action>.completed` arrives
-    /// (legacy match-arm action that doesn't fire `.completed`,
-    /// stalled action) is treated the same way as a timed-out
-    /// pending — Abort drops silently, FireWithDefault still emits
-    /// the synthesized event with `await: null`.
-    ///
-    /// Caller invokes this on a timer (e.g. nestty-linux's GTK pump
-    /// every 50ms) — the engine has no thread of its own.
+    /// Drop expired entries from BOTH pools — total wait (preflight +
+    /// pending) shares one timeout window. Caller drives this on a timer;
+    /// the engine has no thread of its own.
     pub fn sweep_pending_awaits(&self) {
         let now = Instant::now();
         let mut to_emit: Vec<(String, Value)> = Vec::new();
@@ -620,35 +440,23 @@ impl TriggerEngine {
         }
     }
 
-    /// Diagnostic accessor — number of pending await entries currently
-    /// armed (post-promotion). Used by tests; not load-bearing in
-    /// production.
     pub fn pending_await_count(&self) -> usize {
         self.pending_awaits.read().unwrap().len()
     }
 
-    /// Diagnostic accessor — number of preflight entries currently
-    /// waiting for `<action>.completed`. Used by tests.
     pub fn preflight_await_count(&self) -> usize {
         self.preflight_awaits.read().unwrap().len()
     }
 }
 
-/// Source label for synthesized `<trigger_name>.awaited` events.
-/// Distinct from action_registry's `nestty.action` and bus producers'
-/// own kinds so consumers can identify origin if needed.
 const AWAITED_EVENT_SOURCE: &str = "nestty.trigger.await";
 
 fn awaited_kind_for(trigger_name: &str) -> String {
     format!("{trigger_name}.awaited")
 }
 
-/// Build the payload of a synthesized `<trigger_name>.awaited` event.
-/// Carries the originating trigger's event payload at top level (so
-/// `{event.<orig>}` interpolation keeps working in downstream
-/// triggers) and nests the matched event's payload under `await:`
-/// (so `{event.await.<field>}` reads the reply data via the dot-path
-/// interpolator).
+/// Original event payload at top level, awaited payload nested under `await:`,
+/// so downstream interpolation reads `{event.<orig>}` and `{event.await.<x>}`.
 fn build_awaited_payload(original: &Value, awaited: &Value) -> Value {
     let mut obj = match original {
         Value::Object(m) => m.clone(),
@@ -658,19 +466,11 @@ fn build_awaited_payload(original: &Value, awaited: &Value) -> Value {
     Value::Object(obj)
 }
 
-/// Reduce a set of trigger `event_kind` patterns to the minimal set that
-/// covers all of them — used by the platform layer to compute a deduplicated
-/// list of bus subscriptions. Without this, declaring overlapping patterns
-/// (e.g. `*` plus `panel.focused`) would cause the same bus event to be
-/// delivered to multiple receivers and trigger every matching action once
-/// per delivery instead of once per event.
-///
-/// Rules (matching `event_bus::pattern_matches`):
-/// - `*` covers every pattern → if `*` is present, it's the only result.
-/// - `foo.*` covers `foo.X`, `foo.X.Y`, and `foo.X.*` (any narrower pattern
-///   under the same dotted prefix).
-/// - Exact patterns cover only themselves; they survive only when no other
-///   pattern in the set covers them.
+/// Reduce trigger `event_kind` patterns to the minimal covering set so the
+/// platform layer subscribes once per "real" pattern. Rules:
+/// - `*` covers every pattern.
+/// - `foo.*` covers `foo.X`, `foo.X.Y`, and `foo.X.*`.
+/// - Exact patterns survive only when nothing in the set covers them.
 pub fn covering_patterns<I, S>(patterns: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -733,24 +533,13 @@ fn interpolate_value(template: &Value, event: &Event, context: Option<&Context>)
     }
 }
 
-/// Type-preserving interpolation for `await.payload_match` values.
-/// Differs from `interpolate_value` (which is used for action params)
-/// in one place: when a string is exactly `{<token>}` with nothing
-/// else, the raw resolved JSON `Value` is returned instead of the
-/// string-coerced form. That's necessary because await match runs
-/// pure JSON-value equality against the awaited event's payload —
-/// `payload_match = { count = "{event.count}" }` against `event.count =
-/// 42` (a number) would otherwise compare `Value::String("42")` to
-/// `Value::Number(42)` and never match. Mixed templates like
-/// `{ "Hello {event.name}" }` still string-coerce because there's no
-/// single source value to preserve. Unresolved single-token cases
-/// fall back to the literal `{token}` string (same fail-loud posture
-/// as flat-token resolution).
+/// Type-preserving variant of `interpolate_value` for `payload_match` values:
+/// a string that is exactly `{<token>}` resolves to the raw JSON `Value`
+/// (so `count = "{event.count}"` matches `Value::Number(42)`, not
+/// `Value::String("42")`). Mixed templates still string-coerce.
 fn interpolate_value_typed(template: &Value, event: &Event, context: Option<&Context>) -> Value {
     match template {
         Value::String(s) => {
-            // Single-token-only path: extract `{...}` if the string is
-            // exactly one token wrapper and nothing else.
             if let Some(token) = single_token(s)
                 && let Some(value) = resolve_token_value(token, event, context)
             {
@@ -774,10 +563,6 @@ fn interpolate_value_typed(template: &Value, event: &Event, context: Option<&Con
     }
 }
 
-/// If `s` is exactly `{<token>}` with no surrounding text and no
-/// embedded close-brace, return the inner token. Used by the typed
-/// payload_match interpolator to know when raw-value substitution is
-/// safe vs when string-coercion is the only viable path.
 fn single_token(s: &str) -> Option<&str> {
     let inner = s.strip_prefix('{')?.strip_suffix('}')?;
     if inner.contains('{') || inner.contains('}') {
@@ -786,9 +571,6 @@ fn single_token(s: &str) -> Option<&str> {
     Some(inner)
 }
 
-/// Like `resolve_token` but returns the raw JSON `Value` reference
-/// instead of stringifying. Only used by the typed payload_match
-/// interpolator.
 fn resolve_token_value<'a>(
     token: &str,
     event: &'a Event,
@@ -797,13 +579,8 @@ fn resolve_token_value<'a>(
     if let Some(field) = token.strip_prefix("event.") {
         return resolve_dot_path(&event.payload, field);
     }
-    // `context.X` resolution returns the raw payload field if we
-    // wrap it as a Value. ContextService doesn't expose a typed
-    // surface (it's just two Option<String>s today), so for context
-    // tokens we fall back to the string interpolator's view by
-    // returning None — caller will then string-coerce, which matches
-    // the existing context surface. Adding typed context resolution
-    // is a future extension when richer context data lands.
+    // ContextService is two Option<String>s today; typed context resolution
+    // would need a richer surface. Fall back to string-coercion via the caller.
     let _ = context;
     None
 }
@@ -855,13 +632,8 @@ fn resolve_token(token: &str, event: &Event, context: Option<&Context>) -> Optio
     None
 }
 
-/// Walk a dot-separated path (`foo.bar.baz`) into a JSON `Value`.
-/// Top-level field is a single segment (legacy shape: `event.id`);
-/// nested objects use additional dots (`event.payload.text`,
-/// `event.await.thread_ts`). Stops at the first non-object hop —
-/// e.g. `event.tags.0` won't index into an array, returning `None`
-/// instead. That keeps the surface intentionally narrow until a
-/// real call site asks for array/index access.
+/// Walk a dot-separated path into a JSON `Value`. Stops at the first
+/// non-object hop — array/index access is intentionally unsupported.
 fn resolve_dot_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = root;
     for seg in path.split('.') {
@@ -1475,16 +1247,8 @@ mod tests {
         assert_eq!(t.params["lead_minutes"], json!(10));
     }
 
-    // -- Phase 14.1: end-to-end chained trigger via completion fan-out --
-
-    /// E2E for the killer-demo shape: an originating event fires
-    /// trigger A which invokes action `step1`. The registry's
-    /// completion fan-out publishes `step1.completed` onto the
-    /// bus. Trigger B on `step1.completed` invokes action `step2`,
-    /// which is what we assert ran. Without Phase 14.1 the second
-    /// step would never have anything to listen to.
     #[test]
-    fn phase_14_1_chained_triggers_compose_via_completion_event() {
+    fn chained_triggers_compose_via_completion_event() {
         use crate::event_bus::{EventBus, RecvOutcome};
         use std::time::Duration;
 
@@ -1565,10 +1329,8 @@ mod tests {
         assert_eq!(step2_invocations[0]["marker"], json!("from-step1"));
     }
 
-    /// Same shape as above but the first step FAILS — verify
-    /// `step1.failed` lights up a recovery trigger.
     #[test]
-    fn phase_14_1_failed_event_drives_recovery_trigger() {
+    fn failed_event_drives_recovery_trigger() {
         use crate::action_registry::invalid_params;
         use crate::event_bus::{EventBus, RecvOutcome};
         use std::time::Duration;
@@ -1625,23 +1387,12 @@ mod tests {
         assert_eq!(recovery_calls.load(Ordering::SeqCst), 1);
     }
 
-    // -- Phase 15.2: end-to-end Vision Flow 3 chain --
-
-    /// Drives a 3-trigger chain modeling the killer demo:
-    ///   `todo.start_requested` (with linked_jira)
-    ///     → `git.worktree_add` (sanitize_jira branch)
-    ///     → `git.worktree_add.completed` (auto-emitted)
-    ///     → `claude.start` (with workspace_path interpolated)
-    ///
-    /// Every step is a real `[[triggers]]` row; the actions are
-    /// mocks that record their interpolated params so we can
-    /// assert end-to-end data flow without spawning real
-    /// subprocesses (claude.start needs GTK; git.worktree_add
-    /// needs a real repo). The relevant integration surface
-    /// here IS the engine + bus + registry plumbing — that's
-    /// what Phase 15.2 wires together.
+    /// 3-trigger chain: `todo.start_requested` → `git.worktree_add` →
+    /// `git.worktree_add.completed` → `claude.start`. Action mocks record
+    /// their interpolated params so we assert engine + bus + registry
+    /// plumbing without real subprocesses or a real git repo.
     #[test]
-    fn phase_15_2_killer_demo_chain_with_jira() {
+    fn worktree_add_chain_with_jira_branch() {
         use crate::event_bus::EventBus;
         use std::time::Duration;
 
@@ -1812,10 +1563,9 @@ mod tests {
         );
     }
 
-    /// Same chain, no `linked_jira` → trigger 2 (without-jira)
-    /// fires instead, branch is `todo-<id>`.
+    /// Same chain, no `linked_jira` → branch is `todo-<id>`.
     #[test]
-    fn phase_15_2_killer_demo_chain_without_jira() {
+    fn worktree_add_chain_without_jira_branch() {
         use crate::event_bus::EventBus;
         use std::time::Duration;
 
@@ -1924,15 +1674,10 @@ mod tests {
         assert_eq!(claude_seen[0]["workspace_path"], "/tmp/wt/todo-T-20260427");
     }
 
-    /// The `examples/triggers/vision-flow-3.toml` file ships as
-    /// the documented Phase 15.2 reference config. If it stops
-    /// parsing — e.g. because someone renamed a field or
-    /// changed the condition DSL — users copy-pasting it would
-    /// hit a config-load error at nestty startup. Pin it.
+    /// Pin `examples/triggers/vision-flow-3.toml` so a renamed field or
+    /// DSL change can't silently break the shipped reference config.
     #[test]
-    fn phase_15_2_example_toml_parses_cleanly() {
-        // Path is relative to the workspace root; cargo runs
-        // tests with the per-crate dir as CWD, so step out.
+    fn vision_flow_3_example_toml_parses_cleanly() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -1970,10 +1715,9 @@ mod tests {
         );
     }
 
-    /// Ensures `git.worktree_add.failed` does NOT fire
-    /// claude.start. The chain only progresses on success.
+    /// `git.worktree_add.failed` must NOT fire claude.start.
     #[test]
-    fn phase_15_2_chain_halts_on_worktree_failure() {
+    fn worktree_add_chain_halts_on_failure() {
         use crate::event_bus::EventBus;
         use std::time::Duration;
 
