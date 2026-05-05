@@ -20,59 +20,32 @@ pub struct Config {
     /// Polling interval (default 300s — Jira Cloud rate-limits
     /// aggressively per-user). Range 60..=3600.
     pub poll_interval: Duration,
-    /// JQL `updated > -<n>h` window for the polling search. Default 24h —
-    /// large enough to cover an overnight off-machine but small enough
-    /// to keep response payloads bounded. Range 1..=720.
+    /// JQL `updated > -<n>h` window. Default 24h, range 1..=720.
     pub lookback_hours: u32,
     /// Optional `project in (X, Y)` allowlist. None = all projects
     /// the user has access to.
     pub projects: Option<Vec<String>>,
-    /// When true, walk the inline `fields.comment.comments[]` of
-    /// each polled ticket and emit `jira.comment_added` (plus
-    /// `jira.mention` if the body mentions the authenticated user)
-    /// for any comment whose `created` timestamp is strictly newer
-    /// than the per-ticket watermark. Default true; set false to
-    /// suppress comment-derived events entirely (no API cost
-    /// reduction since comments arrive inline in the search response,
-    /// but useful for users who want a status/assignee-only feed).
+    /// Default true; set `false` for a status/assignee-only feed (no API
+    /// cost reduction since comments arrive inline in the search response).
     pub fetch_comments: bool,
-    /// Set when env validation fails. Allows RPC to start (so the
-    /// supervisor handshake completes) while every Jira-touching
-    /// action returns `not_authenticated` upfront — a stale token
-    /// from a previous good run can't make `list_my_tickets`
-    /// succeed once and break confusingly on the next refresh.
+    /// Set on env-validation failure: RPC starts (so the supervisor
+    /// handshake completes) but every Jira-touching action returns
+    /// `not_authenticated` upfront. Without this gate a stale stored
+    /// token from a previous good run could make one call succeed
+    /// before the next refresh fails confusingly.
     pub fatal_error: Option<String>,
 }
 
 impl Config {
-    /// Read all settings from env. The credential env vars
-    /// (`NESTTY_JIRA_BASE_URL` / `_EMAIL` / `_API_TOKEN`) are
-    /// OPTIONAL: RPC mode falls back to the keyring-stored TokenSet
-    /// when env credentials are missing, so a one-time
-    /// `nestty-plugin-jira auth` is enough — subsequent restarts
-    /// don't need the env again. If env credentials ARE supplied
-    /// they take precedence (useful for testing against a different
-    /// Atlassian site without touching the store).
-    ///
-    /// `auth` subcommand explicitly checks the three credential
-    /// fields are present after calling this and exits with a
-    /// friendly message when they're missing. RPC mode just lets
-    /// `current_credentials` fall through to the store.
-    ///
-    /// A malformed value on a present env var IS still a hard error
-    /// (bad URL scheme, bad workspace label, malformed boolean) —
-    /// silently masking with stored defaults would hide a user
-    /// typo behind whatever the store last held.
+    /// Credential env vars (`NESTTY_JIRA_BASE_URL`/`_EMAIL`/`_API_TOKEN`)
+    /// are OPTIONAL — RPC mode falls back to the keyring-stored TokenSet,
+    /// so a one-time `auth` subcommand is enough. Env wins when set
+    /// (useful for testing against a different site). A malformed value
+    /// on a *present* env var IS still a hard error: silently falling
+    /// back to stored defaults would hide user typos.
     pub fn from_env() -> Result<Self, String> {
-        // All credential env vars are trimmed before further checks.
-        // A whitespace-only value (e.g. `export NESTTY_JIRA_EMAIL=" "`
-        // from a typo'd shell rc) MUST be treated as "not set" rather
-        // than as a complete env credential — otherwise it would
-        // shadow the store and `auth_status` would lie about the
-        // live state until the first 401. We trim and then check
-        // empty rather than leaving the raw value in place so the
-        // env_creds_empty() check captures both the truly-unset and
-        // whitespace-only cases uniformly.
+        // Trim before checking presence so a whitespace-only value (typo'd
+        // shell rc) is treated as "not set" rather than shadowing the store.
         let base_url_raw = std::env::var("NESTTY_JIRA_BASE_URL").unwrap_or_default();
         let base_url = base_url_raw.trim().trim_end_matches('/').to_string();
         if !base_url.is_empty() {
@@ -116,9 +89,7 @@ impl Config {
         })
     }
 
-    /// Used when env validation fails but RPC still needs to start so
-    /// the supervisor can register us. All Jira-touching actions return
-    /// `not_authenticated` until the env is fixed.
+    /// Builds a Config in fatal-error state (see `fatal_error` field).
     pub fn minimal_with_error(err: String) -> Self {
         Self {
             base_url: String::new(),
@@ -141,24 +112,13 @@ impl Config {
     }
 }
 
-/// Restrict `base_url` to the Atlassian Cloud host shape
-/// `https://<subdomain>.atlassian.net[/]`. The plugin sends an
-/// HTTP Basic header carrying the user's API token to whatever host
-/// is in `base_url`; without this restriction a typo like
-/// `https://atlassian.net.evil.example` would POST the token to an
-/// attacker. We document Atlassian Cloud-only support, so the
-/// validator enforces it.
-///
-/// Self-hosted Jira Server / Data Center (`https://jira.company.com`)
-/// is intentionally rejected here — they require different auth (PAT
-/// or session cookies, not the Basic-auth API token), and silently
-/// running with Cloud's auth shape against a Server install would
-/// fail in confusing ways. Add a `Server` adapter when there's
-/// concrete demand.
-///
-/// Public so `current_credentials` (in main.rs) can apply the SAME
-/// gate to stored base_urls — a hand-edited keyring/plaintext entry
-/// must not be able to bypass the env-time host restriction.
+/// Restricts `base_url` to `https://<subdomain>.atlassian.net[/]` shape.
+/// Trust-boundary defense: a typo like `https://atlassian.net.evil.example`
+/// would POST the API token to an attacker. Self-hosted Server / Data
+/// Center is rejected because it needs different auth (PAT/cookies, not
+/// Basic) — running Cloud's auth shape there would fail confusingly.
+/// Public so `current_credentials` can apply the same gate to stored
+/// base_urls (hand-edited keyring entries must not bypass env-time check).
 pub fn validate_base_url(s: &str) -> Result<(), String> {
     if s.is_empty() {
         return Err("NESTTY_JIRA_BASE_URL: cannot be empty".to_string());
@@ -243,10 +203,8 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reject workspace labels that could break out of the plaintext-store
-/// directory or cause keyring entry collisions. Same charset as
-/// calendar/slack/discord — interpolated directly into the keyring
-/// entry name and the plaintext file path (`jira-token-<workspace>.json`).
+/// Trust-boundary: the label is interpolated into the keyring entry name
+/// and the plaintext file path. Same charset as calendar/slack/discord.
 fn validate_workspace_label(s: &str) -> Result<(), String> {
     if s.is_empty() {
         return Err("NESTTY_JIRA_WORKSPACE: cannot be empty".to_string());
@@ -279,11 +237,8 @@ fn parse_bool(var: &str, default: bool) -> Result<bool, String> {
     }
 }
 
-/// Parse an integer env var bounded inclusively by [min, max].
-/// Generic so the same helper serves both `u64` (poll seconds) and
-/// `u32` (lookback hours). Empty / unset → default; out-of-range or
-/// non-integer → hard error so a misconfigured shell rc doesn't
-/// silently degrade the poller (tight loop or near-empty window).
+/// Empty/unset → default; out-of-range or non-integer → hard error so a
+/// misconfigured shell rc doesn't silently degrade the poller.
 fn parse_bounded_int<T>(var: &str, default: T, min: T, max: T) -> Result<T, String>
 where
     T: std::str::FromStr + std::fmt::Display + PartialOrd + Copy,
@@ -306,13 +261,9 @@ where
     }
 }
 
-/// Parse a comma-separated project-key allowlist. Each key uses
-/// Jira's project-key shape — uppercase ASCII letters and digits, with
-/// the first character a letter (e.g. `PROJ`, `IOS2`). Anything else
-/// is rejected so a typo can't silently steer the polling JQL into
-/// returning everything (`project in ()` is a JQL syntax error, but
-/// a malformed key like `proj-456` would error obscurely at the API
-/// boundary).
+/// Comma-separated allowlist of Jira project keys (`[A-Z][A-Z0-9_]*`).
+/// Strict validation so a typo can't silently steer the polling JQL into
+/// returning everything or fail obscurely at the API boundary.
 fn parse_projects(raw: &str) -> Result<Option<Vec<String>>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
