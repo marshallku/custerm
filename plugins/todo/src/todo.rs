@@ -87,9 +87,8 @@ impl Priority {
 pub struct Todo {
     pub id: String,
     pub status: Status,
-    /// Wall-clock create time as RFC 3339; we store/round-trip the
-    /// raw string rather than `DateTime<Utc>` so a vim edit that
-    /// keeps the original timestamp byte-identical doesn't churn.
+    /// RFC 3339 string (not parsed) so a byte-identical vim edit
+    /// doesn't re-canonicalize the timestamp.
     pub created: String,
     pub workspace: String,
     pub title: String,
@@ -100,12 +99,9 @@ pub struct Todo {
     pub linked_slack: Vec<Value>,
     pub linked_kb: Vec<String>,
     pub tags: Vec<String>,
-    /// Optional explicit instruction for downstream agents (claude,
-    /// LLM completions). When set, takes precedence over the body
-    /// markdown as the per-Todo layer of the assembled prompt — body
-    /// stays a human-readable description while `prompt` is the
-    /// agent-facing imperative. When absent, prompt assembly falls
-    /// back to title + body.
+    /// Agent-facing instruction that takes precedence over `body` when
+    /// assembling the per-Todo prompt layer. `body` stays the
+    /// human-readable description; `prompt` is the imperative.
     pub prompt: Option<String>,
 }
 
@@ -164,14 +160,11 @@ impl Todo {
     }
 }
 
-/// Parse a markdown file with optional frontmatter into a Todo. The
-/// `id` is enforced from the file path (caller passes it) — the
-/// frontmatter `id` is informational only, since the file path is
-/// the canonical key (rename-safe). `workspace` follows the same
-/// rule. Files without frontmatter still parse: every field gets a
-/// safe default and the body is the entire content. The first H1
-/// (`# title`) inside the body becomes `title`; if absent, the
-/// first non-empty line; if also absent, the id.
+/// File path is the canonical key for `id` and `workspace` — frontmatter
+/// values for those are informational only (rename-safe). Files without
+/// frontmatter still parse, every field defaulting safely. Title comes
+/// from the first non-blank body line (`# ` prefix stripped if present),
+/// or the id when the body is empty.
 pub fn parse(content: &str, id: &str, workspace: &str) -> Todo {
     let (fm, body_str) = split_frontmatter(content);
     let fm = fm.unwrap_or_default();
@@ -259,15 +252,10 @@ pub fn parse(content: &str, id: &str, workspace: &str) -> Todo {
     }
 }
 
-/// Render a Todo back to file contents. Every field that was set
-/// becomes a frontmatter line; arrays use the inline `[a, b]`
-/// short form when scalar, the block form (`linked_slack:\n  - {...}`)
-/// for object arrays. The trailing body is whatever the caller
-/// supplies. We DO NOT try to round-trip a previously-loaded file
-/// byte-identically — vim users own the file format. set_status
-/// preserves the original frontmatter ordering by keeping the
-/// pre-parsed text and only replacing the `status:` line; see
-/// `update_status_in_text`.
+/// Frontmatter uses inline `[a, b]` for scalar arrays, block form
+/// (`linked_slack:\n  - {...}`) for object arrays. Does NOT byte-stable
+/// round-trip a previously-loaded file — vim users own the file format.
+/// The status-preserving in-place rewrite path is `update_status_in_text`.
 pub fn render_new(todo: &Todo) -> String {
     let mut out = String::new();
     out.push_str("---\n");
@@ -334,12 +322,10 @@ pub fn render_new(todo: &Todo) -> String {
     out
 }
 
-/// In-place rewrite of the `status:` field in an existing file's
-/// raw text. Preserves all other frontmatter ordering, comments,
-/// and body bytes — the file as the user (or vim) last saved it.
-/// Returns `None` if the file has no frontmatter or no `status:`
-/// line, in which case the caller should fall back to a full
-/// `render_new` rebuild.
+/// Rewrites the `status:` line only, preserving every other byte
+/// (frontmatter ordering, comments, body) as the user last saved it.
+/// `None` when the file lacks a `---` fence or a `status:` line — caller
+/// falls back to `render_new`.
 pub fn update_status_in_text(content: &str, new_status: Status) -> Option<String> {
     let prefix_len = if content.starts_with("---\n") {
         4
@@ -389,19 +375,11 @@ pub fn update_status_in_text(content: &str, new_status: Status) -> Option<String
     Some(out)
 }
 
-/// Pull the title out of `body_str` and return the body markdown
-/// with that title line removed (plus the immediately-following
-/// blank line, if any). This is what makes `parse → render → parse`
-/// round-trip byte-stable for `Todo.body`: the field never carries
-/// the title, and `render_new` always re-prepends it.
-///
-/// Title resolution order:
-/// 1. First non-empty body line beginning with `# ` → its text.
-/// 2. First non-empty body line, otherwise.
-/// 3. Falls back to the file id when the body is empty.
-///
-/// The body returned is the slice with the chosen line removed.
-/// When the title falls back to the id, body is unchanged.
+/// Strips the title line so `parse → render → parse` is byte-stable for
+/// `Todo.body` — the field never carries the title and `render_new`
+/// re-prepends it. Title is the first non-blank line (`# ` prefix
+/// stripped if present); when the body is empty, falls back to the id
+/// and returns body unchanged.
 fn derive_title_and_body(body_str: &str, id: &str) -> (String, String) {
     // Walk the original `&str` so we can compute byte ranges and
     // splice the title line out cleanly.
@@ -442,11 +420,9 @@ fn derive_title_and_body(body_str: &str, id: &str) -> (String, String) {
     (id.to_string(), body_str.to_string())
 }
 
-/// Split content into (frontmatter map, body slice). Pulled into
-/// the todo module rather than reused from `nestty-plugin-kb` because
-/// crossing a plugin boundary for a 60-line parser isn't worth
-/// the build-graph entanglement, and todo's parse needs slightly
-/// different behavior (block-form arrays for `linked_kb`).
+/// Module-local rather than shared with `nestty-plugin-kb`: todo needs
+/// block-form arrays (`linked_kb`/`linked_slack`) that the kb parser
+/// doesn't support.
 fn split_frontmatter(content: &str) -> (Option<Map<String, Value>>, &str) {
     let prefix_len = if content.starts_with("---\n") {
         4
