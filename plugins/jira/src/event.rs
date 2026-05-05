@@ -26,43 +26,28 @@ pub struct Ticket {
     /// Direct browser-friendly URL: `<base>/browse/<key>`.
     pub url: String,
     pub updated: DateTime<Utc>,
-    /// The verbatim issue JSON. Carried through to event payloads so
-    /// triggers / `nestctl` can reach uncommonly-needed fields without
-    /// us having to model every Jira field.
+    /// Verbatim issue JSON. Carried into event payloads so triggers reach
+    /// rare fields without us modeling every Jira column.
     pub raw_json: Value,
 }
 
-/// One snapshot per ticket, kept by the poller across ticks.
-/// Diffing against the prior snapshot is what produces the four
-/// event kinds. We keep the raw `updated` string from Jira so dedup
-/// can use it as a stable per-update discriminator without
-/// round-tripping through chrono.
-///
-/// `last_comment_created_iso` is the high-water mark of comment
-/// `created` timestamps we've already emitted events for — a
-/// timestamp-based watermark rather than a count, because Jira's
-/// comment indices SHIFT when a comment is deleted. A count-based
-/// `startAt` would skip new comments after a deletion (the new
-/// comment now sits at offset N-1 instead of N, but `startAt=N`
-/// passes right over it). Watermark-based filtering is robust
-/// against arbitrary insertion/deletion patterns.
+/// Per-ticket snapshot kept by the poller; tick-to-tick diff produces the
+/// four event kinds. Comment dedup uses a timestamp watermark (not a count)
+/// because Jira's comment indices shift on delete — `startAt=N` after a
+/// deletion would skip past a new comment that filled the freed slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketSnapshot {
     pub updated_iso: String,
     pub status_name: String,
     pub assignee_account_id: Option<String>,
-    /// Latest `created` timestamp of any comment we've emitted
-    /// events for. None on first sight — first sight does NOT emit
-    /// historical comment events; it just records the high water
-    /// mark from the inline comments so the next tick has a baseline.
+    /// `None` on first sight — first sight does NOT emit historical comment
+    /// events; it just records a baseline so the next tick can diff.
     pub last_comment_created_iso: Option<String>,
 }
 
 impl Ticket {
-    /// Snapshot the non-comment fields. The poller fills in
-    /// `last_comment_created_iso` separately from
-    /// process_new_comments since it needs to walk the inline
-    /// comments to know the high water mark.
+    /// Non-comment fields only; the poller's `process_new_comments`
+    /// fills in `last_comment_created_iso` after walking inline comments.
     pub fn snapshot_without_comments(&self) -> TicketSnapshot {
         TicketSnapshot {
             updated_iso: self.updated.to_rfc3339(),
@@ -73,10 +58,7 @@ impl Ticket {
     }
 }
 
-/// Walk an issue's inline `fields.comment.comments[]` (returned by
-/// `*all` searches) and return the parsed comments in chronological
-/// order. Jira returns them oldest-first by default. Empty when
-/// `comment` field is absent or malformed.
+/// Inline comments from a `*all` issue payload, oldest-first.
 pub fn extract_inline_comments(raw: &Value) -> Vec<Comment> {
     let comments_arr = raw
         .get("fields")
@@ -88,12 +70,9 @@ pub fn extract_inline_comments(raw: &Value) -> Vec<Comment> {
         .unwrap_or_default()
 }
 
-/// Map a Jira `/search` or `/issue/<key>` response (a single issue)
-/// into our `Ticket` struct. `base_url` is needed to build the browser
-/// URL; the Jira API doesn't include a `/browse/<key>` link in the
-/// response. Returns `None` when essential fields are missing — a
-/// malformed issue should drop quietly rather than poison the whole
-/// tick.
+/// Map a single-issue payload to `Ticket`. `base_url` is needed because
+/// Jira's response has no `/browse/<key>` link. Returns `None` on missing
+/// essentials — malformed issues drop quietly rather than poison the tick.
 pub fn from_jira_json(raw: &Value, base_url: &str) -> Option<Ticket> {
     let key = raw.get("key").and_then(Value::as_str)?.to_string();
     let fields = raw.get("fields")?;
@@ -159,12 +138,9 @@ pub fn from_jira_json(raw: &Value, base_url: &str) -> Option<Ticket> {
     })
 }
 
-/// Parse a Jira timestamp string. Jira Cloud emits ISO 8601 with
-/// the `+0000`/`+0900` offset format (no colon between hours and
-/// minutes). `chrono::DateTime::parse_from_rfc3339` requires strict
-/// RFC 3339 (`+00:00`), so we use the more permissive `%Y-%m-%dT%H:%M:%S%.f%z`
-/// format which accepts both. Falls back to RFC 3339 in case Jira ever
-/// changes its mind.
+/// Jira Cloud emits ISO 8601 with `+0000`/`+0900` (no colon), which is
+/// not strict RFC 3339. The `%Y-%m-%dT%H:%M:%S%.f%z` format accepts both
+/// forms; we still fall back to RFC 3339 as a safety net.
 pub fn parse_jira_timestamp(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z") {
         return Some(dt.with_timezone(&Utc));
@@ -175,9 +151,6 @@ pub fn parse_jira_timestamp(s: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-/// Build the common envelope for every `jira.*` event (without
-/// per-kind extras). Triggers reach fields via `{event.key}`,
-/// `{event.summary}`, etc.
 pub fn to_payload_json(t: &Ticket) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("key".to_string(), json!(t.key));
@@ -218,12 +191,9 @@ pub fn to_payload_json(t: &Ticket) -> Map<String, Value> {
 //                ADF (Atlassian Document Format)
 // ============================================================
 
-/// Walk an ADF document tree and concatenate all `text` node values
-/// into a plain string. Paragraph boundaries become `\n\n`; line
-/// breaks (hardBreak nodes) become `\n`. Mention nodes contribute
-/// their `attrs.text` (which is `@DisplayName`). Other inline marks
-/// (bold/italic/etc.) are stripped — the goal is interpolation-ready
-/// text, not faithful rendering.
+/// ADF → plain text for trigger interpolation: paragraph → `\n\n`,
+/// hardBreak → `\n`, mention → `attrs.text` (`@DisplayName`); inline
+/// marks like bold/italic are stripped (not faithful rendering).
 pub fn adf_to_plain_text(adf: &Value) -> String {
     let mut out = String::new();
     walk_adf(adf, &mut out);
@@ -265,9 +235,8 @@ fn walk_adf(node: &Value, out: &mut String) {
     }
 }
 
-/// Walk an ADF tree looking for a `mention` node whose `attrs.id`
-/// matches the given account_id. Used to detect `jira.mention` events
-/// from `jira.comment_added` payloads.
+/// Detects a `mention` node whose `attrs.id` matches `account_id`
+/// (drives `jira.mention` synthesis from `jira.comment_added`).
 pub fn adf_contains_mention_of(adf: &Value, account_id: &str) -> bool {
     if !adf.is_object() {
         return false;
@@ -291,9 +260,6 @@ pub fn adf_contains_mention_of(adf: &Value, account_id: &str) -> bool {
     false
 }
 
-/// Parse a single comment from `/issue/<key>/comment`'s `comments[]`
-/// array into a flat shape suitable for interpolation. Returns None
-/// when essential fields are missing (id/body/created).
 pub fn parse_comment(c: &Value) -> Option<Comment> {
     let id = c.get("id").and_then(Value::as_str)?.to_string();
     let body_adf = c.get("body").cloned().unwrap_or(Value::Null);
