@@ -1,0 +1,114 @@
+# Example triggers driven by the Jira plugin.
+#
+# Drop relevant pieces of this file into your nestty config (or include
+# a `[[triggers]]` block in `~/.config/nestty/config.toml`) once the
+# Jira plugin is authenticated.
+#
+# The plugin emits four event kinds:
+#   - jira.ticket_assigned   — when a ticket is newly assigned to you
+#   - jira.status_changed    — status field changes (carries from/to)
+#   - jira.comment_added     — new comment posted on a watched/assigned ticket
+#   - jira.mention           — fires alongside comment_added when the
+#                              comment body @mentions you
+#
+# Common envelope fields on every event:
+#   key, summary, status, assignee_account_id, assignee_display,
+#   reporter_account_id, project_key, url, updated, event_json
+# (`event_json` is the verbatim Jira response — useful for reaching
+#  custom fields the envelope doesn't surface explicitly.)
+#
+# Per-kind extras:
+#   status_changed → from, to
+#   comment_added  → comment { id, body, body_adf, created,
+#                              author_account_id, author_display }
+#   mention        → comment (same shape as comment_added)
+#
+# ---------------------------------------------------------------------
+# 1. Ticket assigned → Todo created with linked_jira populated
+#    Composes with vision-flow-3: clicking Start on the new Todo
+#    runs git.worktree_add (with sanitize_jira: true → branch name
+#    `proj-456` from key `PROJ-456`) → claude.start with the
+#    layered prompt.
+# ---------------------------------------------------------------------
+[[triggers]]
+name = "jira-assigned-to-todo"
+action = "todo.create"
+params = { workspace = "default", title = "{event.key}: {event.summary}", body = """
+{event.summary}
+
+Reporter: {event.reporter_account_id}
+Status: {event.status}
+URL: {event.url}
+""", linked_jira = "{event.key}" }
+[triggers.when]
+event_kind = "jira.ticket_assigned"
+
+# ---------------------------------------------------------------------
+# 2. Mention in comment → KB raw-archive note
+#    The comment is captured verbatim under .raw/jira/ for later
+#    grep / LLM-summarize. Uses kb.ensure (create-once-only) so
+#    a Jira-side delivery retry doesn't duplicate the file.
+# ---------------------------------------------------------------------
+[[triggers]]
+name = "jira-mention-archive"
+action = "kb.ensure"
+params = { id = ".raw/jira/{event.key}-comment-{event.comment.id}.md", default_template = """\
+---
+ticket: {event.key}
+ticket_url: {event.url}
+comment_id: {event.comment.id}
+comment_url: {event.url}?focusedCommentId={event.comment.id}
+author: {event.comment.author_display}
+created: {event.comment.created}
+---
+
+# {event.key}: {event.summary}
+
+{event.comment.body}
+
+""" }
+[triggers.when]
+event_kind = "jira.mention"
+
+# ---------------------------------------------------------------------
+# 3. (Sketch) Status change to Done → Slack post in #releases
+#    Commented because it requires the slack plugin to be
+#    authenticated AND the user to know their workspace's channel id.
+# ---------------------------------------------------------------------
+# [[triggers]]
+# name = "jira-done-to-slack"
+# action = "slack.post_message"
+# params = { channel = "C0123ABC", text = "Shipped {event.key}: {event.summary} — {event.url}" }
+# condition = """event.to == "Done""""
+# [triggers.when]
+# event_kind = "jira.status_changed"
+
+# ---------------------------------------------------------------------
+# 4. (Sketch) Per-project condition narrowing
+#    The polling JQL already supports `NESTTY_JIRA_PROJECTS=APP,PROJ`
+#    for env-side narrowing, but a trigger-side condition lets one
+#    plugin instance drive multiple destinations per project.
+# ---------------------------------------------------------------------
+# [[triggers]]
+# name = "jira-app-only-todos"
+# action = "todo.create"
+# params = { workspace = "app-team", title = "{event.key}: {event.summary}", linked_jira = "{event.key}" }
+# condition = """event.project_key == "APP""""
+# [triggers.when]
+# event_kind = "jira.ticket_assigned"
+
+# ---------------------------------------------------------------------
+# Trigger language quick reference (Phase 10.2 / Phase 14)
+# ---------------------------------------------------------------------
+# `[triggers.when]`     — required positive match: `event_kind` glob
+#                          plus key=value payload equality.
+# `condition = "..."`   — optional boolean expression evaluated AFTER
+#                          `when` matches.
+#                          Operators: == != < <= > >= && || !
+#                          References: event.X.Y / context.X
+#                          Literals: "string", numbers, true/false/null
+# `[triggers.await]`    — optional Phase 14.2 correlation primitive
+#                          (event_kind + payload_match + timeout) for
+#                          chained ask-and-wait flows. Not used in the
+#                          examples above; see vision-flow-3.toml for
+#                          a worked example with discord.get_message.

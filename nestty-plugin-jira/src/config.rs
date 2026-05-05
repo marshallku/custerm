@@ -7,6 +7,8 @@
 //! id.atlassian.com/manage-profile/security/api-tokens and pastes
 //! it via env, then `nestty-plugin-jira auth` validates and persists.
 
+use std::time::Duration;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub base_url: String,
@@ -15,6 +17,25 @@ pub struct Config {
     pub workspace_label: String,
     pub require_secure_store: bool,
     pub plaintext_path: std::path::PathBuf,
+    /// Polling interval (default 300s — Jira Cloud rate-limits
+    /// aggressively per-user). Range 60..=3600.
+    pub poll_interval: Duration,
+    /// JQL `updated > -<n>h` window for the polling search. Default 24h —
+    /// large enough to cover an overnight off-machine but small enough
+    /// to keep response payloads bounded. Range 1..=720.
+    pub lookback_hours: u32,
+    /// Optional `project in (X, Y)` allowlist. None = all projects
+    /// the user has access to.
+    pub projects: Option<Vec<String>>,
+    /// When true, walk the inline `fields.comment.comments[]` of
+    /// each polled ticket and emit `jira.comment_added` (plus
+    /// `jira.mention` if the body mentions the authenticated user)
+    /// for any comment whose `created` timestamp is strictly newer
+    /// than the per-ticket watermark. Default true; set false to
+    /// suppress comment-derived events entirely (no API cost
+    /// reduction since comments arrive inline in the search response,
+    /// but useful for users who want a status/assignee-only feed).
+    pub fetch_comments: bool,
     /// Set when env validation fails. Allows RPC to start (so the
     /// supervisor handshake completes) while every Jira-touching
     /// action returns `not_authenticated` upfront — a stale token
@@ -72,6 +93,12 @@ impl Config {
         validate_workspace_label(&workspace_label)?;
 
         let require_secure_store = parse_bool("NESTTY_JIRA_REQUIRE_SECURE_STORE", false)?;
+
+        let poll_secs: u64 = parse_bounded_int("NESTTY_JIRA_POLL_SECS", 300, 60, 3600)?;
+        let lookback_hours: u32 = parse_bounded_int("NESTTY_JIRA_LOOKBACK_HOURS", 24, 1, 720)?;
+        let projects = parse_projects(&std::env::var("NESTTY_JIRA_PROJECTS").unwrap_or_default())?;
+        let fetch_comments = parse_bool("NESTTY_JIRA_FETCH_COMMENTS", true)?;
+
         let plaintext_path = default_plaintext_path(&workspace_label);
 
         Ok(Self {
@@ -81,6 +108,10 @@ impl Config {
             workspace_label,
             require_secure_store,
             plaintext_path,
+            poll_interval: Duration::from_secs(poll_secs),
+            lookback_hours,
+            projects,
+            fetch_comments,
             fatal_error: None,
         })
     }
@@ -96,6 +127,10 @@ impl Config {
             workspace_label: "default".to_string(),
             require_secure_store: false,
             plaintext_path: default_plaintext_path("default"),
+            poll_interval: Duration::from_secs(300),
+            lookback_hours: 24,
+            projects: None,
+            fetch_comments: true,
             fatal_error: Some(err),
         }
     }
@@ -242,6 +277,82 @@ fn parse_bool(var: &str, default: bool) -> Result<bool, String> {
         },
         Err(_) => Ok(default),
     }
+}
+
+/// Parse an integer env var bounded inclusively by [min, max].
+/// Generic so the same helper serves both `u64` (poll seconds) and
+/// `u32` (lookback hours). Empty / unset → default; out-of-range or
+/// non-integer → hard error so a misconfigured shell rc doesn't
+/// silently degrade the poller (tight loop or near-empty window).
+fn parse_bounded_int<T>(var: &str, default: T, min: T, max: T) -> Result<T, String>
+where
+    T: std::str::FromStr + std::fmt::Display + PartialOrd + Copy,
+{
+    match std::env::var(var) {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                return Ok(default);
+            }
+            let parsed: T = trimmed
+                .parse()
+                .map_err(|_| format!("{var}: invalid integer {trimmed:?}"))?;
+            if parsed < min || parsed > max {
+                return Err(format!("{var}: {parsed} out of range [{min}, {max}]"));
+            }
+            Ok(parsed)
+        }
+        Err(_) => Ok(default),
+    }
+}
+
+/// Parse a comma-separated project-key allowlist. Each key uses
+/// Jira's project-key shape — uppercase ASCII letters and digits, with
+/// the first character a letter (e.g. `PROJ`, `IOS2`). Anything else
+/// is rejected so a typo can't silently steer the polling JQL into
+/// returning everything (`project in ()` is a JQL syntax error, but
+/// a malformed key like `proj-456` would error obscurely at the API
+/// boundary).
+fn parse_projects(raw: &str) -> Result<Option<Vec<String>>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let key = part.trim();
+        if key.is_empty() {
+            continue;
+        }
+        validate_project_key(key)?;
+        out.push(key.to_string());
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(Some(out))
+}
+
+fn validate_project_key(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("NESTTY_JIRA_PROJECTS: empty project key".to_string());
+    }
+    let bytes = s.as_bytes();
+    if !bytes[0].is_ascii_uppercase() {
+        return Err(format!(
+            "NESTTY_JIRA_PROJECTS: project key {s:?} must start with an uppercase ASCII letter"
+        ));
+    }
+    for &b in bytes {
+        if !(b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
+            return Err(format!(
+                "NESTTY_JIRA_PROJECTS: project key {s:?} contains invalid character (allowed: A-Z, 0-9, _)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn default_plaintext_path(workspace: &str) -> std::path::PathBuf {
@@ -459,6 +570,69 @@ mod tests {
         assert!(c.email.is_empty(), "got {:?}", c.email);
         assert!(c.api_token.is_empty(), "got {:?}", c.api_token);
         assert!(c.env_creds_empty());
+    }
+
+    #[test]
+    fn parse_bounded_int_accepts_default_and_in_range() {
+        // SAFETY: tests run single-threaded for env mutation
+        unsafe { std::env::remove_var("TEST_JIRA_BI_OK") };
+        assert_eq!(
+            parse_bounded_int::<u64>("TEST_JIRA_BI_OK", 300, 60, 3600).unwrap(),
+            300
+        );
+        unsafe { std::env::set_var("TEST_JIRA_BI_OK", "120") };
+        assert_eq!(
+            parse_bounded_int::<u64>("TEST_JIRA_BI_OK", 300, 60, 3600).unwrap(),
+            120
+        );
+    }
+
+    #[test]
+    fn parse_bounded_int_rejects_out_of_range() {
+        // SAFETY: tests run single-threaded for env mutation
+        unsafe { std::env::set_var("TEST_JIRA_BI_LO", "30") };
+        assert!(parse_bounded_int::<u64>("TEST_JIRA_BI_LO", 300, 60, 3600).is_err());
+        unsafe { std::env::set_var("TEST_JIRA_BI_HI", "9999") };
+        assert!(parse_bounded_int::<u64>("TEST_JIRA_BI_HI", 300, 60, 3600).is_err());
+        unsafe { std::env::set_var("TEST_JIRA_BI_BAD", "abc") };
+        assert!(parse_bounded_int::<u64>("TEST_JIRA_BI_BAD", 300, 60, 3600).is_err());
+    }
+
+    #[test]
+    fn parse_projects_accepts_comma_list() {
+        let v = parse_projects("PROJ,APP,IOS2").unwrap().unwrap();
+        // Sorted + deduped on output.
+        assert_eq!(v, vec!["APP", "IOS2", "PROJ"]);
+    }
+
+    #[test]
+    fn parse_projects_dedupes_and_strips_whitespace() {
+        let v = parse_projects(" PROJ , PROJ , APP ").unwrap().unwrap();
+        assert_eq!(v, vec!["APP", "PROJ"]);
+    }
+
+    #[test]
+    fn parse_projects_empty_returns_none() {
+        assert!(parse_projects("").unwrap().is_none());
+        assert!(parse_projects("  ").unwrap().is_none());
+        assert!(parse_projects(" , , ").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_projects_rejects_invalid_keys() {
+        for bad in [
+            "proj",     // lowercase
+            "1PROJ",    // starts with digit
+            "PROJ-456", // hyphen
+            "PROJ.SUB", // dot
+            "PROJ A",   // space
+            "PROJ,abc", // mixed: second key invalid
+        ] {
+            assert!(
+                parse_projects(bad).is_err(),
+                "should reject project list {bad:?}"
+            );
+        }
     }
 
     #[test]

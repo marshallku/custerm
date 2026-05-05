@@ -27,7 +27,9 @@ compile_error!(
 );
 
 mod config;
+mod event;
 mod jira;
+mod poller;
 mod store;
 
 use std::io::{BufRead, BufReader, Write};
@@ -176,10 +178,22 @@ fn run_rpc() {
     });
 
     let initialized = Arc::new(AtomicBool::new(false));
-    // Keep this for slice 16.2 — when the poller spawns it'll read
-    // this flag to decide whether to start ticking. Today it's a
-    // no-op.
-    let _ = initialized.clone();
+
+    // Polling daemon runs in a background thread. It waits for the
+    // `initialized` notification before starting ticks and resolves
+    // credentials on every tick (so running `nestty-plugin-jira auth`
+    // while nestty is already up populates the store and the next
+    // tick picks it up — no plugin restart needed).
+    {
+        let cfg_for_poller = Arc::new(config.clone());
+        let store_for_poller = store.clone();
+        let event_tx = tx.clone();
+        let init_flag = initialized.clone();
+        thread::spawn(move || {
+            let p = poller::Poller::new(cfg_for_poller, store_for_poller, event_tx, init_flag);
+            p.run();
+        });
+    }
 
     let reader = BufReader::new(stdin.lock());
     for line in reader.lines() {
@@ -229,7 +243,14 @@ fn handle_frame(
                 id,
                 json!({
                     "service_version": env!("CARGO_PKG_VERSION"),
-                    "provides": ["jira.auth_status"],
+                    "provides": [
+                        "jira.auth_status",
+                        "jira.list_my_tickets",
+                        "jira.get_ticket",
+                        "jira.create_ticket",
+                        "jira.transition",
+                        "jira.add_comment",
+                    ],
                     "subscribes": [],
                 }),
             );
@@ -268,27 +289,297 @@ fn handle_frame(
 
 fn handle_action(
     name: &str,
-    _params: &Value,
+    params: &Value,
     config: &Config,
     store: &Arc<dyn TokenStore>,
 ) -> Result<Value, (String, String)> {
     if name == "jira.auth_status" {
         return Ok(auth_status_payload(config, store));
     }
-    Err((
-        "action_not_found".to_string(),
-        format!("jira plugin does not handle {name}"),
-    ))
+    // Recognize the action name BEFORE checking credentials so an
+    // unauthenticated call to a typo'd action surfaces as
+    // `action_not_found` (a stable diagnostic) rather than the
+    // state-dependent `not_authenticated` (which would change to
+    // action_not_found later once the user runs `auth`).
+    let known = matches!(
+        name,
+        "jira.list_my_tickets"
+            | "jira.get_ticket"
+            | "jira.create_ticket"
+            | "jira.transition"
+            | "jira.add_comment"
+    );
+    if !known {
+        return Err((
+            "action_not_found".to_string(),
+            format!("jira plugin does not handle {name}"),
+        ));
+    }
+    // All Jira-touching actions need credentials; short-circuit on
+    // fatal_error so a stale stored token can't make a single call
+    // succeed before breaking confusingly on the next refresh.
+    if config.fatal_error.is_some() {
+        return Err((
+            "not_authenticated".to_string(),
+            "jira plugin is in fatal-config state — see jira.auth_status".to_string(),
+        ));
+    }
+    let resolved = current_credentials(config, &**store).ok_or((
+        "not_authenticated".to_string(),
+        "no Jira credentials available — run `nestty-plugin-jira auth` or set env credentials"
+            .to_string(),
+    ))?;
+    let creds = jira::Creds {
+        base_url: &resolved.base_url,
+        email: &resolved.email,
+        api_token: &resolved.api_token,
+    };
+    match name {
+        "jira.list_my_tickets" => handle_list_my_tickets(creds, params),
+        "jira.get_ticket" => handle_get_ticket(creds, params),
+        "jira.create_ticket" => handle_create_ticket(creds, params),
+        "jira.transition" => handle_transition(creds, params),
+        "jira.add_comment" => handle_add_comment(creds, params),
+        // Unreachable — the `known` guard above already filtered.
+        other => Err((
+            "action_not_found".to_string(),
+            format!("jira plugin does not handle {other}"),
+        )),
+    }
+}
+
+/// Promote `jira::http_*`'s prefix-encoded error string to the
+/// action's `(code, message)` tuple. Mirrors slack/main.rs:442 in
+/// spirit but uses an EXPLICIT allowlist instead of "any bare
+/// snake_case prefix" — the looser rule would let internal error
+/// strings like `"json parse: ..."`, `"project key: ..."`,
+/// `"transition response missing id"` escape as ad-hoc codes
+/// (`"json"`, `"project"`, `"transition"`) and break the stable
+/// trigger-matchable contract. Anything unknown collapses to
+/// `io_error` with the full string preserved in `message`.
+fn map_jira_error(err: String) -> (String, String) {
+    /// Public error-code surface for jira.* actions. Triggers and
+    /// `nestctl call` clients can pattern-match on these. Adding a
+    /// new code is a documented contract change — keep this list
+    /// in sync with the `[I]` notes in roadmap.md Phase 16.2.
+    const KNOWN_CODES: &[&str] = &[
+        "unauthorized",
+        "forbidden",
+        "not_found",
+        "rate_limited",
+        "transition_not_available",
+        "invalid_params",
+        "io_error",
+    ];
+    // Split on whitespace, `(`, AND `:` so prefixes like
+    // `"unauthorized HTTP 401:"` and `"rate_limited (Retry-After:..."`
+    // both land as the bare keyword.
+    let bare = err
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ':')
+        .next()
+        .unwrap_or("");
+    if KNOWN_CODES.contains(&bare) {
+        (bare.to_string(), err)
+    } else {
+        ("io_error".to_string(), err)
+    }
+}
+
+fn handle_list_my_tickets(creds: jira::Creds, params: &Value) -> Result<Value, (String, String)> {
+    let status = optional_string(params, "status")?;
+    let project = optional_string(params, "project")?;
+    let updated_since = optional_string(params, "updated_since")?;
+
+    if let Some(p) = &project {
+        jira::validate_project_key(p).map_err(|e| ("invalid_params".to_string(), e))?;
+    }
+    let mut clauses = vec!["assignee = currentUser()".to_string()];
+    if let Some(s) = &status {
+        // Status names can have spaces; quote them.
+        clauses.push(format!("status = \"{}\"", jql_escape(s)));
+    }
+    if let Some(p) = &project {
+        clauses.push(format!("project = {p}"));
+    }
+    if let Some(since) = &updated_since {
+        // `since` should look like `-2d` / `-1w` / `2026-01-01` —
+        // pass through as-is, JQL will validate.
+        clauses.push(format!("updated > \"{}\"", jql_escape(since)));
+    }
+    let jql = format!("{} ORDER BY updated DESC", clauses.join(" AND "));
+
+    // Paginate up to MAX_PAGES so a chatty workspace doesn't truncate
+    // silently. Action surface returns the union of pages with an
+    // explicit `truncated` flag so callers (triggers, nestctl, future
+    // panel UIs) can detect partial results and surface a user-visible
+    // warning rather than silently acting on an arbitrary prefix of
+    // the result set. The new `/search/jql` endpoint dropped `total`
+    // from responses (cursor-based pagination doesn't need it), so
+    // we no longer report a total count — only `truncated` matters.
+    const MAX_PAGES: u64 = 10;
+    let fields = [
+        "summary", "status", "assignee", "reporter", "project", "updated",
+    ];
+    let mut tickets = Vec::new();
+    let mut next_page_token: Option<String> = None;
+    let mut truncated = false;
+    for page in 0..MAX_PAGES {
+        let resp = jira::search(creds, &jql, next_page_token.as_deref(), 100, &fields)
+            .map_err(map_jira_error)?;
+        for issue in &resp.issues {
+            if let Some(t) = event::from_jira_json(issue, creds.base_url) {
+                tickets.push(serde_json::Value::Object(event::to_payload_json(&t)));
+            }
+        }
+        match resp.next_page_token {
+            Some(tok) => next_page_token = Some(tok),
+            None => break,
+        }
+        if page + 1 == MAX_PAGES {
+            truncated = true;
+        }
+    }
+    Ok(json!({
+        "tickets": tickets,
+        "truncated": truncated,
+    }))
+}
+
+fn handle_get_ticket(creds: jira::Creds, params: &Value) -> Result<Value, (String, String)> {
+    let key = required_string(params, "key")?;
+    jira::validate_issue_key(&key).map_err(|e| ("invalid_params".to_string(), e))?;
+    // Returns the verbatim Jira response (per the docs contract:
+    // "returns full ticket json"). Triggers / nestctl callers who
+    // want the trigger envelope shape can use list_my_tickets which
+    // returns the envelope form. This split lets `get_ticket`
+    // surface fields like custom field values, `changelog`, full
+    // `comment` arrays, etc. that the envelope flattens away.
+    jira::get_issue(creds, &key).map_err(map_jira_error)
+}
+
+fn handle_create_ticket(creds: jira::Creds, params: &Value) -> Result<Value, (String, String)> {
+    let project = required_string(params, "project")?;
+    let summary = required_string(params, "summary")?;
+    let description = optional_string(params, "description")?;
+    let assignee = optional_string(params, "assignee")?;
+    let parent = optional_string(params, "parent")?;
+    let issue_type = optional_string(params, "issue_type")?;
+    // Validate at handler level so a bad project key surfaces as
+    // `invalid_params` (the public action contract) rather than the
+    // io_error fallback that map_jira_error would assign to the
+    // bubble-up from create_issue's internal validation.
+    jira::validate_project_key(&project).map_err(|e| ("invalid_params".to_string(), e))?;
+    if let Some(p) = &parent {
+        jira::validate_issue_key(p).map_err(|e| ("invalid_params".to_string(), e))?;
+    }
+    let resp = jira::create_issue(
+        creds,
+        &project,
+        &summary,
+        description.as_deref(),
+        assignee.as_deref(),
+        parent.as_deref(),
+        issue_type.as_deref(),
+    )
+    .map_err(map_jira_error)?;
+    let key = resp
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or((
+            "io_error".to_string(),
+            "create response missing key".to_string(),
+        ))?
+        .to_string();
+    let url = format!("{}/browse/{}", creds.base_url.trim_end_matches('/'), key);
+    Ok(json!({ "key": key, "url": url }))
+}
+
+fn handle_transition(creds: jira::Creds, params: &Value) -> Result<Value, (String, String)> {
+    let key = required_string(params, "key")?;
+    let status = required_string(params, "status")?;
+    jira::validate_issue_key(&key).map_err(|e| ("invalid_params".to_string(), e))?;
+    let (from, to) = jira::transition(creds, &key, &status).map_err(map_jira_error)?;
+    Ok(json!({ "key": key, "from_status": from, "to_status": to }))
+}
+
+fn handle_add_comment(creds: jira::Creds, params: &Value) -> Result<Value, (String, String)> {
+    let key = required_string(params, "key")?;
+    let body = required_string(params, "body")?;
+    jira::validate_issue_key(&key).map_err(|e| ("invalid_params".to_string(), e))?;
+    let comment_id = jira::add_comment(creds, &key, &body).map_err(map_jira_error)?;
+    Ok(json!({ "comment_id": comment_id }))
+}
+
+fn required_string(params: &Value, name: &str) -> Result<String, (String, String)> {
+    params
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or((
+            "invalid_params".to_string(),
+            format!("missing required string param {name:?}"),
+        ))
+        .and_then(|s| {
+            if s.trim().is_empty() {
+                Err((
+                    "invalid_params".to_string(),
+                    format!("required param {name:?} must not be empty"),
+                ))
+            } else {
+                Ok(s)
+            }
+        })
+}
+
+fn optional_string(params: &Value, name: &str) -> Result<Option<String>, (String, String)> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            if s.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(s.clone()))
+            }
+        }
+        Some(_) => Err((
+            "invalid_params".to_string(),
+            format!("param {name:?} must be a string or null"),
+        )),
+    }
+}
+
+/// JQL string-literal escape: backslash and double-quote. JQL allows
+/// embedded `"` inside a quoted string only when escaped as `\"`,
+/// and `\` becomes `\\`. Other characters pass through verbatim
+/// (JQL doesn't care about newlines / control chars in literals).
+fn jql_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Resolved credentials with their source label, mirroring
 /// slack::current_credentials. Returned as `None` when neither env
 /// nor store has a usable set.
+///
+/// `account_id_hint` carries the stored TokenSet's account_id when
+/// (and ONLY when) source=="store" — captured atomically with the
+/// other credential fields. The poller uses this for its
+/// my_account_id resolution so that hot re-auth between
+/// `current_credentials()` and a follow-up `store.load()` can't
+/// produce a credentials/account_id mismatch.
 pub struct ResolvedCreds {
     pub source: &'static str,
     pub base_url: String,
     pub email: String,
     pub api_token: String,
+    pub account_id_hint: Option<String>,
 }
 
 pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<ResolvedCreds> {
@@ -298,6 +589,10 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
             base_url: config.base_url.clone(),
             email: config.email.clone(),
             api_token: config.api_token.clone(),
+            // env-supplied creds haven't been validated by /myself
+            // (the `auth` subcommand path is what records account_id);
+            // poller will resolve via /myself on first tick.
+            account_id_hint: None,
         });
     }
     let t = store.load()?;
@@ -331,11 +626,17 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
         );
         return None;
     }
+    let account_id_hint = if t.account_id.is_empty() {
+        None
+    } else {
+        Some(t.account_id.clone())
+    };
     Some(ResolvedCreds {
         source: "store",
         base_url: t.base_url,
         email: t.email,
         api_token: t.api_token,
+        account_id_hint,
     })
 }
 
@@ -467,6 +768,10 @@ mod tests {
             workspace_label: "default".into(),
             require_secure_store: false,
             plaintext_path: std::path::PathBuf::from("/tmp/x"),
+            poll_interval: std::time::Duration::from_secs(300),
+            lookback_hours: 24,
+            projects: None,
+            fetch_comments: true,
             fatal_error: None,
         }
     }
@@ -581,6 +886,111 @@ mod tests {
         cfg.api_token = String::new();
         cfg.base_url = String::new();
         assert!(current_credentials(&cfg, &*store).is_none());
+    }
+
+    #[test]
+    fn required_string_rejects_missing_or_empty() {
+        let p = json!({});
+        assert_eq!(required_string(&p, "x").unwrap_err().0, "invalid_params");
+        let p = json!({ "x": "" });
+        assert_eq!(required_string(&p, "x").unwrap_err().0, "invalid_params");
+        let p = json!({ "x": "   " });
+        assert_eq!(required_string(&p, "x").unwrap_err().0, "invalid_params");
+        let p = json!({ "x": 42 });
+        assert_eq!(required_string(&p, "x").unwrap_err().0, "invalid_params");
+        let p = json!({ "x": "value" });
+        assert_eq!(required_string(&p, "x").unwrap(), "value");
+    }
+
+    #[test]
+    fn optional_string_treats_null_and_empty_as_none() {
+        let p = json!({});
+        assert!(optional_string(&p, "x").unwrap().is_none());
+        let p = json!({ "x": null });
+        assert!(optional_string(&p, "x").unwrap().is_none());
+        let p = json!({ "x": "" });
+        assert!(optional_string(&p, "x").unwrap().is_none());
+        let p = json!({ "x": "  " });
+        assert!(optional_string(&p, "x").unwrap().is_none());
+        let p = json!({ "x": "value" });
+        assert_eq!(optional_string(&p, "x").unwrap().as_deref(), Some("value"));
+        let p = json!({ "x": 42 });
+        assert_eq!(optional_string(&p, "x").unwrap_err().0, "invalid_params");
+    }
+
+    #[test]
+    fn jql_escape_backslash_and_quote() {
+        assert_eq!(jql_escape("plain"), "plain");
+        assert_eq!(jql_escape("a\"b"), "a\\\"b");
+        assert_eq!(jql_escape("a\\b"), "a\\\\b");
+        assert_eq!(jql_escape("\"both\\\""), "\\\"both\\\\\\\"");
+    }
+
+    #[test]
+    fn map_jira_error_promotes_known_codes_only() {
+        // Known codes ride through verbatim.
+        let (code, msg) = map_jira_error("unauthorized HTTP 401: bad creds".into());
+        assert_eq!(code, "unauthorized");
+        assert!(msg.contains("HTTP 401"));
+        let (code, _) = map_jira_error("forbidden HTTP 403: x".into());
+        assert_eq!(code, "forbidden");
+        let (code, _) = map_jira_error("not_found HTTP 404: x".into());
+        assert_eq!(code, "not_found");
+        let (code, _) = map_jira_error("rate_limited (Retry-After: 30)".into());
+        assert_eq!(code, "rate_limited");
+        let (code, _) = map_jira_error("transition_not_available no transition".into());
+        assert_eq!(code, "transition_not_available");
+        let (code, _) = map_jira_error("io_error Jira HTTP 503: gateway timeout".into());
+        assert_eq!(code, "io_error");
+        // Unknown bare-snake prefixes (internal validation error
+        // bubble-ups) MUST collapse to io_error rather than leaking
+        // ad-hoc codes that triggers can't reliably match against.
+        for unknown in [
+            "json parse: bad shape",
+            "project key: cannot be empty",
+            "create response missing key",
+            "transition response missing id",
+            "transport: connection refused",
+            "issue key PROJ-1: invalid",
+        ] {
+            let (code, msg) = map_jira_error(unknown.to_string());
+            assert_eq!(
+                code, "io_error",
+                "input {unknown:?} should collapse to io_error"
+            );
+            assert!(msg.contains(unknown.split_once(' ').map(|(p, _)| p).unwrap_or(unknown)));
+        }
+    }
+
+    #[test]
+    fn handle_action_create_validates_required_params() {
+        let store: Arc<dyn TokenStore> = Arc::new(EmptyStore);
+        let cfg = good_config();
+        // Missing project + summary.
+        let err = handle_action("jira.create_ticket", &json!({}), &cfg, &store).unwrap_err();
+        assert_eq!(err.0, "invalid_params");
+    }
+
+    #[test]
+    fn handle_action_get_ticket_validates_key_shape() {
+        let store: Arc<dyn TokenStore> = Arc::new(EmptyStore);
+        let cfg = good_config();
+        let err = handle_action(
+            "jira.get_ticket",
+            &json!({"key": "PROJ/../foo"}),
+            &cfg,
+            &store,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, "invalid_params");
+    }
+
+    #[test]
+    fn handle_action_short_circuits_on_fatal_error() {
+        let store: Arc<dyn TokenStore> = Arc::new(EmptyStore);
+        let cfg = Config::minimal_with_error("missing X".into());
+        let err = handle_action("jira.list_my_tickets", &json!({}), &cfg, &store).unwrap_err();
+        assert_eq!(err.0, "not_authenticated");
     }
 
     #[test]

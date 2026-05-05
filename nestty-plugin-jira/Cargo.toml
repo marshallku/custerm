@@ -3,7 +3,7 @@ name = "nestty-plugin-jira"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "First-party Jira (Atlassian Cloud) service plugin for nestty (slice 16.1: auth subcommand + jira.auth_status). Slice 16.2 will add the polling loop and 5 jira.* read/write actions."
+description = "First-party Jira (Atlassian Cloud) service plugin for nestty — polls assigned/watched tickets and emits jira.ticket_assigned/status_changed/comment_added/mention; provides jira.list_my_tickets/get_ticket/create_ticket/transition/add_comment actions plus jira.auth_status."
 repository.workspace = true
 
 [[bin]]
@@ -18,6 +18,11 @@ keyring = { version = "3", default-features = false, features = [
     "apple-native",
     "sync-secret-service",
     "crypto-rust",
+] }
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+    "serde",
+    "std",
 ] }
 
 [dev-dependencies]

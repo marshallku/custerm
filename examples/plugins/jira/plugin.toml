@@ -2,22 +2,25 @@
 name = "jira"
 title = "Jira (Atlassian Cloud)"
 version = "0.1.0"
-description = "Atlassian Cloud Jira plugin (slice 16.1: auth subcommand + jira.auth_status only). Slice 16.2 will add a polling loop emitting jira.ticket_assigned/status_changed/comment_added/mention plus 5 read/write actions."
+description = "Polls Jira Cloud for assigned-to-me / watched tickets, emits jira.ticket_assigned/status_changed/comment_added/mention events, and provides jira.list_my_tickets/get_ticket/create_ticket/transition/add_comment + auth_status actions."
 
 [[services]]
 name = "main"
 exec = "nestty-plugin-jira"
-# onStartup: the polling daemon (slice 16.2) must be alive whenever
-# nestty is running so it can publish ticket-assigned and
-# status-change events on schedule. Lazy activation
-# (onAction:jira.*) would only spawn on the first explicit query —
-# too late for "ticket got assigned to me, create a Todo for it".
-# Slice 16.1 only ships auth_status, but onStartup keeps the
-# manifest stable across slices.
+# onStartup: the polling daemon must be alive whenever nestty is
+# running so it can publish ticket-assigned events on schedule.
+# Lazy activation (onAction:jira.*) would only spawn on the first
+# explicit query — too late for "ticket got assigned to me, create
+# a Todo for it".
 activation = "onStartup"
 restart = "on-crash"
 provides = [
     "jira.auth_status",
+    "jira.list_my_tickets",
+    "jira.get_ticket",
+    "jira.create_ticket",
+    "jira.transition",
+    "jira.add_comment",
 ]
 subscribes = []
 # Setup (one-time):
@@ -29,14 +32,21 @@ subscribes = []
 #   3. Run `nestty-plugin-jira auth` once to validate + persist to keyring
 #   4. Restart nestty (the supervisor only loads service handles at startup)
 #
-# Required env (for `auth`; optional for RPC mode if creds in store):
+# After step 4, env vars become OPTIONAL — the plugin reads from the
+# keyring on subsequent startups. You can drop the env exports from
+# your shell rc once auth has succeeded.
+#
+# Required env (for `auth`; optional for RPC mode once creds are stored):
 #   NESTTY_JIRA_BASE_URL    — https://<workspace>.atlassian.net (no trailing slash)
 #   NESTTY_JIRA_EMAIL       — your Atlassian account email
 #   NESTTY_JIRA_API_TOKEN   — generated at id.atlassian.com
 #
-# Optional env:
-#   NESTTY_JIRA_WORKSPACE              (default "default")  — keyring/plaintext namespace label
+# Optional env (RPC mode):
+#   NESTTY_JIRA_WORKSPACE              (default "default")  — keyring/plaintext namespace
 #   NESTTY_JIRA_REQUIRE_SECURE_STORE   (default false)      — refuse plaintext fallback
+#   NESTTY_JIRA_POLL_SECS              (default 300)        — polling cadence (60..=3600)
+#   NESTTY_JIRA_LOOKBACK_HOURS         (default 24)         — JQL `updated > -<n>h` window (1..=720)
+#   NESTTY_JIRA_PROJECTS               (none)               — comma-separated key allowlist (e.g. PROJ,APP)
+#   NESTTY_JIRA_FETCH_COMMENTS         (default true)       — set false to suppress jira.comment_added/mention events entirely (no API cost change since comments arrive inline in the search response)
 #
-# Slice 16.2 will add polling controls (poll interval, lookback hours,
-# project allowlist, fetch-comments toggle) — manifest stays unchanged.
+# See triggers.example.toml for ready-to-copy [[triggers]] entries.
