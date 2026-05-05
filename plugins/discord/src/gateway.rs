@@ -57,21 +57,15 @@ use crate::events::{DiscordEvent, from_dispatch};
 use crate::store::TokenStore;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
-/// Gateway intents bitfield (37376 + 8192 + 1024 = 46592 = 0xB600):
-///   GUILD_MESSAGES (1<<9) | GUILD_MESSAGE_REACTIONS (1<<10) |
-///   DIRECT_MESSAGES (1<<12) | DIRECT_MESSAGE_REACTIONS (1<<13) |
-///   MESSAGE_CONTENT (1<<15).
-///
-/// Privileged MESSAGE_CONTENT (1<<15) must be toggled on at
-/// <https://discord.com/developers/applications> → the application's
-/// Bot tab. Without it, message `content` arrives empty for messages
-/// that don't directly mention the bot, and keyword/payload triggers
-/// can't match. The reaction intents are NON-privileged but must
-/// still be in the bitfield or MESSAGE_REACTION_ADD never dispatches.
+/// `GUILD_MESSAGES | GUILD_MESSAGE_REACTIONS | DIRECT_MESSAGES |
+/// DIRECT_MESSAGE_REACTIONS | MESSAGE_CONTENT`. The privileged
+/// `MESSAGE_CONTENT` bit needs Developer Portal → Bot tab opt-in;
+/// without it `content` arrives empty for non-mentions and keyword
+/// triggers can't match. Reaction bits are non-privileged but must
+/// still be in the field or `MESSAGE_REACTION_ADD` never dispatches.
 const GATEWAY_INTENTS: u64 = (1 << 9) | (1 << 10) | (1 << 12) | (1 << 13) | (1 << 15);
-/// Wait period when no credentials are available — same posture as
-/// the Slack plugin so a `nestty-plugin-discord auth` invocation while
-/// the plugin is already running gets picked up without restart.
+/// Recheck cadence when no credentials — fresh `auth` is picked up
+/// without supervisor restart (slack-plugin parallel).
 const NO_CREDS_RECHECK: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -80,10 +74,8 @@ pub struct ResolvedCredentials {
     pub source: &'static str, // "env" | "store"
 }
 
-/// Resolve a bot token from env first (so test overrides win) or fall
-/// back to the keyring/plaintext store. Mirrors Slack's
-/// `current_credentials`. Discord uses a single token rather than a
-/// pair, so there's no cross-source-mixing pitfall to guard against.
+/// Env wins (test overrides), store falls back. Discord uses a single
+/// token so there's no cross-source-mixing pitfall (cf. Slack pair).
 pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<ResolvedCredentials> {
     if let Some(t) = &config.bot_token_env
         && !t.is_empty()
@@ -108,10 +100,8 @@ struct GatewaySession {
     bot_user_id: Option<String>,
     session_id: Option<String>,
     seq: Option<i64>,
-    /// Per-session WSS URL for RESUME. Discord may direct us to a
-    /// region-specific gateway (`gateway-us-east1-d.discord.gg`) —
-    /// using the wrong host on RESUME causes the server to bounce us
-    /// with INVALID_SESSION.
+    /// Discord may issue a region-specific gateway URL; resuming on the
+    /// wrong host bounces with INVALID_SESSION.
     resume_gateway_url: Option<String>,
 }
 
@@ -502,10 +492,9 @@ fn send_heartbeat(
         .map_err(|e| format!("send heartbeat: {e}"))
 }
 
-/// Set the underlying TcpStream's read timeout. Walks through the
-/// TLS wrapper if present. Without this the read loop blocks until a
-/// frame arrives, which would starve heartbeat scheduling on a quiet
-/// channel and trip Discord's 4009 (session timeout).
+/// Walks through the TLS wrapper. Without a read timeout the loop
+/// would block until a frame arrives, starving heartbeat scheduling
+/// on a quiet channel and tripping Discord's 4009 (session timeout).
 fn set_read_timeout(
     ws: &mut tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>,
     timeout: Duration,
@@ -520,11 +509,8 @@ fn set_read_timeout(
     }
 }
 
-/// Try to read one text frame within `total` total time. Used only
-/// for the initial HELLO read where we want a bounded wait without
-/// committing to the long-term heartbeat-driven schedule yet.
-/// Returns None on timeout, Some(Ok(text)) on a text frame, or
-/// Some(Err(...)) on any IO/parse-level error.
+/// Bounded one-shot text-frame read for the initial HELLO. `None` on
+/// timeout, `Some(Ok)` on a text frame, `Some(Err)` on IO/parse errors.
 fn read_text_with_timeout(
     ws: &mut tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>,
     total: Duration,
@@ -544,11 +530,9 @@ fn read_text_with_timeout(
     }
 }
 
-/// Append `?v=10&encoding=json` to the resume URL if missing.
-/// Discord's `resume_gateway_url` returns the host without query
-/// parameters; the version/encoding suffix is what makes the
-/// connection actually parse JSON instead of falling back to
-/// whatever the server defaults to (which has changed over time).
+/// `resume_gateway_url` arrives without query params; the
+/// `v=10&encoding=json` suffix pins the wire format (server defaults
+/// have changed over time).
 fn ensure_query(url: &str) -> String {
     if url.contains("v=") {
         url.to_string()
@@ -559,11 +543,9 @@ fn ensure_query(url: &str) -> String {
     }
 }
 
-/// `GET /gateway/bot` — returns the bootstrap WSS URL with version
-/// suffix. Requires the bot token (Discord uses `/gateway` as a
-/// public endpoint but `/gateway/bot` returns session-start-limit
-/// info that surfaces over-quota IDENTIFYs early; surfacing those at
-/// connect time beats hitting them mid-loop.
+/// Authenticated `/gateway/bot` (vs public `/gateway`) so over-quota
+/// IDENTIFYs surface at connect time via session-start-limit instead
+/// of mid-loop.
 fn bootstrap_url(token: &str) -> Result<String, String> {
     let resp = ureq::get(&format!("{DISCORD_API_BASE}/gateway/bot"))
         .set("Authorization", &format!("Bot {token}"))
