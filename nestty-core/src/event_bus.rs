@@ -36,11 +36,9 @@ pub struct EventReceiver {
     inner: Receiver<Event>,
 }
 
-/// Outcome of a `recv_timeout` call. Consumers like
-/// `service_supervisor`'s subscribe-forwarder use this to break out
-/// of a blocking recv periodically without busy-spinning, so an
-/// explicit teardown (e.g. `handle_exit`) can stop the forwarder by
-/// flipping a shared stop flag.
+/// Lets consumers (e.g. the service supervisor's subscribe-forwarder)
+/// break out of a blocking recv periodically without busy-spinning, so
+/// an external stop flag can drive teardown.
 #[derive(Debug, Clone)]
 pub enum RecvOutcome {
     Event(Event),
@@ -57,11 +55,9 @@ impl EventReceiver {
         self.inner.recv().ok()
     }
 
-    /// Block up to `timeout` for the next event, returning explicit
-    /// outcomes for "no event yet", "got an event", and "the bus has
-    /// dropped this subscriber". Callers spinning on this can check
-    /// an external stop flag between calls without losing events
-    /// that arrived during the wait.
+    /// Distinguishes "got an event", "timed out", and "bus dropped this
+    /// subscriber" so callers can check an external stop flag between
+    /// waits without losing events that arrived during the wait.
     pub fn recv_timeout(&self, timeout: std::time::Duration) -> RecvOutcome {
         match self.inner.recv_timeout(timeout) {
             Ok(e) => RecvOutcome::Event(e),
@@ -137,9 +133,8 @@ impl EventBus {
         EventReceiver { inner: rx }
     }
 
-    /// Subscribe with an unbounded channel. Use this for external wire streams
-    /// (e.g. the socket `event.subscribe` projection) where event loss would
-    /// violate the client contract. The caller is responsible for draining.
+    /// Unbounded — for external wire streams (socket `event.subscribe`
+    /// projection) where loss violates the client contract. Caller drains.
     pub fn subscribe_unbounded(&self, pattern: impl Into<String>) -> EventReceiver {
         let (tx, rx) = channel();
         self.subscribers.lock().unwrap().push(Subscriber {
@@ -181,15 +176,10 @@ impl Default for EventBus {
     }
 }
 
-/// Glob-style matcher used by the bus for routing and shared with other
-/// modules (e.g. `trigger::Trigger`) so user-facing `event_kind` patterns
-/// have one and only one definition of "matches".
-///
-/// Rules:
-/// - `"*"` matches everything.
-/// - `"foo.*"` matches any kind that starts with `foo.` (deep — also matches
-///   `foo.bar.baz`). Does NOT match the bare prefix `foo` alone.
-/// - Otherwise, exact string equality.
+/// Single source of truth for `event_kind` matching (shared with
+/// `trigger::Trigger`). Rules: `*` matches everything; `foo.*` matches
+/// any deeper kind starting with `foo.` (`foo.bar.baz` matches; bare
+/// `foo` does not); otherwise exact equality.
 pub fn pattern_matches(pattern: &str, kind: &str) -> bool {
     if pattern == "*" {
         return true;
