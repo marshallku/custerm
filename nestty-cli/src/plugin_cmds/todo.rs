@@ -101,9 +101,8 @@ pub enum TodoCommand {
         /// New status: open | in_progress | done | blocked
         #[arg(long)]
         status: String,
-        /// Scope id resolution to this workspace (disambiguates ids that
-        /// exist in multiple workspaces — todo ids are workspace-scoped,
-        /// not globally unique)
+        /// Scope id resolution to this workspace (todo ids are
+        /// workspace-scoped, not globally unique)
         #[arg(long)]
         workspace: Option<String>,
     },
@@ -158,9 +157,7 @@ pub enum TodoCommand {
     },
 }
 
-/// Top-level dispatch. Performs id-prefix resolution where needed,
-/// calls the action via the socket, and renders. Returns process
-/// exit code so `main.rs` can propagate it.
+/// Returns process exit code for `main.rs` to propagate.
 pub fn dispatch(cmd: &TodoCommand, socket_path: &str, json_out: bool) -> i32 {
     match cmd {
         TodoCommand::Create {
@@ -284,21 +281,13 @@ pub fn dispatch(cmd: &TodoCommand, socket_path: &str, json_out: bool) -> i32 {
     }
 }
 
-/// `nestctl todo show <id>` — full Todo + linked-entity expansion.
-///
-/// Composes existing actions, no new plugin work:
-/// 1. Resolve id via the same preflight `todo.list` used by set/start/delete.
-/// 2. For each `linked_kb` entry: call `kb.read {id}` (best-effort,
-///    swallow per-entry errors). First few lines rendered as a
-///    preview in human mode; `--json` returns full content.
-/// 3. `linked_jira` would fan out to `jira.get_ticket` once Phase 16
-///    ships; until then we render the keys verbatim.
-/// 4. `linked_slack` permalinks rendered as-is — no fan-out (no
-///    cheap "read message body" action that doesn't burn rate
-///    limit; user can click the permalink).
-/// 5. Timeline (todo.changed / todo.completed / todo.start_requested
-///    history) waits on Phase 19.2c's `event.history` ring buffer —
-///    until then there's no socket-callable history surface.
+/// `todo show` — fan out from one resolved id:
+/// - `linked_kb[]` → `kb.read` per entry (best-effort; per-entry errors
+///   are swallowed and aggregated). Preview in human mode, full content
+///   under `--json`.
+/// - `linked_jira` rendered as keys (no `jira.get_ticket` fan-out yet).
+/// - `linked_slack` rendered as permalinks (no cheap body-fetch).
+/// - Timeline omitted — there's no socket-callable history surface yet.
 fn show(
     socket_path: &str,
     id_or_prefix: &str,
@@ -367,9 +356,6 @@ fn show(
     0
 }
 
-/// Pull the full todo object from `todo.list` (workspace-filtered)
-/// by id. Returns the Value for the matching entry, or an error
-/// exit code after printing a diagnostic.
 fn find_todo(socket_path: &str, id: &str, workspace: &str) -> Result<Value, i32> {
     let resp =
         match client::send_command(socket_path, "todo.list", json!({ "workspace": workspace })) {
@@ -399,10 +385,8 @@ fn find_todo(socket_path: &str, id: &str, workspace: &str) -> Result<Value, i32>
         })
 }
 
-/// Single one-shot action call used by the linked-entity fan-out.
-/// Distinct from `call_and_render` because we don't want to print
-/// or exit on per-call failure — `show` aggregates and renders all
-/// at once.
+/// Like `call_and_render` but doesn't print/exit on failure — `show`
+/// aggregates per-entry errors and renders them together.
 fn call_one(socket_path: &str, method: &str, params: Value) -> Result<Value, (String, String)> {
     let resp = client::send_command(socket_path, method, params)
         .map_err(|e| ("transport_error".to_string(), e.to_string()))?;
@@ -574,10 +558,6 @@ fn set_status(
     )
 }
 
-/// Render a `todo.list` response in the human-friendly form.
-/// Layout: one row per todo, status icon + id + priority + title +
-/// trailing meta (workspace, tags, due, linked_jira). Aligned columns
-/// for status / id / priority; title and meta are flow-spaced.
 fn render_list(v: &Value, hide_done: bool) {
     let todos = match v.get("todos").and_then(Value::as_array) {
         Some(arr) => arr,
@@ -639,35 +619,21 @@ fn render_list(v: &Value, hide_done: bool) {
     }
 }
 
-/// Result of preflighting an `<id>` argument: the full id plus the
-/// workspace it lives in. The actions all default the `workspace`
-/// param to the plugin's configured default if omitted, so a todo
-/// in a non-default workspace would 404 without this. Always
-/// preflight the workspace alongside the id.
+/// Pairs id with its actual workspace — actions default `workspace`
+/// to the plugin's configured default, so a non-default-workspace
+/// todo 404s without this.
 struct ResolvedTodo {
     id: String,
     workspace: String,
 }
 
-/// Resolve a possibly-prefixed id into the full id + its workspace.
-/// Calls `todo.list` (with optional `workspace` filter) and finds:
-///   - All EXACT id matches across visible workspaces. Todo ids are
-///     workspace-scoped, not globally unique (the store at
-///     `<root>/<workspace>/<id>.md` only checks collisions per
-///     workspace), so multiple workspaces can hold the same full id.
-///     If we see >1 we force the user to disambiguate via
-///     `--workspace`. We do NOT silently pick whichever workspace
-///     `todo.list` enumerated first — that would silently mutate the
-///     wrong todo.
-///   - All PREFIX matches (only consulted when there are zero exact
-///     matches), again disambiguated when >1.
-///
-/// `workspace_filter`, if `Some`, scopes the preflight at the action
-/// level so the user can disambiguate a known-duplicate id by
-/// passing `--workspace <ws>`.
-///
-/// On miss/ambiguity prints diagnostic to stderr and returns
-/// `Err(exit_code)`.
+/// Resolves `<id>` (full or prefix) → `ResolvedTodo`. Strategy:
+/// exact-match first across visible workspaces; on zero matches, fall
+/// back to prefix-match. Either set ambiguous (>1) forces the user to
+/// pass `--workspace <ws>` — we never silently pick whichever workspace
+/// the listing enumerated first, which would mutate the wrong todo.
+/// `workspace_filter` scopes the preflight when the user already knows
+/// which workspace to target.
 fn resolve_id(
     socket_path: &str,
     prefix: &str,
