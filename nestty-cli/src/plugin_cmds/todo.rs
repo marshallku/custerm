@@ -7,6 +7,7 @@
 //! |-------------------------------------|-------------------|
 //! | `todo create <title> [--workspace …]` | `todo.create`     |
 //! | `todo list [--status …]`              | `todo.list`       |
+//! | `todo update <id> [flags…]`           | `todo.update`     |
 //! | `todo set <id> --status <s>`          | `todo.set_status` |
 //! | `todo done <id>`                      | `todo.set_status` (status=done) |
 //! | `todo doing <id>`                     | `todo.set_status` (status=in_progress) |
@@ -146,6 +147,47 @@ pub enum TodoCommand {
         #[arg(long)]
         workspace: Option<String>,
     },
+    /// Update mutable fields of an existing todo. Every flag is optional —
+    /// omit a flag to leave that field unchanged. Empty-string args for
+    /// `--due` / `--linked-jira` / `--prompt` clear the field
+    /// (action's null-or-string convention).
+    Update {
+        /// Todo id (full id or unique prefix)
+        id: String,
+        /// Scope id resolution to this workspace
+        #[arg(long)]
+        workspace: Option<String>,
+        /// New title
+        #[arg(long)]
+        title: Option<String>,
+        /// Replace body wholesale. Mutually exclusive with --append-subtask.
+        #[arg(long, conflicts_with = "append_subtask")]
+        body: Option<String>,
+        /// Append `- [ ] <text>` to the existing body. Convenience for
+        /// adding subtasks mid-loop without round-tripping through `--body`.
+        #[arg(long = "append-subtask")]
+        append_subtask: Option<String>,
+        /// Priority: low | normal | high
+        #[arg(long)]
+        priority: Option<String>,
+        /// Due date (ISO 8601). Empty string clears.
+        #[arg(long)]
+        due: Option<String>,
+        /// Linked Jira ticket key. Empty string clears.
+        #[arg(long = "linked-jira")]
+        linked_jira: Option<String>,
+        /// Linked KB note ids (comma-separated). Replaces the current
+        /// link set. Empty string clears.
+        #[arg(long = "linked-kb")]
+        linked_kb: Option<String>,
+        /// Tags (comma-separated). Replaces the current tag set.
+        #[arg(long)]
+        tags: Option<String>,
+        /// Agent-facing instruction stored in the `prompt` frontmatter.
+        /// Empty string clears.
+        #[arg(long)]
+        prompt: Option<String>,
+    },
     /// Show full Todo with linked-entity expansion (kb previews,
     /// linked Jira/Slack list)
     Show {
@@ -274,6 +316,71 @@ pub fn dispatch(cmd: &TodoCommand, socket_path: &str, json_out: bool) -> i32 {
                 json_out,
                 |_| println!("deleted {} (ws={})", r.id, r.workspace),
             )
+        }
+        TodoCommand::Update {
+            id,
+            workspace,
+            title,
+            body,
+            append_subtask,
+            priority,
+            due,
+            linked_jira,
+            linked_kb,
+            tags,
+            prompt,
+        } => {
+            let r = match resolve_id(socket_path, id, workspace.as_deref()) {
+                Ok(r) => r,
+                Err(code) => return code,
+            };
+            // `--append-subtask` is wired straight through to the action's
+            // `append_subtask` param so the read-modify-write happens inside
+            // the action handler — no client-side preflight that would widen
+            // the race window. clap's `conflicts_with` already rejects
+            // simultaneous `--body` + `--append-subtask`; the action also
+            // rejects the combination as a defense-in-depth.
+            let mut params = json!({ "id": r.id, "workspace": r.workspace });
+            if let Some(t) = title {
+                params["title"] = json!(t);
+            }
+            if let Some(b) = body {
+                params["body"] = json!(b);
+            }
+            if let Some(text) = append_subtask {
+                params["append_subtask"] = json!(text);
+            }
+            if let Some(p) = priority {
+                params["priority"] = json!(p);
+            }
+            if let Some(d) = due {
+                params["due"] = if d.is_empty() { Value::Null } else { json!(d) };
+            }
+            if let Some(j) = linked_jira {
+                params["linked_jira"] = if j.is_empty() { Value::Null } else { json!(j) };
+            }
+            if let Some(kb) = linked_kb {
+                let parts: Vec<&str> = kb
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                params["linked_kb"] = json!(parts);
+            }
+            if let Some(t) = tags {
+                let parts: Vec<&str> = t
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                params["tags"] = json!(parts);
+            }
+            if let Some(p) = prompt {
+                params["prompt"] = if p.is_empty() { Value::Null } else { json!(p) };
+            }
+            call_and_render(socket_path, "todo.update", params, json_out, |_| {
+                println!("updated {} (ws={})", r.id, r.workspace);
+            })
         }
         TodoCommand::Show { id, workspace } => {
             show(socket_path, id, workspace.as_deref(), json_out)

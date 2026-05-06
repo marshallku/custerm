@@ -242,7 +242,10 @@ impl Store {
     /// high-frequency status-toggle path (use `set_status` instead).
     /// Outer `Option` is "None = don't touch"; for `Option<Option<String>>`
     /// fields (`due`, `linked_jira`, `prompt`) an inner empty string clears.
-    /// `title: Some("")` is rejected.
+    /// `title: Some("")` is rejected. `body` and `append_subtask` are
+    /// mutually exclusive — the latter performs the read-modify-write
+    /// inside this call so callers don't widen the race window with a
+    /// client-side preflight fetch.
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &self,
@@ -250,6 +253,7 @@ impl Store {
         id: &str,
         title: Option<String>,
         body: Option<String>,
+        append_subtask: Option<String>,
         priority: Option<Priority>,
         due: Option<Option<String>>,
         linked_jira: Option<Option<String>>,
@@ -257,6 +261,18 @@ impl Store {
         tags: Option<Vec<String>>,
         prompt: Option<Option<String>>,
     ) -> Result<Todo, Err> {
+        if body.is_some() && append_subtask.is_some() {
+            return Err(Err::InvalidParams(
+                "'body' and 'append_subtask' are mutually exclusive".into(),
+            ));
+        }
+        if let Some(s) = &append_subtask
+            && s.is_empty()
+        {
+            return Err(Err::InvalidParams(
+                "'append_subtask' cannot be empty".into(),
+            ));
+        }
         let path = self.todo_path(workspace, id)?;
         let mut f = OpenOptions::new()
             .read(true)
@@ -280,6 +296,17 @@ impl Store {
         }
         if let Some(b) = body {
             t.body = b;
+        }
+        if let Some(text) = append_subtask {
+            let line = format!("- [ ] {text}");
+            if t.body.is_empty() {
+                t.body = line;
+            } else if t.body.ends_with('\n') {
+                t.body.push_str(&line);
+            } else {
+                t.body.push('\n');
+                t.body.push_str(&line);
+            }
         }
         if let Some(p) = priority {
             t.priority = p;

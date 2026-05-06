@@ -422,6 +422,10 @@ fn action_update(
             ));
         }
     };
+    // optional_present_string rejects an explicit empty string — passing
+    // `append_subtask: ""` would otherwise silently no-op AND bypass the
+    // mutual-exclusion check with `body`. If present, it must be non-empty.
+    let append_subtask = optional_present_string(params, "append_subtask")?;
     let priority = match optional_string(params, "priority")? {
         Some(s) => Some(Priority::parse(&s).ok_or_else(|| {
             (
@@ -481,6 +485,7 @@ fn action_update(
             &id,
             title,
             body,
+            append_subtask,
             priority,
             due,
             linked_jira,
@@ -917,6 +922,64 @@ mod tests {
         let err =
             action_update(&json!({"id": "T-missing", "title": "x"}), &config, &store).unwrap_err();
         assert_eq!(err.0, "not_found");
+    }
+
+    #[test]
+    fn update_append_subtask_appends_to_empty_body() {
+        let (_d, config, store, _tx, _rx) = fixture();
+        let t = action_create(&json!({"title": "x"}), &config, &store).unwrap();
+        let r = action_update(
+            &json!({"id": t.id, "append_subtask": "first task"}),
+            &config,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            r["todo"]["body"].as_str().unwrap().trim(),
+            "- [ ] first task"
+        );
+    }
+
+    #[test]
+    fn update_append_subtask_handles_existing_body_newline() {
+        let (_d, config, store, _tx, _rx) = fixture();
+        // Body without trailing newline (render_new will add one on store,
+        // but parse round-trips body content as authored).
+        let t =
+            action_create(&json!({"title": "x", "body": "- [ ] one"}), &config, &store).unwrap();
+        let r = action_update(
+            &json!({"id": t.id, "append_subtask": "two"}),
+            &config,
+            &store,
+        )
+        .unwrap();
+        let body = r["todo"]["body"].as_str().unwrap();
+        // Both lines present; no doubled blank line between them.
+        assert!(body.contains("- [ ] one"));
+        assert!(body.contains("- [ ] two"));
+        assert!(!body.contains("\n\n- [ ] two"));
+    }
+
+    #[test]
+    fn update_rejects_body_and_append_subtask_together() {
+        let (_d, config, store, _tx, _rx) = fixture();
+        let t = action_create(&json!({"title": "x"}), &config, &store).unwrap();
+        let err = action_update(
+            &json!({"id": t.id, "body": "replacement", "append_subtask": "also this"}),
+            &config,
+            &store,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, "invalid_params");
+    }
+
+    #[test]
+    fn update_rejects_empty_append_subtask() {
+        let (_d, config, store, _tx, _rx) = fixture();
+        let t = action_create(&json!({"title": "x"}), &config, &store).unwrap();
+        let err =
+            action_update(&json!({"id": t.id, "append_subtask": ""}), &config, &store).unwrap_err();
+        assert_eq!(err.0, "invalid_params");
     }
 
     #[test]
