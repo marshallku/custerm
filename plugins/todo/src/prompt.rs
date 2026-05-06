@@ -39,10 +39,11 @@ use std::path::{Path, PathBuf};
 
 use crate::todo::Todo;
 
-/// Build the assembled prompt for a Todo. Reads layer files relative
-/// to `docs_root`. None inputs (e.g. when `docs_root` cannot be
-/// derived) just skip the filesystem layers and fall back to
-/// title+body — `assemble` always returns a non-empty string.
+/// Layered prompt: filesystem layers (when `docs_root` is `Some`) +
+/// `todo_instruction` (`todo.prompt` if set, else title+body) + optional
+/// linked_jira line + linked_kb references (when `docs_root` is `Some`).
+/// `docs_root = None` skips both filesystem layers; the instruction
+/// section always renders so the result is never empty.
 pub fn assemble(todo: &Todo, docs_root: Option<&Path>) -> String {
     let mut sections: Vec<String> = Vec::new();
 
@@ -113,11 +114,8 @@ pub fn assemble(todo: &Todo, docs_root: Option<&Path>) -> String {
     sections.join("\n\n")
 }
 
-/// Walk `target`'s components (starting at `root`) and reject if
-/// any existing component is a symlink. Mirrors the KB plugin's
-/// defense — the lexical path check can't catch `<root>/alias`
-/// where `alias` is a symlink to `/etc`. Uses `symlink_metadata`
-/// so it sees the link itself rather than following.
+/// `lstat` walk so an `alias → /etc` symlink can't bypass the lexical
+/// containment check (mirrors KB's defense).
 fn path_has_no_symlink_ancestors(root: &Path, target: &Path) -> bool {
     let Ok(rel) = target.strip_prefix(root) else {
         return false;
@@ -136,13 +134,9 @@ fn path_has_no_symlink_ancestors(root: &Path, target: &Path) -> bool {
     true
 }
 
-/// Verify `rel` resolves into a file under `root` without leaving via
-/// `..` or absolute components. Returns the joined path on success,
-/// `None` if the path tries to escape the boundary. We do this on the
-/// *lexical* path before reading — even if the file doesn't exist the
-/// security rule has to hold so a future-created file at a forbidden
-/// location can't sneak in. Same posture as `nestty-plugin-kb`'s
-/// docs-root containment.
+/// Lexical containment check (no `..` / absolute components) BEFORE
+/// reading, so a future-created file at a forbidden lexical location
+/// can't sneak in. KB-style docs-root posture.
 fn resolve_within(root: &Path, rel: &str) -> Option<PathBuf> {
     if rel.is_empty() {
         return None;
@@ -177,10 +171,9 @@ fn todo_instruction(todo: &Todo) -> String {
     }
 }
 
-/// Resolve the docs root (sibling-of-todos) from the configured todo
-/// root. Returns `None` if the todo root is the filesystem root
-/// (parent does not exist) — caller treats that as "no preamble
-/// layers", same effect as missing files.
+/// `parent(todo_root)`. `None` when todo root has no parent — caller
+/// passes that `None` to `assemble`, which then skips the filesystem
+/// layers (todo_instruction + linked_jira still render).
 pub fn docs_root_for(todo_root: &Path) -> Option<PathBuf> {
     todo_root.parent().map(Path::to_path_buf)
 }
