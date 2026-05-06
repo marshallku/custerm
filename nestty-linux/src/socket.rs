@@ -22,18 +22,11 @@ const WALLPAPER_CACHE: &str = ".cache/terminal-wallpapers.txt";
 const BG_MODE_FILE: &str = ".cache/nestty-bg-mode";
 const BUS_SOURCE_NESTTY_LINUX: &str = "nestty-linux";
 
-/// Names of socket methods handled directly in the legacy `dispatch`
-/// match arm — i.e. those NOT yet migrated into `ActionRegistry`.
-/// Migration is incremental, so for now this is the second source of
-/// truth (alongside `ActionRegistry::names()`) for "core action names
-/// that a service plugin must not shadow." When a method is migrated
-/// into the registry it should be removed from this list and the
-/// registry will own its name.
-///
-/// `event.subscribe` is intentionally excluded — it's handled in the
-/// socket connection thread, not in `dispatch`, and is not a meaningful
-/// action endpoint (it owns the connection for the lifetime of a
-/// stream).
+/// Methods served by the legacy `dispatch` match arm (not yet migrated
+/// into `ActionRegistry`). Second source of truth for "core action names
+/// a service plugin must not shadow"; remove an entry when its method
+/// migrates into the registry. `event.subscribe` is excluded — it owns
+/// the connection for the stream's lifetime, not a one-shot action.
 pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
     "background.set",
     "background.clear",
@@ -1391,23 +1384,13 @@ fn handle_terminal_context(req: &Request, mgr: &Rc<TabManager>) -> Response {
     )
 }
 
-/// Spawn a new nestty tab with `cwd = workspace_path`, then feed
-/// `tmux new-session -A -s <name> 'claude [...]'` into the
-/// terminal. `-A` attaches to an existing session of the same
-/// name (so re-running on the same worktree re-attaches the live
-/// claude rather than stacking duplicates) or creates one. The
-/// quote-as-command form lets tmux interpret `claude --resume X`
-/// as the initial-window command on session-create; on attach,
-/// tmux ignores the command and we just attach.
-///
-/// Phase 18.2: `prompt` is delivered via `tmux load-buffer +
-/// paste-buffer + send-keys Enter` once both a claude-specific
-/// capture-pane signal AND `pane_current_command` confirm the pane
-/// is actually claude — see `spawn_claude_prompt_seeder`. Mutually
-/// exclusive with `resume_session` (resume restores existing
-/// context; pasting on top would just confuse claude). Failures
-/// during the post-action paste log to stderr but never propagate
-/// — the action has already returned success.
+/// Spawns a tab at `workspace_path` and runs `tmux new-session -A -s
+/// <name> 'claude [...]'`. The `-A` attaches to an existing same-name
+/// session (re-running on a worktree re-attaches live claude rather
+/// than stacking duplicates) or creates one. `prompt` (mutually
+/// exclusive with `resume_session`) is paste-seeded via
+/// `spawn_claude_prompt_seeder` once two readiness checks confirm the
+/// pane is claude — failures log but don't propagate.
 fn handle_claude_start(
     req: &Request,
     mgr: &Rc<TabManager>,
@@ -1578,12 +1561,9 @@ fn handle_claude_start(
     )
 }
 
-/// Pull the last 1-2 path components and stitch them together
-/// with `-`, lowercased and sanitized. Two components rather
-/// than one because worktree layouts like
-/// `<worktree_root>/feature/foo` would otherwise collapse to
-/// just `foo`, colliding with sibling worktrees on the same
-/// leaf name.
+/// Last 1-2 path components joined by `-`, lowercased + sanitized.
+/// Two components, not one, so `<root>/feature/foo` doesn't collapse
+/// to `foo` and collide with siblings sharing a leaf name.
 fn derive_session_name(path: &std::path::Path) -> String {
     let mut parts: Vec<String> = Vec::new();
     for comp in path.components().rev() {
@@ -1636,30 +1616,20 @@ fn validate_tmux_session_name(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Spawn a background thread that waits for claude's REPL to become
-/// interactive in `session_name`'s tmux pane, then delivers `prompt`
-/// via tmux's load-buffer + paste-buffer (handles arbitrary
-/// multi-line text without per-character escaping) and a final
-/// Enter.
+/// Waits for claude's REPL in `session_name`'s tmux pane, then pastes
+/// `prompt` via tmux load-buffer + paste-buffer + Enter.
 ///
-/// Readiness detection runs in two stages and refuses to paste if
-/// either fails — the original spec was "fire claude with a
-/// pre-seeded prompt" but `tmux new-session -A` ATTACHES if a
-/// session already exists, ignoring our `claude` command. If that
-/// pre-existing pane is a shell, blindly pasting + Enter would
-/// EXECUTE the prompt as a shell command (and exfiltrate `linked_kb`
-/// content into the user's history). Both checks below have to pass:
+/// **Trust boundary**: `tmux new-session -A` attaches if the session
+/// already exists, ignoring our `claude` command. Pasting into a
+/// pre-existing shell pane would EXECUTE the prompt as a shell command
+/// and exfiltrate `linked_kb` content into history. The seeder pastes
+/// only when BOTH gates pass:
+/// 1. `pane_current_command` is claude (or the node binary it's built
+///    on); shells (`zsh`/`bash`/`sh`/`fish`) hard-skip.
+/// 2. `capture-pane` shows claude-specific markers (banner / `Try "`);
+///    generic `> ` or box-drawing are insufficient since shells emit those.
 ///
-/// 1. `pane_current_command` indicates claude (or the node binary
-///    claude-code is built on). A shell (`zsh`, `bash`, `sh`, `fish`)
-///    is a hard skip.
-/// 2. `capture-pane` has rendered claude-specific markers — banner
-///    or `Try "` strings. Generic `> ` / box-drawing are NOT enough
-///    because shells emit those too.
-///
-/// Failures are logged to stderr, never propagated. claude.start
-/// has already returned success to the caller; the prompt is a
-/// post-action best-effort and any retry is the user's call.
+/// Failures log; never propagated (claude.start already returned).
 fn spawn_claude_prompt_seeder(session_name: String, prompt: String) {
     std::thread::spawn(move || {
         // Initial settle so capture-pane has SOMETHING to inspect.
