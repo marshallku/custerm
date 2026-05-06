@@ -35,22 +35,17 @@ pub enum BookmarkCommand {
     /// Capture a URL as a bookmark note. Idempotent: re-adding an
     /// already-captured URL returns the existing entry.
     Add {
-        /// URL to capture (must be http/https; canonicalized
-        /// server-side: tracking params stripped, fragment dropped,
-        /// host lowercased).
+        /// URL (http/https; canonicalized server-side — tracking params
+        /// stripped, fragment dropped, host lowercased)
         url: String,
-        /// Optional title. If omitted the plugin derives one from
-        /// the URL host + last path segment until BM-2 fetches the
-        /// real `<title>`.
+        /// Optional title; otherwise derived from host + last path segment
         #[arg(long)]
         title: Option<String>,
         /// Tags (comma-separated).
         #[arg(long)]
         tags: Option<String>,
-        /// Override the `source` frontmatter field. Defaults to
-        /// `cli`. Documented values: `cli`, `share`. Free-form
-        /// string; future entrypoints can introduce new values
-        /// without a CLI change.
+        /// Source label for the `source` frontmatter field (free-form;
+        /// `cli` / `share` are conventional)
         #[arg(long, default_value = "cli")]
         source: String,
     },
@@ -150,11 +145,8 @@ pub fn dispatch(cmd: &BookmarkCommand, socket_path: &str, json_out: bool) -> i32
     }
 }
 
-/// Detect whether the user passed a URL (starts with `http://` or
-/// `https://`, case-insensitive — `HTTPS://...` is a perfectly valid
-/// URL spelling some sites embed in copy-paste paths) and route
-/// accordingly. Anything else is assumed to be a urlhash8 prefix —
-/// the server validates hex and existence.
+/// `http(s)://` (case-insensitive) → URL; otherwise treated as a
+/// urlhash8 prefix (server validates hex + existence).
 fn id_or_url_params(input: &str) -> Value {
     let trimmed = input.trim();
     let lower = trimmed.to_ascii_lowercase();
