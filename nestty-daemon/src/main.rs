@@ -52,7 +52,8 @@ fn main() -> ExitCode {
     let pool = build_pool();
     let actions =
         Arc::new(ActionRegistry::with_completion_bus(event_bus.clone())).with_pool(pool.clone());
-    register_builtins(&actions);
+    let plugins = discover_and_sort_plugins();
+    register_builtins(&actions, &plugins);
     if env_flag_enabled(ENV_E2E_ACTIONS) {
         register_e2e_actions(&actions);
     }
@@ -67,9 +68,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let supervisor_guard: Arc<ServiceSupervisor> = activate_supervisor(&actions, &event_bus);
+    let supervisor_guard: Arc<ServiceSupervisor> =
+        activate_supervisor(&actions, &event_bus, &plugins);
 
-    let state = DaemonState::new(actions, event_bus.clone());
+    let state = DaemonState::new(actions, event_bus.clone(), plugins, socket_path.clone());
 
     log::info!("nesttyd listening on {}", socket_path.display());
     socket::run_accept_loop(listener, state);
@@ -128,7 +130,10 @@ fn register_e2e_actions(actions: &Arc<ActionRegistry>) {
     });
 }
 
-fn register_builtins(actions: &Arc<ActionRegistry>) {
+fn register_builtins(
+    actions: &Arc<ActionRegistry>,
+    plugins: &Arc<Vec<nestty_core::plugin::LoadedPlugin>>,
+) {
     actions.register_silent("system.ping", |_| Ok(json!({ "status": "ok" })));
     actions.register("system.log", |params| {
         let msg = params
@@ -161,9 +166,10 @@ fn register_builtins(actions: &Arc<ActionRegistry>) {
         // resolves its own current theme through GUI-owned routing later.
         Ok(json!({ "themes": themes, "current": serde_json::Value::Null }))
     });
-    actions.register("plugin.list", |_| {
-        let plugins: Vec<_> = nestty_core::plugin::discover_plugins()
-            .into_iter()
+    let plugins_for_list = plugins.clone();
+    actions.register("plugin.list", move |_| {
+        let body: Vec<_> = plugins_for_list
+            .iter()
             .map(|p| {
                 let m = &p.manifest;
                 json!({
@@ -193,7 +199,7 @@ fn register_builtins(actions: &Arc<ActionRegistry>) {
                 })
             })
             .collect();
-        Ok(json!({ "plugins": plugins }))
+        Ok(json!({ "plugins": body }))
     });
 }
 
@@ -206,11 +212,39 @@ fn env_flag_enabled(var: &str) -> bool {
     }
 }
 
-fn activate_supervisor(
-    actions: &Arc<ActionRegistry>,
-    event_bus: &Arc<nestty_core::event_bus::EventBus>,
-) -> Arc<ServiceSupervisor> {
-    let plugins = nestty_core::plugin::discover_plugins();
+/// `manifest.plugin.name` is the dispatch key for `plugin.<name>.<cmd>`
+/// and statusbar `_module.run`. Sort the once-discovered list so two
+/// daemons on the same machine register the same set in the same order
+/// (deterministic last-write-wins on duplicates). Warns about dupes so
+/// the user can fix the manifest.
+pub fn discover_and_sort_plugins() -> Arc<Vec<nestty_core::plugin::LoadedPlugin>> {
+    let mut plugins = nestty_core::plugin::discover_plugins();
+    // Sort by name, then by dir as a stable tiebreaker so two plugins
+    // with the same manifest name resolve to the same winner across
+    // restarts regardless of filesystem readdir order.
+    plugins.sort_by(|a, b| {
+        a.manifest
+            .plugin
+            .name
+            .cmp(&b.manifest.plugin.name)
+            .then_with(|| a.dir.cmp(&b.dir))
+    });
+    // After sort: equal names are adjacent and ordered by dir.
+    // `register_blocking` does last-write-wins on HashMap insertion,
+    // so the entry registered LAST (largest dir) is the active one.
+    let mut prev: Option<&str> = None;
+    for p in &plugins {
+        let name = p.manifest.plugin.name.as_str();
+        if Some(name) == prev {
+            log::warn!(
+                "duplicate plugin manifest name `{}` at {}; the entry sorted last by dir wins `plugin.{}.<cmd>` resolution",
+                name,
+                p.dir.display(),
+                name
+            );
+        }
+        prev = Some(name);
+    }
     log::info!(
         "discovered {} plugin manifest(s); spawning onStartup services",
         plugins.len()
@@ -222,6 +256,14 @@ fn activate_supervisor(
             p.manifest.plugin.version
         );
     }
+    Arc::new(plugins)
+}
+
+fn activate_supervisor(
+    actions: &Arc<ActionRegistry>,
+    event_bus: &Arc<nestty_core::event_bus::EventBus>,
+    plugins: &Arc<Vec<nestty_core::plugin::LoadedPlugin>>,
+) -> Arc<ServiceSupervisor> {
     let reserved: Vec<&str> = LEGACY_DISPATCH_METHODS
         .iter()
         .copied()
@@ -230,7 +272,7 @@ fn activate_supervisor(
     ServiceSupervisor::new(
         event_bus.clone(),
         actions.clone(),
-        &plugins,
+        plugins,
         env!("CARGO_PKG_VERSION"),
         &reserved,
     )

@@ -12,6 +12,7 @@ use std::thread;
 
 use nestty_core::action_registry::ActionRegistry;
 use nestty_core::event_bus::EventBus as CoreEventBus;
+use nestty_core::plugin::LoadedPlugin;
 use nestty_core::protocol::{PROTOCOL_VERSION, Request, Response};
 use serde_json::Value;
 
@@ -203,15 +204,43 @@ pub struct DaemonState {
     pub gui: Arc<GuiRegistry>,
     /// Forwarded to each registered GUI via `start_event_forwarder`.
     pub event_bus: EventBus,
+    /// Discovered once at startup, sorted by `manifest.plugin.name`
+    /// then `dir` as tiebreaker. Will back `plugin.<name>.<cmd>` and
+    /// `_module.run` dispatch in the next commit; currently consumed
+    /// by `plugin.list` only.
+    pub plugins: Arc<Vec<LoadedPlugin>>,
+    /// Path the daemon actually bound. Will be passed as
+    /// `NESTTY_SOCKET` to plugin shell children in the next commit;
+    /// currently unused by dispatch.
+    pub socket_path: PathBuf,
 }
 
 impl DaemonState {
-    pub fn new(actions: Arc<ActionRegistry>, event_bus: EventBus) -> Arc<Self> {
+    pub fn new(
+        actions: Arc<ActionRegistry>,
+        event_bus: EventBus,
+        plugins: Arc<Vec<LoadedPlugin>>,
+        socket_path: PathBuf,
+    ) -> Arc<Self> {
         Arc::new(Self {
             actions,
             gui: GuiRegistry::new(),
             event_bus,
+            plugins,
+            socket_path,
         })
+    }
+
+    /// Test-only constructor with empty plugins + placeholder socket path.
+    /// Production callers should pass real values.
+    #[cfg(test)]
+    pub fn new_for_test(actions: Arc<ActionRegistry>, event_bus: EventBus) -> Arc<Self> {
+        Self::new(
+            actions,
+            event_bus,
+            Arc::new(Vec::new()),
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        )
     }
 }
 
@@ -536,7 +565,7 @@ mod tests {
     fn mk_state_with_ping() -> Arc<DaemonState> {
         let actions = Arc::new(ActionRegistry::new());
         actions.register_silent("system.ping", |_| Ok(json!({"status": "ok"})));
-        DaemonState::new(actions, new_event_bus())
+        DaemonState::new_for_test(actions, new_event_bus())
     }
 
     #[test]
@@ -574,7 +603,7 @@ mod tests {
     fn dispatch_routes_to_registered_action() {
         let actions = Arc::new(ActionRegistry::new());
         actions.register("greet", |_| Ok(json!({"hi": true})));
-        let state = DaemonState::new(actions, new_event_bus());
+        let state = DaemonState::new_for_test(actions, new_event_bus());
         let req = Request::new("g-1", "greet", json!({}));
         let resp = dispatch(&req, &state);
         assert!(resp.ok);
