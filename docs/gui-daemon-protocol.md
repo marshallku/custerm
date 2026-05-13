@@ -39,9 +39,11 @@ external scripts and per-machine config.
 
 ### Transport
 
-- Unix socket at well-known path:
-  - Linux: `${XDG_RUNTIME_DIR:-/tmp}/nestty/socket`
-  - macOS: `~/Library/Caches/nestty/socket`
+- Unix socket at well-known path (see `nestty_core::paths::socket_path`):
+  - Linux: `${XDG_RUNTIME_DIR}/nestty/socket` when set, else
+    `/tmp/nestty-{uid}/socket` (uid-namespaced so multi-user `/tmp` doesn't
+    race on first-binder).
+  - macOS: `~/Library/Caches/nestty/socket`.
 - Newline-delimited JSON. One JSON object per line.
 - The daemon honors `NESTTY_SOCKET` (override path) and accepts an optional
   `--legacy-socket /tmp/nestty.sock` flag for a transitional second listener

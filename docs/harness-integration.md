@@ -239,10 +239,25 @@ Step 3 in the earlier draft was not atomic. Resliced:
    code yet. ~half day.
 
 2. **Daemon binary scaffolding.** New `nestty-daemon` crate + `nesttyd` bin.
-   Imports current `service_supervisor` / `trigger_sink` and the **daemon-only
-   half of `socket.rs`** via path (no move yet). Listens on well-known socket.
-   Runs alongside GUI but does nothing useful — just confirms it boots,
-   plugins activate, events publish. ~1 day.
+   Sliced into three commits to keep each diff reviewable per the user's
+   small-unit save convention:
+   - **2a (scaffolding):** crate + binary entry; `PlatformPaths` in
+     `nestty-core`; transport (UnixListener bind, accept loop, framing);
+     minimal dispatch handling `system.ping`; socket-permission hardening
+     (parent dir 0700, socket 0600); stale-socket cleanup; sigterm-safe
+     shutdown via stale-detect on next start (no async-signal handler).
+     `nestctl` discovery aware of the new well-known path but still prefers
+     legacy GUI socket during migration. ~half day.
+   - **2b (supervisor import):** import `service_supervisor` +
+     `trigger_sink` (audit confirmed both are GTK-free, depend only on
+     `nestty-core`). `nesttyd` activates plugins on start and pushes bus
+     events. Plugin manifest discovery uses the same path as today. ~half
+     day.
+   - **2c (pdeathsig / orphan reaping):** dedicated long-lived spawner
+     thread (so the fork-thread never exits while nesttyd is alive) OR
+     `pidfd_open` + epoll path. Re-introduces crash-safe child reaping
+     that Phase 9.5 rolled back. ~half day.
+   ~1.5 days total.
 
 3. **Relocate clean modules.** Move `service_supervisor.rs` and
    `trigger_sink.rs` from `nestty-linux/src/` to `nestty-daemon/src/`. Update
@@ -651,7 +666,7 @@ Codex flagged these as more urgent under daemon-first, not less:
 ## Suggested sequencing
 
 1. **GUI ↔ daemon protocol spec** (Migration step 1) — design deliverable, no code. ~half day.
-2. **Daemon scaffolding** (step 2) — `nesttyd` binary, pdeathsig fix bundled. ~1 day.
+2. **Daemon scaffolding** (step 2) — three thin commits per Migration step 2's slicing: 2a daemon binary + ping + permission hardening (~½ day), 2b supervisor + trigger_sink import (~½ day), 2c pdeathsig / orphan reaping (~½ day). Total ~1.5 days.
 3. **Phase 9.4 thread pool** — bounded-worker pool before hook/life-assistant bursts arrive. ~1 day.
 4. **Relocate supervisor + trigger_sink** (step 3) — ~half day.
 5. **Split socket.rs + dual dispatch under flag** (step 4) — ~2 days.

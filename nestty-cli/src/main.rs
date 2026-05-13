@@ -25,6 +25,12 @@ fn main() {
             .unwrap_or_else(|| discover_socket().unwrap_or_else(|| "/tmp/nestty.sock".to_string()))
     });
 
+    // Diagnostic — `nestctl --debug-socket ping` etc surface which path
+    // was picked. Plain CLI users never see this.
+    if std::env::var("NESTTY_DEBUG_SOCKET").is_ok() {
+        eprintln!("[nestctl] using socket: {socket_path}");
+    }
+
     // Event subscribe is a long-lived streaming connection
     if matches!(&cli.command, Command::Event(EventCommand::Subscribe)) {
         match client::subscribe(&socket_path) {
@@ -84,6 +90,22 @@ fn main() {
     }
 }
 
+/// Socket discovery order (migration-aware):
+///
+/// 1. `/tmp/nestty-*.sock` glob — legacy per-PID socket the in-process
+///    nestty GUI uses today. Newest connectable wins. **Tried first**
+///    during the migration window because the v0 daemon only implements
+///    `system.ping`; preferring it would route every other CLI verb
+///    (`tab.*`, `plugin.*`, `todo.*`, ...) into `unknown_method`.
+/// 2. `nestty_core::paths::socket_path()` — the daemon's well-known path
+///    (`${XDG_RUNTIME_DIR}/nestty/socket` on Linux,
+///    `~/Library/Caches/nestty/socket` on macOS). Used as a *fallback*
+///    while the daemon is gaining feature parity. Once the daemon
+///    handles every method the GUI does (sequencing step 5), the order
+///    flips so daemon-driven deployments are the default.
+///
+/// Callers fall through to `NESTTY_SOCKET` env (highest priority,
+/// upstream) and a hardcoded `/tmp/nestty.sock` fallback.
 fn discover_socket() -> Option<String> {
     let mut sockets: Vec<_> = std::fs::read_dir("/tmp")
         .ok()?
@@ -109,6 +131,26 @@ fn discover_socket() -> Option<String> {
             return Some(path.to_string_lossy().to_string());
         }
     }
+
+    // Fall back to daemon well-known path. Use `runtime_dir().join("socket")`
+    // rather than `paths::socket_path()` so a stale `NESTTY_SOCKET` env
+    // (already rejected by `main`) doesn't bounce us back to the same
+    // unconnectable path.
+    //
+    // Verify the runtime dir is owned by current uid and not
+    // group/world-accessible before connecting — on systems without
+    // `XDG_RUNTIME_DIR`, the `/tmp/nestty-{uid}` fallback is predictable
+    // and could be pre-created by another local user hosting their own
+    // listener. We refuse to connect into an attacker-owned dir.
+    let runtime_dir = nestty_core::paths::runtime_dir();
+    if !nestty_core::paths::is_trusted_dir(&runtime_dir) {
+        return None;
+    }
+    let well_known = runtime_dir.join("socket");
+    if std::os::unix::net::UnixStream::connect(&well_known).is_ok() {
+        return Some(well_known.to_string_lossy().to_string());
+    }
+
     None
 }
 
