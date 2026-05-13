@@ -142,6 +142,23 @@ impl ActionRegistry {
         );
     }
 
+    /// `register_blocking` + silent. For high-frequency blocking work
+    /// (e.g. statusbar module ticks) where pool backpressure is needed
+    /// but completion-event fan-out would flood the bus.
+    pub fn register_blocking_silent<F>(&self, name: impl Into<String>, handler: F)
+    where
+        F: Fn(Value) -> ActionResult + Send + Sync + 'static,
+    {
+        self.entries.write().unwrap().insert(
+            name.into(),
+            Entry {
+                handler: Arc::new(handler),
+                blocking: true,
+                silent: true,
+            },
+        );
+    }
+
     pub fn invoke(&self, name: &str, params: Value) -> ActionResult {
         // Clone out the handler Arc under the read lock, then drop the guard
         // before running the handler. This keeps handler execution off the
@@ -771,6 +788,52 @@ mod tests {
         match rx.recv_timeout(Duration::from_millis(100)) {
             crate::event_bus::RecvOutcome::Timeout => {}
             other => panic!("silent action published an event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocking_silent_action_runs_on_pool_and_suppresses_fan_out() {
+        use crate::thread_pool::ThreadPool;
+
+        let bus = Arc::new(EventBus::new());
+        let rx = bus.subscribe_unbounded("mod.tick.completed");
+        let pool = ThreadPool::new(2, 4);
+        let reg = Arc::new(ActionRegistry::with_completion_bus(bus)).with_pool(pool);
+
+        let runner_thread = Arc::new(Mutex::new(None::<std::thread::ThreadId>));
+        let dispatch_thread = std::thread::current().id();
+        let rt_set = runner_thread.clone();
+        reg.register_blocking_silent("mod.tick", move |_| {
+            *rt_set.lock().unwrap() = Some(std::thread::current().id());
+            Ok(json!({"stdout": "x"}))
+        });
+
+        let done = Arc::new(Mutex::new(false));
+        let d = done.clone();
+        reg.try_dispatch(
+            "mod.tick",
+            json!({}),
+            Box::new(move |_| *d.lock().unwrap() = true),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !*done.lock().unwrap() {
+            assert!(Instant::now() < deadline, "on_done never fired");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let observed_thread = runner_thread
+            .lock()
+            .unwrap()
+            .expect("handler must have observed its thread id");
+        assert_ne!(
+            observed_thread, dispatch_thread,
+            "blocking_silent handler must run off the caller thread"
+        );
+
+        // Silent: no completion event even after handler ran.
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            crate::event_bus::RecvOutcome::Timeout => {}
+            other => panic!("silent blocking action published an event: {other:?}"),
         }
     }
 
