@@ -35,6 +35,29 @@ export NESTTYD_E2E_TEST_ACTIONS=1
 mkdir -p "$WORK/xdg-config/nestty/plugins"
 export XDG_CONFIG_HOME="$WORK/xdg-config"
 
+# Stub plugin for Step 8 (plugin.<name>.<cmd> + _module.run dispatch).
+# No [[services]] entries so the supervisor doesn't try to spawn a
+# non-existent binary. `hello` command emits JSON so the dispatcher's
+# "parse stdout as JSON" path is exercised; `clock` module emits a
+# fixed string so the test can assert exact stdout.
+STUB_DIR="$WORK/xdg-config/nestty/plugins/e2e-stub"
+mkdir -p "$STUB_DIR"
+cat > "$STUB_DIR/plugin.toml" <<'TOML'
+[plugin]
+name = "e2e-stub"
+title = "E2E Stub"
+version = "0.0.1"
+
+[[commands]]
+name = "hello"
+exec = "printf '{\"msg\":\"hi\"}'"
+
+[[modules]]
+name = "clock"
+exec = "printf 'tick'"
+interval = 60
+TOML
+
 DAEMON_PID=""
 GUI_PID=""
 DAEMON_STARTS=0
@@ -298,6 +321,65 @@ overloaded=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['overloa
 (( received == 12 )) || fail "burst: expected 12 responses, got $received"
 (( overloaded >= 6 )) || fail "burst: expected ≥6 overloaded, got $overloaded"
 pass "burst: $received/12 responded, $overloaded overloaded"
+
+step 8 "daemon-hosted plugin.<name>.<cmd> + _module.run dispatch"
+# Calls go to the well-known daemon socket directly — no GUI involved.
+# The stub plugin was dropped into XDG_CONFIG_HOME before step 1, so
+# the daemon has it in its registry. `hello` returns JSON → daemon
+# parses; `_module.run` returns {stdout, exit_code}.
+DISP_LOG="$WORK/dispatch.log"
+python3 - "$SOCKET" >"$DISP_LOG" 2>&1 <<'PY'
+import json, socket, sys, uuid
+
+sock_path = sys.argv[1]
+
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sock_path)
+    f = s.makefile("rwb", buffering=0)
+    req = {"id": str(uuid.uuid4()), "method": method, "params": params}
+    f.write((json.dumps(req) + "\n").encode())
+    line = f.readline()
+    return json.loads(line) if line else None
+
+out = {}
+out["cmd"] = call("plugin.e2e-stub.hello", {})
+out["module"] = call("_module.run", {"plugin": "e2e-stub", "module": "clock"})
+print(json.dumps(out))
+PY
+SUMMARY=$(tail -n1 "$DISP_LOG")
+cmd_msg=$(python3 -c "import sys,json; print((json.loads(sys.argv[1])['cmd'].get('result') or {}).get('msg'))" "$SUMMARY")
+[[ "$cmd_msg" == "hi" ]] || fail "plugin.e2e-stub.hello: expected result.msg='hi', got $cmd_msg (summary: $SUMMARY)"
+pass "plugin.e2e-stub.hello → {msg: 'hi'}"
+
+mod_stdout=$(python3 -c "import sys,json; print((json.loads(sys.argv[1])['module'].get('result') or {}).get('stdout'))" "$SUMMARY")
+[[ "$mod_stdout" == "tick" ]] || fail "_module.run: expected result.stdout='tick', got $mod_stdout (summary: $SUMMARY)"
+pass "_module.run e2e-stub/clock → stdout='tick'"
+
+# Negative paths: unknown plugin, unknown module.
+ERR_LOG="$WORK/dispatch-err.log"
+python3 - "$SOCKET" >"$ERR_LOG" 2>&1 <<'PY'
+import json, socket, sys, uuid
+sock_path = sys.argv[1]
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sock_path)
+    f = s.makefile("rwb", buffering=0)
+    req = {"id": str(uuid.uuid4()), "method": method, "params": params}
+    f.write((json.dumps(req) + "\n").encode())
+    line = f.readline()
+    return json.loads(line) if line else None
+print(json.dumps({
+    "unknown_plugin": call("_module.run", {"plugin": "nope", "module": "clock"}),
+    "unknown_module": call("_module.run", {"plugin": "e2e-stub", "module": "nope"}),
+}))
+PY
+ERR_SUMMARY=$(tail -n1 "$ERR_LOG")
+up_code=$(python3 -c "import sys,json; print((json.loads(sys.argv[1])['unknown_plugin'].get('error') or {}).get('code'))" "$ERR_SUMMARY")
+[[ "$up_code" == "not_found" ]] || fail "_module.run unknown plugin: expected error.code='not_found', got $up_code"
+um_code=$(python3 -c "import sys,json; print((json.loads(sys.argv[1])['unknown_module'].get('error') or {}).get('code'))" "$ERR_SUMMARY")
+[[ "$um_code" == "not_found" ]] || fail "_module.run unknown module: expected error.code='not_found', got $um_code"
+pass "negative paths return not_found"
 
 echo
 echo "=== AUTO E2E COMPLETE ==="
