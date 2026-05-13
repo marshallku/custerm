@@ -30,24 +30,51 @@ const CAPABILITIES: &[&str] = &[
     "search",
 ];
 
-/// Connection-and-loop thread. Returns on disconnect; caller can re-spawn
-/// to reconnect (step 4a does not auto-reconnect).
+/// Reconnect backoff bounds.
+const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Spawns the reconnect loop. Each iteration connects, registers, and
+/// handles Invokes until the daemon connection drops; then waits a
+/// backoff interval and retries. Backoff resets to 1s after a successful
+/// register.
 pub fn spawn(dispatch_tx: Sender<SocketCommand>) {
     thread::Builder::new()
         .name("nestty-gui-client".into())
-        .spawn(move || {
-            // Honors NESTTY_SOCKET — matches what nestctl + nesttyd use,
-            // so an override aligns the whole stack.
-            let socket_path = nestty_core::paths::socket_path();
-            match run(&socket_path.to_string_lossy(), dispatch_tx) {
-                Ok(()) => eprintln!("[nestty] gui_client disconnected from daemon"),
-                Err(e) => eprintln!("[nestty] gui_client error: {e}"),
-            }
-        })
+        .spawn(move || reconnect_loop(dispatch_tx))
         .expect("spawn nestty-gui-client");
 }
 
-fn run(socket_path: &str, dispatch_tx: Sender<SocketCommand>) -> Result<(), String> {
+fn reconnect_loop(dispatch_tx: Sender<SocketCommand>) {
+    let mut backoff = BACKOFF_INITIAL;
+    loop {
+        let socket_path = nestty_core::paths::socket_path();
+        let registered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        match run(
+            &socket_path.to_string_lossy(),
+            dispatch_tx.clone(),
+            registered.clone(),
+        ) {
+            Ok(()) => eprintln!("[nestty] gui_client disconnected from daemon"),
+            Err(e) => eprintln!("[nestty] gui_client error: {e}"),
+        }
+        eprintln!("[nestty] gui_client reconnect in {:?}", backoff);
+        thread::sleep(backoff);
+        // Bump AFTER the sleep so the first retry waits BACKOFF_INITIAL,
+        // not 2× it. Reset on success.
+        if registered.load(std::sync::atomic::Ordering::SeqCst) {
+            backoff = BACKOFF_INITIAL;
+        } else {
+            backoff = (backoff * 2).min(BACKOFF_MAX);
+        }
+    }
+}
+
+fn run(
+    socket_path: &str,
+    dispatch_tx: Sender<SocketCommand>,
+    registered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
     let stream = UnixStream::connect(socket_path)
         .map_err(|e| format!("connect to nesttyd at {socket_path}: {e}"))?;
     let write_stream = stream
@@ -67,6 +94,7 @@ fn run(socket_path: &str, dispatch_tx: Sender<SocketCommand>) -> Result<(), Stri
     let mut reader = BufReader::new(stream);
     let register_id = register(&writer_tx)?;
     await_register_ack(&mut reader, &register_id)?;
+    registered.store(true, std::sync::atomic::Ordering::SeqCst);
 
     for line in reader.lines() {
         let line = line.map_err(|e| format!("read: {e}"))?;
@@ -81,8 +109,25 @@ fn run(socket_path: &str, dispatch_tx: Sender<SocketCommand>) -> Result<(), Stri
             }
         };
 
-        if value.get("invoke").is_some() {
-            handle_invoke(value, &dispatch_tx, &writer_tx)?;
+        if let Some(method) = value.get("invoke").and_then(|v| v.as_str()) {
+            // _ping handled inline on the reader thread — cheap echo,
+            // no GTK round-trip, no thread::spawn cost. Keeps heartbeat
+            // responsive even under thread-creation pressure.
+            if method == "_ping" {
+                if let Err(e) = handle_ping(value, &writer_tx) {
+                    log::warn!("[nestty] gui_client ping reply: {e}");
+                }
+                continue;
+            }
+            // Slow path: worker per Invoke so the reader stays
+            // unblocked for the next _ping.
+            let dispatch_tx = dispatch_tx.clone();
+            let writer_tx = writer_tx.clone();
+            thread::spawn(move || {
+                if let Err(e) = handle_invoke(value, &dispatch_tx, &writer_tx) {
+                    log::warn!("[nestty] gui_client invoke worker: {e}");
+                }
+            });
         } else if value.get("ok").is_some() {
             // Response to our gui.register or a heartbeat reply later.
             log::debug!("[nestty] gui_client response: {value}");
@@ -148,6 +193,15 @@ fn await_register_ack(reader: &mut BufReader<UnixStream>, register_id: &str) -> 
     Ok(())
 }
 
+fn handle_ping(value: Value, writer_tx: &Sender<String>) -> Result<(), String> {
+    let inv: Invoke = serde_json::from_value(value).map_err(|e| format!("parse ping: {e}"))?;
+    let resp = Response::success(inv.id, inv.params);
+    let encoded = serde_json::to_string(&resp).map_err(|e| format!("serialize ping: {e}"))?;
+    writer_tx
+        .send(encoded)
+        .map_err(|_| "writer thread closed".to_string())
+}
+
 fn handle_invoke(
     value: Value,
     dispatch_tx: &Sender<SocketCommand>,
@@ -162,9 +216,8 @@ fn handle_invoke(
     if dispatch_tx.send(cmd).is_err() {
         return Err("GTK dispatch channel closed".into());
     }
-    // Keep this strictly larger than the daemon's max per-method timeout
-    // (currently 120s) so the daemon's outer timeout fires first — this
-    // is just the safety net for a wedged GTK pump.
+    // Larger than the daemon's max per-method timeout (120s) so the
+    // daemon's outer timeout fires first; this is the wedged-pump safety net.
     let resp = match reply_rx.recv_timeout(Duration::from_secs(125)) {
         Ok(r) => r,
         Err(_) => Response::error(

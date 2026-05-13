@@ -240,10 +240,11 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
             return;
         }
     };
+    // Third fd, handed to GuiClient on register so heartbeat-triggered
+    // unregister can `shutdown(SHUT_RDWR)` the connection from outside
+    // this reader thread.
+    let shutdown_stream = stream.try_clone().ok();
 
-    // Per-connection writer: serializes outbound lines so multiple
-    // threads (the reader replying to a Request, the daemon dispatch
-    // issuing an Invoke) can share the connection.
     let (writer_tx, writer_rx) = mpsc::channel::<String>();
     thread::spawn(move || {
         let mut writer = write_stream;
@@ -256,6 +257,7 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
 
     let reader = BufReader::new(stream);
     let mut registered_client_id: Option<String> = None;
+    let mut shutdown_stream = shutdown_stream;
 
     for line in reader.lines() {
         let line = match line {
@@ -283,8 +285,12 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
                         );
                         continue;
                     }
-                    let (resp, new_client_id) =
-                        handle_gui_register(&req, &state, writer_tx.clone());
+                    let (resp, new_client_id) = handle_gui_register(
+                        &req,
+                        &state,
+                        writer_tx.clone(),
+                        shutdown_stream.take(),
+                    );
                     send_line(&writer_tx, &resp);
                     if let Some(cid) = new_client_id {
                         registered_client_id = Some(cid);
@@ -354,6 +360,7 @@ fn handle_gui_register(
     req: &Request,
     state: &Arc<DaemonState>,
     writer_tx: mpsc::Sender<String>,
+    shutdown_handle: Option<UnixStream>,
 ) -> (Response, Option<String>) {
     let caps = req
         .params
@@ -388,7 +395,10 @@ fn handle_gui_register(
         );
     }
 
-    let (client_id, is_primary) = state.gui.register(caps, want_primary, writer_tx);
+    let (client_id, is_primary) =
+        state
+            .gui
+            .register(caps, want_primary, writer_tx, shutdown_handle);
     let resp = Response::success(
         req.id.clone(),
         serde_json::json!({
