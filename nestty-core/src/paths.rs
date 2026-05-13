@@ -1,23 +1,11 @@
-//! Platform-aware filesystem paths for the daemon and its clients.
-//!
-//! These helpers replace the previous PID-tied `/tmp/nestty-{PID}.sock` so
-//! `nesttyd` can own a stable, well-known socket location across restarts.
-//! Discovery from `nestctl` and external integrations (hooks, life-assistant
-//! bridge) becomes "does this path exist and connect".
-//!
-//! See `docs/gui-daemon-protocol.md` § Baseline → Transport and
-//! `docs/harness-integration.md` § Platform abstraction.
+//! Platform-aware filesystem paths for nesttyd and its clients.
 
 use std::env;
 use std::path::PathBuf;
 
-/// Per-user runtime directory — short-lived sockets, pids.
-///
-/// - Linux: `${XDG_RUNTIME_DIR}/nestty/` if set, else `/tmp/nestty-{uid}/`.
-///   `/tmp` fallback is namespaced by uid so concurrent users on the same
-///   box don't collide.
-/// - macOS: `~/Library/Caches/nestty/` (Apple's blessed transient cache
-///   location; macOS has no XDG_RUNTIME_DIR equivalent).
+/// - Linux: `$XDG_RUNTIME_DIR/nestty/` or `/tmp/nestty-{uid}/` (uid-namespaced
+///   so multi-user `/tmp` doesn't race on first-binder).
+/// - macOS: `~/Library/Caches/nestty/` (no XDG_RUNTIME_DIR equivalent).
 pub fn runtime_dir() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
@@ -41,8 +29,8 @@ pub fn runtime_dir() -> PathBuf {
     }
 }
 
-/// Well-known daemon socket path. `nesttyd` listens here; `nestctl` and
-/// other clients connect here unless `NESTTY_SOCKET` overrides.
+/// `nesttyd` listens here; `nestctl` connects here unless `NESTTY_SOCKET`
+/// overrides.
 pub fn socket_path() -> PathBuf {
     if let Ok(override_path) = env::var("NESTTY_SOCKET")
         && !override_path.is_empty()
@@ -52,11 +40,8 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("socket")
 }
 
-/// Persistent per-user state (handoffs, indices, anything that should
-/// survive reboot but isn't config).
-///
-/// - Linux: `~/.local/state/nestty/` (XDG state dir).
-/// - macOS: `~/Library/Application Support/nestty/`.
+/// Persistent state (handoffs, indices) — Linux `~/.local/state/nestty/`,
+/// macOS `~/Library/Application Support/nestty/`.
 pub fn state_dir() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
@@ -81,8 +66,7 @@ pub fn state_dir() -> PathBuf {
     }
 }
 
-/// Cache dir for things that can be regenerated (wallpaper lists,
-/// derived indices, etc).
+/// Regenerable cache (wallpaper lists, derived indices).
 pub fn cache_dir() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
@@ -111,17 +95,9 @@ fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Verify a directory is safe to host the daemon's well-known socket:
-///
-/// - exists and is a directory,
-/// - owned by the current user, and
-/// - has no group/other permission bits set (mode `& 0o077 == 0`).
-///
-/// This blocks the "attacker pre-creates `/tmp/nestty-{victim_uid}` before
-/// first daemon start" attack on systems without `XDG_RUNTIME_DIR`. Both
-/// `nesttyd` (before binding) and `nestctl` (before connecting to the
-/// daemon well-known path) consult this so neither uses an attacker-owned
-/// dir.
+/// Dir exists, is owned by current uid, and grants no group/other access.
+/// Blocks the `/tmp/nestty-{victim_uid}` pre-creation attack on systems
+/// without `XDG_RUNTIME_DIR`.
 pub fn is_trusted_dir(path: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = std::fs::metadata(path) else {
@@ -143,7 +119,7 @@ mod tests {
 
     #[test]
     fn socket_path_respects_env_override() {
-        // SAFETY: env mutation in tests is fine if no other thread reads it.
+        // SAFETY: env in tests is fine if no other thread reads it.
         unsafe {
             env::set_var("NESTTY_SOCKET", "/custom/path/sock");
         }
@@ -178,8 +154,7 @@ mod tests {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
-            .expect("loosen perms");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("loosen");
         assert!(!is_trusted_dir(&dir), "0755 dir must NOT be trusted");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("tighten");
         assert!(is_trusted_dir(&dir), "0700 dir owned by us IS trusted");

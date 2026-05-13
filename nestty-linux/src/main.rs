@@ -11,11 +11,9 @@ mod terminal;
 mod webview;
 mod window;
 
-// service_supervisor and trigger_sink now live in `nestty-daemon` (step 2b
-// of the daemon-first migration). nestty-linux imports them via the
-// `nestty_daemon::{service_supervisor, trigger_sink}` paths; `crate::socket`
-// re-exports the shared transport types so callsites in plugin_panel/tabs
-// keep working without further churn.
+// service_supervisor + trigger_sink live in `nestty-daemon`; this crate
+// imports them via `nestty_daemon::{...}` and `crate::socket` re-exports
+// the shared transport types.
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

@@ -31,22 +31,11 @@ pub fn run() {
         let window = NesttyWindow::new(app, &config);
         window.present();
 
-        // Ctrl-C in the foreground or `kill <pid>` from another shell
-        // would otherwise kill the GTK process *without* running the
-        // window's `connect_destroy` callback, leaving the plugin
-        // subprocesses orphaned to init. Handle SIGTERM and SIGINT
-        // by closing all windows — that fires connect_destroy →
-        // ServiceSupervisor::shutdown_all() through the existing
-        // graceful path.
-        //
-        // SIGKILL / segfault: re-armed in step 2c of the daemon-first
-        // migration via the long-lived `nestty-spawner` thread (see
-        // `nestty-daemon::service_supervisor`). Every plugin spawn now
-        // forks from the spawner, so `PR_SET_PDEATHSIG(SIGTERM)` armed
-        // in the child's `pre_exec` fires only when nestty actually
-        // dies. Cooperative shutdown still goes through `shutdown_all`
-        // (this handler triggers it via `close_all_windows →
-        // connect_destroy`); pdeathsig is the crash-safety net.
+        // SIGTERM/SIGINT close windows so `connect_destroy` runs
+        // `ServiceSupervisor::shutdown_all` — without this, default
+        // disposition would kill GTK before that callback fires and
+        // orphan plugin children. SIGKILL/segfault are caught by
+        // `PR_SET_PDEATHSIG` armed in each plugin's `pre_exec`.
         let signal_app = app.downgrade();
         glib::unix_signal_add_local(libc::SIGTERM, move || {
             if let Some(app) = signal_app.upgrade() {

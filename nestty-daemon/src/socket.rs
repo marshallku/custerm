@@ -1,8 +1,5 @@
-//! Socket transport for nesttyd.
-//!
-//! v0 scope: bind well-known socket path, accept connections, respond to
-//! `ping`. No supervisor/trigger/event integration yet — those land in
-//! follow-up commits within step 2 of the migration plan.
+//! Socket transport for nesttyd: bind well-known path, accept connections,
+//! route requests through `ActionRegistry`.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -17,27 +14,12 @@ use nestty_core::action_registry::ActionRegistry;
 use nestty_core::event_bus::EventBus as CoreEventBus;
 use nestty_core::protocol::{Request, Response};
 
-/// Convenience alias for the shared event bus. Mirrors the type nestty-linux
-/// has been passing around as `crate::socket::EventBus`; lifted here so both
-/// the GUI shell and `nesttyd` can use the same handle type without
-/// duplicating the alias.
 pub type EventBus = Arc<CoreEventBus>;
 
-/// Methods served by the legacy `dispatch` match arm in nestty-linux's
-/// socket module (GUI-owned actions: `tab.*`, `webview.*`, `terminal.*`,
-/// `background.*`, `statusbar.*`, `agent.approve`, `claude.start`,
-/// `theme.list`, `plugin.list`, `plugin.open`, `session.*`).
-///
-/// Lives here in the daemon crate because `ServiceSupervisor::new` reserves
-/// these names against plugin `provides[]` claims — without that reservation
-/// a plugin could shadow a GUI-handled method, and the supervisor needs to
-/// know the legacy list whether or not the GUI is actually running. The
-/// GUI re-exports this constant so its own dispatch match still reads
-/// `socket::LEGACY_DISPATCH_METHODS`.
-///
-/// Remove an entry when its method migrates into `ActionRegistry`.
-/// `event.subscribe` is excluded — it owns the connection for the stream's
-/// lifetime, not a one-shot action.
+/// GUI-owned methods that `ServiceSupervisor::new` reserves against plugin
+/// `provides[]` claims so a plugin can't shadow a GUI handler. nestty-linux
+/// re-exports for its own dispatch match. Remove an entry when its method
+/// migrates into `ActionRegistry`.
 pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
     "background.set",
     "background.clear",
@@ -90,33 +72,19 @@ pub fn new_event_bus() -> EventBus {
     Arc::new(CoreEventBus::new())
 }
 
-/// A socket request paired with a reply channel for the GTK main-loop
-/// pump (in the GUI) or for `nesttyd`-internal handlers. The data shape
-/// is platform-neutral — both nestty-linux and nestty-daemon share it,
-/// which is why it lives here in the daemon crate (the daemon's
-/// `ServiceSupervisor` + `LiveTriggerSink` need it too).
+/// Socket request + reply channel, shared between the GUI's GTK main-loop
+/// pump and the daemon's stdio plugin dispatch.
 pub struct SocketCommand {
     pub request: Request,
     pub reply: mpsc::Sender<Response>,
 }
 
-/// Owner-only permissions for the daemon's runtime directory.
-/// `XDG_RUNTIME_DIR` is already 0700 by the XDG spec; the `/tmp/nestty-{uid}/`
-/// fallback needs us to set this explicitly, otherwise another local user
-/// can list / `cd` into the dir and connect the socket.
 const RUNTIME_DIR_MODE: u32 = 0o700;
-/// Owner-only permissions for the socket file itself. Defense in depth
-/// against an XDG_RUNTIME_DIR misconfigured to weaker than 0700.
 const SOCKET_FILE_MODE: u32 = 0o600;
 
-/// Result of `prepare_socket_path` — distinguishes "fresh path, just bind"
-/// from "stale socket file removed, safe to bind" from "another live daemon
-/// is bound, refuse to start" from "path exists but isn't ours, hands off".
 #[derive(Debug, PartialEq, Eq)]
 pub enum SocketPrep {
-    /// Path didn't exist; parent dir created if needed.
     Fresh,
-    /// Stale socket file (no live listener) was removed.
     StaleCleared,
     /// A live `nesttyd` is already listening — caller must not bind.
     InUse,
@@ -127,28 +95,17 @@ pub enum SocketPrep {
     Error(String),
 }
 
-/// Idempotent prep: ensures the parent dir exists, detects stale sockets,
-/// and reports whether it's safe to `bind` next.
-///
-/// **Safety**: we only unlink an existing path entry if it is itself a Unix
-/// socket inode (via `stat` → `S_IFSOCK`). A regular file with the same
-/// path — common if the user mistypes `NESTTY_SOCKET` — is left untouched
-/// and surfaced as `NotSocket`. Same-user data files are not in our blast
-/// radius.
-///
-/// Stale-ness is probed by trying a non-blocking connect on a verified
-/// socket inode: a live listener accepts, a stale path returns
-/// `ConnectionRefused`. The latter is safe to unlink.
+/// Idempotent. Creates parent dir (0700 atomically if it's our runtime
+/// dir), verifies ownership, then probes the path. Only `ConnectionRefused`
+/// on connect proves stale-ness; other errors → `Error` (refuse to unlink
+/// a possibly-live socket). Non-socket inodes are never unlinked.
 pub fn prepare_socket_path(path: &Path) -> SocketPrep {
     if let Some(parent) = path.parent() {
         let owns_parent = parent == nestty_core::paths::runtime_dir();
         if owns_parent {
-            // Atomic create with mode 0700 closes the race where a permissive
-            // umask would briefly expose the new dir to other local users
-            // (the `/tmp/nestty-{victim_uid}` pre-creation attack codex
-            // flagged). `DirBuilder::mode` applies to every directory
-            // newly created by `recursive(true)`; pre-existing parent
-            // components (`/run/user/{uid}/`, `/tmp/`) are not modified.
+            // Atomic create with mode 0700 closes the umask window where
+            // another local user could pre-create the predictable
+            // `/tmp/nestty-{uid}/` and slip a listener in.
             use std::os::unix::fs::DirBuilderExt;
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true);
@@ -160,8 +117,8 @@ pub fn prepare_socket_path(path: &Path) -> SocketPrep {
                 ));
             }
 
-            // Verify ownership: an attacker could have pre-created the dir
-            // before we ran, so the atomic-create no-ops on existing dirs.
+            // Atomic create no-ops on existing dirs — verify ownership in
+            // case an attacker created it first.
             use std::os::unix::fs::MetadataExt;
             match fs::metadata(parent) {
                 Ok(meta) => {
@@ -179,9 +136,8 @@ pub fn prepare_socket_path(path: &Path) -> SocketPrep {
                 }
             }
 
-            // chmod still runs to repair a dir created by an older nesttyd
-            // build that did `create_dir_all` without the mode flag — we
-            // own it (verified above) so this is safe.
+            // Repair perms on a dir created by an older nesttyd that
+            // didn't use the atomic-mode path.
             if let Err(e) =
                 fs::set_permissions(parent, fs::Permissions::from_mode(RUNTIME_DIR_MODE))
             {
@@ -202,10 +158,6 @@ pub fn prepare_socket_path(path: &Path) -> SocketPrep {
         Ok(true) => {}
     }
 
-    // Probe stale-ness. Only `ConnectionRefused` is canonical "no listener
-    // is alive on this inode". Any other error (PermissionDenied, transient
-    // filesystem fault, etc.) is treated as unknown — we refuse to unlink
-    // a possibly-live socket file in that case.
     match UnixStream::connect(path) {
         Ok(_) => SocketPrep::InUse,
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
@@ -222,25 +174,19 @@ pub fn prepare_socket_path(path: &Path) -> SocketPrep {
     }
 }
 
-/// `true` iff the path exists and is a Unix socket (`S_IFSOCK`).
 fn is_unix_socket(path: &Path) -> std::io::Result<bool> {
     use std::os::unix::fs::FileTypeExt;
     let meta = std::fs::symlink_metadata(path)?;
     Ok(meta.file_type().is_socket())
 }
 
-/// Bind a UnixListener at the prepared path. Caller MUST have called
-/// `prepare_socket_path` first and not received `InUse`/`Error`.
-///
-/// Sets the socket file to mode 0600 after bind. Unix-domain sockets honor
-/// filesystem permissions for `connect()`, so this enforces owner-only
-/// access even if the surrounding directory mode is lax.
+/// Caller MUST have called `prepare_socket_path` first and not received
+/// `InUse`/`Error`. Socket file chmod'd to 0600 — fs perms gate `connect()`
+/// on Unix sockets, so this enforces owner-only access even if the parent
+/// dir mode is lax.
 pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
     if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_FILE_MODE)) {
-        // Rollback: socket file is bound but we couldn't lock it down.
-        // Refuse to return a permissive listener; the caller would otherwise
-        // expose it to other UIDs.
         let _ = fs::remove_file(path);
         return Err(std::io::Error::other(format!(
             "chmod socket 0600 failed: {e}"
@@ -249,9 +195,6 @@ pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// State carried across the accept loop and into each connection thread.
-/// Owns the per-process `ActionRegistry` (and, optionally, a held reference
-/// to the `ServiceSupervisor` keeping plugin children alive).
 pub struct DaemonState {
     pub actions: Arc<ActionRegistry>,
 }
@@ -262,14 +205,9 @@ impl DaemonState {
     }
 }
 
-/// Accept loop. Spawns one OS thread per connection. Returns when the
-/// listener yields a fatal error so the caller can run `cleanup_socket`.
-///
-/// We intentionally do NOT swallow errors: an `accept(2)` failure on a
-/// Unix domain socket is almost always non-recoverable (fd exhaustion,
-/// bad listener fd, etc.). Swallowing them would turn a real fault into
-/// a tight warning loop and leave the socket inode on disk because
-/// cleanup never reaches.
+/// Returns on listener fatal error (caller runs `cleanup_socket`). We
+/// don't swallow accept errors — `accept(2)` on a Unix socket fails for
+/// fd exhaustion / bad listener fd, which we can't recover from.
 pub fn run_accept_loop(listener: UnixListener, state: Arc<DaemonState>) {
     for stream in listener.incoming() {
         match stream {
@@ -332,17 +270,9 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
     }
 }
 
-/// Dispatch a single Request → Response.
-///
-/// Routing order:
-/// 1. Anything registered in `state.actions` (including the built-in
-///    `system.ping` plus all plugin-provided action names) → dispatched
-///    through the registry. Sync handlers return inline; blocking ones
-///    run on a worker thread and the connection thread blocks on a
-///    one-shot channel (bounded by `ACTION_TIMEOUT`).
-/// 2. Anything else → `unknown_method`. `LEGACY_DISPATCH_METHODS`
-///    (GUI-owned) is not handled here yet — the daemon currently has no
-///    GUI client protocol to proxy to. That arrives with migration step 4.
+/// Routes through `state.actions` if registered, else `unknown_method`.
+/// `LEGACY_DISPATCH_METHODS` (GUI-owned) gets a hint in the error message
+/// until migration step 4 wires the GUI-client proxy.
 pub fn dispatch(req: &Request, state: &Arc<DaemonState>) -> Response {
     if state.actions.has(&req.method) {
         return dispatch_via_registry(req, &state.actions);
@@ -360,10 +290,8 @@ pub fn dispatch(req: &Request, state: &Arc<DaemonState>) -> Response {
     )
 }
 
-/// Sync bridge: `try_dispatch` is callback-based to support blocking
-/// handlers without parking the registry; nesttyd's connection thread is
-/// itself already off-main and can wait, so we collect the callback
-/// result through a oneshot mpsc.
+/// Bridges callback-based `try_dispatch` to a sync return so the
+/// per-connection thread can block on plugin replies.
 fn dispatch_via_registry(req: &Request, actions: &Arc<ActionRegistry>) -> Response {
     let (tx, rx) = std::sync::mpsc::channel();
     let req_id = req.id.clone();
@@ -380,9 +308,6 @@ fn dispatch_via_registry(req: &Request, actions: &Arc<ActionRegistry>) -> Respon
                     error: Some(err),
                 },
             };
-            // Send may fail if the recv side is gone (timeout already
-            // returned `action_timeout`). That's fine — we just drop the
-            // late reply.
             let _ = tx.send(resp);
         }),
     );
@@ -396,8 +321,6 @@ fn dispatch_via_registry(req: &Request, actions: &Arc<ActionRegistry>) -> Respon
     }
 }
 
-/// Best-effort cleanup. Called by the binary on exit / panic so the next
-/// daemon start sees `prepare_socket_path → Fresh`.
 pub fn cleanup_socket(path: &PathBuf) {
     if let Err(e) = std::fs::remove_file(path)
         && e.kind() != std::io::ErrorKind::NotFound
@@ -493,15 +416,11 @@ mod tests {
 
     #[test]
     fn prepare_socket_path_clears_stale_socket_inode() {
-        // Bind + drop a UnixListener to leave a stale *socket* inode that
-        // is no longer accepting. `prepare_socket_path` should detect that
-        // it IS a socket (S_IFSOCK passes) and that connect refuses, then
-        // unlink it.
         let path = tmp_socket();
         let _ = std::fs::remove_file(&path);
         {
             let _listener = UnixListener::bind(&path).expect("bind");
-        } // dropped → listener closed, but socket inode persists on disk
+        } // dropped → listener closed, but socket inode persists
         assert!(path.exists());
         let res = prepare_socket_path(&path);
         assert_eq!(res, SocketPrep::StaleCleared);
@@ -522,10 +441,8 @@ mod tests {
 
     #[test]
     fn prepare_socket_path_leaves_foreign_parent_perms_alone() {
+        // tempfile_dir() is not runtime_dir(); chmod must NOT fire.
         use std::os::unix::fs::PermissionsExt;
-        // The temp dir we use is NOT the daemon's runtime_dir(), so chmod
-        // must NOT fire — verifies the C1 fix that prevents arbitrary
-        // NESTTY_SOCKET overrides from locking down user dirs.
         let dir = tempfile_dir();
         let path = dir.join("test-foreign-parent-sock");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("loosen dir");
@@ -542,8 +459,6 @@ mod tests {
 
     #[test]
     fn prepare_socket_path_refuses_regular_file() {
-        // A non-socket inode at the path (e.g. mistyped NESTTY_SOCKET).
-        // We must NOT unlink it.
         let path = tmp_socket();
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, "very important user data").expect("write file");
@@ -578,8 +493,6 @@ mod tests {
         let path_clone = path.clone();
         let _server = thread::spawn(move || run_accept_loop(listener, state));
 
-        // Give the accept loop a moment to call into thread::spawn.
-        // Conservative: 50ms is plenty for local Unix sockets.
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         let mut stream = UnixStream::connect(&path_clone).expect("connect");
@@ -594,8 +507,6 @@ mod tests {
         assert!(resp.ok);
         assert_eq!(resp.id, "rt-1");
 
-        // Cleanup. accept loop is daemon-thread; will die with the test
-        // process. Unlink the socket so a re-run doesn't see stale.
         drop(stream);
         let _ = std::fs::remove_file(&path_clone);
     }

@@ -22,10 +22,6 @@ const WALLPAPER_CACHE: &str = ".cache/terminal-wallpapers.txt";
 const BG_MODE_FILE: &str = ".cache/nestty-bg-mode";
 const BUS_SOURCE_NESTTY_LINUX: &str = "nestty-linux";
 
-// Shared transport types + legacy method list now live in nestty-daemon —
-// see step 2b of the daemon-first migration. Re-export so existing
-// `crate::socket::{EventBus, SocketCommand, LEGACY_DISPATCH_METHODS, …}`
-// callsites in nestty-linux keep working without further churn.
 pub use nestty_daemon::socket::{EventBus, LEGACY_DISPATCH_METHODS, SocketCommand, new_event_bus};
 
 pub fn broadcast(bus: &EventBus, event: &Event) {

@@ -262,9 +262,6 @@ pub fn resolve_provides(plugins: &[LoadedPlugin]) -> (ApprovedProvides, Vec<Prov
     (approved, conflict_list)
 }
 
-/// One unit of work for the long-lived spawner thread: which service to
-/// bring up. Sending an `Arc<ServiceHandle>` to the spawner is cheap and
-/// keeps the handle alive across the channel boundary.
 type SpawnRequest = Arc<ServiceHandle>;
 
 pub struct ServiceSupervisor {
@@ -274,22 +271,12 @@ pub struct ServiceSupervisor {
     nestty_version: String,
     init_timeout: Duration,
     action_timeout: Duration,
-    /// `onEvent:` activations need a bus-listener that spawns the service
-    /// on first matching event. `onAction:` doesn't — the registered handler
-    /// triggers spawn via `invoke_remote`. Boot-immutable.
     on_event_rules: Vec<(String, Arc<ServiceHandle>)>,
-    /// Set by `shutdown_all` to suppress restarts and new activations,
-    /// preventing respawn during window-destroy teardown.
     shutting_down: AtomicBool,
-    /// Long-lived spawner thread inbox. All `spawn_service_async` calls
-    /// route here so every plugin `cmd.spawn()` happens on the same OS
-    /// thread — which is what makes `PR_SET_PDEATHSIG(SIGTERM)` actually
-    /// fire on real daemon death rather than per-spawn worker exit.
-    /// `None` after `shutdown_all` drops the sender.
+    /// All spawns route here so every `fork()` happens on the same OS
+    /// thread; that makes `PR_SET_PDEATHSIG(SIGTERM)` fire on real daemon
+    /// death rather than per-spawn worker exit. `None` post-shutdown.
     spawner_tx: Mutex<Option<Sender<SpawnRequest>>>,
-    /// Join handle for the spawner; held so `shutdown_all` can wait for
-    /// in-flight spawns to settle before sweeping pids (closes the C2
-    /// shutdown race codex flagged in step 2b review).
     spawner_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -417,17 +404,9 @@ impl ServiceSupervisor {
             spawner_thread: Mutex::new(None),
         });
 
-        // Bring up the long-lived spawner thread BEFORE any onEvent /
-        // onStartup activation below. Every plugin spawn from this point
-        // on routes through it, so the OS thread that calls `fork()` for
-        // every child is the same thread for the supervisor's whole
-        // lifetime. That makes `PR_SET_PDEATHSIG(SIGTERM)` (armed in
-        // `start_service_inner`) fire only when nesttyd actually dies,
-        // restoring the original Phase 9.5 intent without the
-        // immediate-SIGTERM trap the previous per-spawn-thread code had.
-        //
-        // `Weak<Self>` so the spawner doesn't keep the supervisor alive
-        // past `shutdown_all → drop spawner_tx → join`.
+        // Spawner must be alive before any onEvent / onStartup activation
+        // below sends a SpawnRequest. `Weak<Self>` so the spawner doesn't
+        // keep the supervisor alive past `shutdown_all`'s join.
         let (spawner_tx, spawner_rx) = channel::<SpawnRequest>();
         let sup_weak = Arc::downgrade(&supervisor);
         let spawner_thread = thread::Builder::new()
@@ -518,14 +497,8 @@ impl ServiceSupervisor {
         if self.shutting_down.load(Ordering::SeqCst) {
             return;
         }
-        // Submit to the long-lived spawner thread. If `shutdown_all` has
-        // already taken the sender, silently drop the request — the
-        // supervisor is on its way down and any spawn that would have
-        // happened here is the C2 race we're trying to prevent.
         let tx_guard = self.spawner_tx.lock().unwrap();
         if let Some(tx) = tx_guard.as_ref() {
-            // Send failure means the spawner already dropped its
-            // receiver (shutdown race we can't recover from). Drop.
             let _ = tx.send(handle);
         }
     }
@@ -579,34 +552,15 @@ impl ServiceSupervisor {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Re-armed in step 2c after Phase 9.5's rollback. The original
-        // problem: `PR_SET_PDEATHSIG(SIGTERM)` fires when the **thread**
-        // that called `fork()` exits, not when the parent process exits.
-        // Phase 9.5 ran each spawn from a fresh worker thread that
-        // returned as soon as `cmd.spawn()` completed, so the kernel
-        // SIGTERM'd every plugin moments after init succeeded.
-        //
-        // Step 2c routes every plugin spawn through a long-lived
-        // `nestty-spawner` thread set up in `ServiceSupervisor::new`.
-        // That thread lives for the supervisor's full lifetime, so the
-        // kernel only sends SIGTERM when `nesttyd` itself dies — which
-        // is the original intent: on crash (SIGKILL, segfault, panic
-        // before `shutdown_all` can fire), every supervised plugin
-        // reaps cleanly. Cooperative shutdown still goes through
-        // `shutdown_all`'s explicit SIGTERM/SIGKILL; pdeathsig is the
-        // crash-safety net.
-        //
-        // macOS has no direct equivalent (no `prctl`, no
-        // `setpdeathsig`). We rely on `shutdown_all` for cooperative
-        // exit there; SIGKILL'd `nesttyd` on macOS still orphans
-        // children (a known limitation tracked alongside the macOS
-        // shell pivot in `docs/harness-integration.md` § Out of scope).
+        // pdeathsig only fires correctly because every fork happens on
+        // the long-lived `nestty-spawner` thread (set up in `new`).
+        // macOS has no equivalent — `shutdown_all` is the only path
+        // there.
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY: pre_exec runs in the child after fork. `prctl` and
-            // `getppid` are async-signal-safe and touch only the calling
-            // process's own state. No locks, no allocations.
+            // SAFETY: pre_exec runs post-fork in the child. `prctl` and
+            // `getppid` are async-signal-safe; no allocs / locks.
             unsafe {
                 cmd.pre_exec(|| {
                     let rc = libc::prctl(
@@ -619,16 +573,9 @@ impl ServiceSupervisor {
                     if rc != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    // Close the fork()/prctl() TOCTOU: if the parent
-                    // died between fork and the prctl above, the kernel
-                    // already reparented us to PID 1 and never delivered
-                    // the death signal. Detect that explicitly and
-                    // self-terminate before exec'ing the plugin binary
-                    // so we never survive as an orphan.
+                    // Closes fork→prctl TOCTOU: parent died in the
+                    // window and we got reparented to init.
                     if libc::getppid() == 1 {
-                        // _exit (NOT exit) — bypass atexit/destructors;
-                        // we're in async-signal context. Non-zero
-                        // status so a hypothetical wait-watcher logs.
                         libc::_exit(129);
                     }
                     Ok(())
@@ -997,14 +944,9 @@ impl ServiceSupervisor {
         let delay = handle.backoff.lock().unwrap().next_delay();
         let sup = self.clone();
         let h = handle.clone();
-        // Restart MUST route through `spawn_service_async` (i.e. via the
-        // long-lived spawner thread) — otherwise this transient thread
-        // becomes the fork-thread for the new child, and pdeathsig fires
-        // when this thread exits seconds later (the original Phase 9.5
-        // trap codex flagged in step 2c review C1). The sleep runs in
-        // this transient thread; the submission afterwards routes
-        // through the supervisor's `shutting_down` check + spawner
-        // channel exactly like initial activation.
+        // Backoff sleep lives on this transient thread; the actual fork
+        // must go through `spawn_service_async` so pdeathsig binds to
+        // the long-lived spawner thread, not us.
         thread::spawn(move || {
             thread::sleep(delay);
             sup.spawn_service_async(h);
@@ -1323,56 +1265,18 @@ impl ServiceSupervisor {
         self.services.lock().unwrap().len()
     }
 
-    /// Idempotent five-stage shutdown (since step 2c's pdeathsig rework):
-    /// 1. Set `shutting_down` (must precede exits, else `restart=always`
-    ///    plugins exiting on the `shutdown` notification could respawn;
-    ///    also short-circuits any spawn_service_async submissions and
-    ///    the spawner loop's per-iteration check).
-    /// 2. Notify every Running service via the JSON `shutdown` frame.
-    /// 3. 200ms cooperative grace — plugins exit on the frame.
-    /// 4. Drop the spawner sender + join the `nestty-spawner` thread.
-    ///    Joining triggers `PR_SET_PDEATHSIG(SIGTERM)` for any plugin
-    ///    still alive (safety net for cooperative-shutdown holdouts).
-    ///    A second 200ms grace lets SIGTERM handlers run.
-    /// 5. SIGKILL belt-and-suspenders for anything that ignored both
-    ///    the JSON shutdown AND SIGTERM.
+    /// Idempotent. Stages: set `shutting_down`, send JSON `shutdown`,
+    /// 200ms grace, drain+join spawner (pdeathsig SIGTERM), 200ms
+    /// SIGTERM-handler grace, SIGKILL sweep.
     ///
-    /// Worst-case latency: 400ms typical (steps 3+grace), but can grow
-    /// to ~5.4s if the spawner is mid-`start_service` when shutdown
-    /// begins (the `DEFAULT_INIT_TIMEOUT` recv blocks `join`). See
-    /// inline comment at the drain site for the cooperative-init
-    /// follow-up that would cut this.
-    ///
-    /// Subscribe-forwarder threads hold cloned `outgoing` senders; the
-    /// SIGKILL chain (writer → forwarder) terminates them naturally.
+    /// Worst-case latency ~5.4s if the spawner is mid-`start_service`
+    /// (init_timeout 5s blocks join); typical ~400ms.
     pub fn shutdown_all(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
 
-        // Ordering rationale (Linux pdeathsig interaction): on Linux every
-        // plugin child has `PR_SET_PDEATHSIG(SIGTERM)` armed and the
-        // kernel ties that signal to the thread that called `fork()` —
-        // our long-lived `nestty-spawner` thread. Joining the spawner
-        // would therefore SIGTERM every running plugin before our
-        // cooperative `shutdown` notification can reach it. Ordering:
-        //
-        //   1. Set `shutting_down` (already done above) so any new
-        //      `spawn_service_async` returns early and any spawn already
-        //      sitting in the spawner queue is short-circuited by the
-        //      `spawner_loop` entry check.
-        //   2. Send cooperative `shutdown` notifications while the
-        //      spawner is still alive (plugins still alive).
-        //   3. Wait the 200ms grace.
-        //   4. Drop the spawner sender + join. pdeathsig now fires for
-        //      any plugin that hasn't already exited — safety net.
-        //   5. Explicit SIGKILL sweep for anything that ignored both
-        //      cooperative shutdown AND SIGTERM.
-        //
-        // Step 4 also closes the C2 spawn race codex flagged in step 2b
-        // review: any spawn that landed on the spawner between steps 1
-        // and 4 is either (a) skipped by the loop's `shutting_down`
-        // check or (b) spawned then killed by the loop's post-spawn
-        // re-check before the loop exits. After join we know there are
-        // no in-flight spawns.
+        // Cooperative shutdown must precede the spawner join: joining
+        // triggers pdeathsig SIGTERM on every still-running plugin, and
+        // we want them to receive the JSON `shutdown` first.
 
         let services = self.services.lock().unwrap().clone();
         for handle in &services {
@@ -1388,20 +1292,9 @@ impl ServiceSupervisor {
 
         thread::sleep(Duration::from_millis(200));
 
-        // Drain the spawner pipeline AFTER the cooperative grace so
-        // pdeathsig only catches plugins that ignored the request.
-        //
-        // Latency note: `join()` waits for the spawner's current
-        // iteration to complete. If the spawner is mid-`start_service`
-        // when shutdown begins, that can include the full
-        // `DEFAULT_INIT_TIMEOUT` (5s) waiting for a plugin's
-        // `initialize` reply. So worst-case shutdown latency =
-        // 200ms (cooperative grace) + up to 5s (in-flight init)
-        // + 200ms (SIGTERM handler grace below). Typical case where
-        // no plugin is starting at shutdown time stays at ~400ms.
-        // Cutting the init wait would require a cooperative
-        // shutting_down check inside `start_service`'s recv_timeout
-        // loop; tracked as a follow-up if shutdown UX needs it.
+        // Drop sender + join spawner. join() can block up to
+        // init_timeout (5s) if the spawner is mid-`start_service`;
+        // see fn doc-comment for worst-case latency.
         {
             let mut tx_guard = self.spawner_tx.lock().unwrap();
             *tx_guard = None;
@@ -1412,12 +1305,8 @@ impl ServiceSupervisor {
             eprintln!("[nestty] spawner thread join failed: {e:?}");
         }
 
-        // Joining the spawner triggers `PR_SET_PDEATHSIG(SIGTERM)` for
-        // any plugin still alive. Give those plugins a brief window to
-        // run their SIGTERM handlers (write final state, close
-        // connections) before the SIGKILL belt below. Without this
-        // grace, SIGTERM and SIGKILL arrive back-to-back and SIGTERM
-        // handlers never fire.
+        // SIGTERM-handler grace — joining the spawner just fired
+        // pdeathsig SIGTERM on every survivor.
         thread::sleep(Duration::from_millis(200));
 
         for handle in &services {
@@ -1428,27 +1317,13 @@ impl ServiceSupervisor {
     }
 }
 
-/// Body of the long-lived spawner thread. Receives `SpawnRequest`s from
-/// `spawn_service_async` and brings each service up via `start_service`.
-///
-/// **Lifetime**: the thread lives as long as the `Sender` half is alive.
-/// `shutdown_all` drops the sender, the receiver wakes with `Err`, and
-/// the loop exits. Joining the JoinHandle then guarantees every spawn
-/// that was queued before shutdown either completed or was skipped.
-///
-/// **C2 race close**: after `start_service` returns, we re-check
-/// `shutting_down`. If it flipped between the entry-check and now, the
-/// child we just spawned is doomed — we kill it here so it doesn't
-/// outlive the daemon. Without this, `shutdown_all`'s pid sweep would
-/// have already happened (it sweeps once after joining us), missing
-/// this newborn.
+/// Receives `SpawnRequest`s, brings services up via `start_service`.
+/// Lives until `shutdown_all` drops the Sender. The post-`start_service`
+/// `shutting_down` re-check kills any newborn child that shutdown raced
+/// past — without it the pid sweep would miss it.
 fn spawner_loop(sup: Weak<ServiceSupervisor>, rx: Receiver<SpawnRequest>) {
     while let Ok(handle) = rx.recv() {
         let Some(sup) = sup.upgrade() else {
-            // Supervisor Arc dropped while we held the queue — race that
-            // only happens if every external Arc was released without
-            // calling shutdown_all (test cleanup paths). Drop the
-            // remaining requests on the floor.
             return;
         };
         if sup.shutting_down.load(Ordering::SeqCst) {
@@ -1461,9 +1336,6 @@ fn spawner_loop(sup: Weak<ServiceSupervisor>, rx: Receiver<SpawnRequest>) {
                 e.message
             );
         }
-        // Re-check: shutdown_all may have fired during start_service.
-        // The pid sweep over there happens after our drain, so a child
-        // we just registered would otherwise leak.
         if sup.shutting_down.load(Ordering::SeqCst)
             && let Some(pid) = *handle.child_pid.lock().unwrap()
         {
@@ -1725,10 +1597,6 @@ mod tests {
 
     #[test]
     fn spawner_thread_started_on_new_and_joined_on_shutdown() {
-        // Step 2c invariant: ServiceSupervisor::new spins up a long-lived
-        // spawner thread used by every plugin spawn. shutdown_all must
-        // drain the sender and join the thread before sweeping pids,
-        // otherwise the C2 race codex flagged returns.
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::new());
         let sup = ServiceSupervisor::new(bus, registry, &[], "test", &[]);
@@ -1753,10 +1621,6 @@ mod tests {
 
     #[test]
     fn shutdown_all_is_idempotent() {
-        // Second call should not panic on take()/join() of already-None
-        // spawner state. The supervisor is held by tests via Arc and may
-        // be dropped after explicit shutdown, but defensive callers
-        // sometimes call shutdown_all on every exit path.
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::new());
         let sup = ServiceSupervisor::new(bus, registry, &[], "test", &[]);
