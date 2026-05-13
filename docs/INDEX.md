@@ -18,6 +18,8 @@
 | [service-plugins.md](./service-plugins.md) | End-state vision, plugin-first pivot, Phase 9–18 plan | Planning beyond Phase 8 — every external integration goes here |
 | [kb-protocol.md](./kb-protocol.md)         | KB action contract (search/read/append/ensure) | Building anything that reads or writes the user's notes |
 | [roadmap.md](./roadmap.md)                 | Implementation phases, pending work         | Planning next steps                       |
+| [harness-integration.md](./harness-integration.md) | Daemon-first pivot + integrations with the user's external harness/tools (~/dotfiles/claude, ~/dev/browser, codex-plugin-cc, life-assistant) | Picking next harness-coupled work |
+| [gui-daemon-protocol.md](./gui-daemon-protocol.md) | GUI ↔ daemon wire protocol spec (Invoke, gui.register, capabilities, origin tagging) | Implementing daemon-first migration step 1+ |
 
 ## Quick Reference
 
