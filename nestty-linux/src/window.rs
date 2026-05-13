@@ -124,12 +124,8 @@ impl NesttyWindow {
         // Pumped from the GTK timer below; exposed via the `context.snapshot` action.
         let context = Arc::new(ContextService::new());
 
-        // Action Registry: shared across socket + plugin dispatch paths.
-        // Migrating commands one at a time from the match arm in socket::dispatch.
-        // `with_completion_bus` opts the registry into Phase 14.1 — every
-        // dispatched action auto-publishes `<name>.completed` / `.failed`
-        // on the bus so chained triggers compose without each plugin
-        // having to emit completion events manually.
+        // `with_completion_bus` auto-publishes `<name>.completed/.failed`
+        // so chained triggers compose without per-plugin emit code.
         let actions = Arc::new(ActionRegistry::with_completion_bus(event_bus.clone()));
         // High-frequency built-ins are registered "silent" so their
         // completions don't dwarf real workflow events on the bus.
@@ -163,26 +159,18 @@ impl NesttyWindow {
         // to `socket::dispatch` via the same path.
         let (dispatch_tx, plugin_dispatch_rx) = std::sync::mpsc::channel();
 
-        // Trigger Engine + scoped bus subscriptions. Sink is `LiveTriggerSink`,
-        // which tries the in-process registry first and falls through to
-        // `socket::dispatch` for legacy match-arm commands. That makes every
-        // existing action (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`,
-        // …) reachable from triggers without per-command migration.
-        // Fire-and-forget caveat for fallthrough actions is documented on
-        // `LiveTriggerSink` itself.
-        //
-        // PumpState bundles every per-tick drain target — context-driving
-        // receivers AND trigger subscriptions — so the timer and the config
+        // `LiveTriggerSink` tries the in-process registry first and
+        // falls through to `socket::dispatch` (fire-and-forget caveat
+        // documented on the sink). PumpState bundles every per-tick
+        // drain target so the timer and the config
         // hot-reload callback can both invoke the same `pump_all` sequence.
         // Exact-match context subscriptions (not `*` and not glob) so high-
         // frequency unrelated kinds cannot flood the bounded ctx queues.
         let sink: Arc<dyn TriggerSink> =
             Arc::new(LiveTriggerSink::new(actions.clone(), dispatch_tx.clone()));
-        // Phase 14.2: engine needs a bus handle to publish synthesized
-        // `<trigger_name>.awaited` events when an `await` clause's
-        // payload-match arrives. Without `with_publish_bus` the await
-        // primitive degrades to no-ops (pendings register but never
-        // emit downstream events).
+        // Engine needs the bus to publish synthesized
+        // `<trigger_name>.awaited` events; without `with_publish_bus`
+        // the `await` primitive silently no-ops.
         let triggers = Arc::new(TriggerEngine::with_publish_bus(sink, event_bus.clone()));
         triggers.set_triggers(config.triggers.clone());
         let pump_state = Rc::new(RefCell::new(PumpState {
@@ -210,16 +198,10 @@ impl NesttyWindow {
             );
         }
 
-        // Step 5b: service plugin hosting moved to nesttyd. GUI no
-        // longer spawns or supervises plugin subprocesses; it talks to
-        // them via the daemon socket. Plugin manifests are still
-        // discovered above (line 210) because the GUI needs panel
-        // metadata, module definitions, and command lists for UI
-        // rendering — that's manifest-only, not lifecycle.
+        // Plugin lifecycle belongs to nesttyd; the manifests discovered
+        // above stay for panel/statusbar/command rendering only.
 
-        // Socket server (per-instance, so multiple nestty windows don't
-        // collide). Lives under `runtime_dir()` (owner-only 0700) since
-        // Step 5b.4 — fs-level perms gate `connect(2)`.
+        // Per-instance under `runtime_dir()` (0700) — fs-perms gate connect(2).
         let socket_path = nestty_core::paths::gui_socket_path(std::process::id())
             .to_string_lossy()
             .into_owned();
@@ -308,12 +290,9 @@ impl NesttyWindow {
             // both this timer and the hot-reload callback so semantics match.
             pump_state_timer.borrow().pump_all(&ctx_pump, &trg_pump);
 
-            // Phase 14.2: drop expired pending awaits and emit
-            // `<trigger_name>.awaited` with null payload for any
-            // entry whose `on_timeout = "fire_with_default"`. Cheap
-            // enough to run on every 50ms tick — pending list is
-            // typically single-digit entries; iteration cost
-            // dominated by Instant::now() per entry.
+            // Drop expired pending awaits and emit `<trigger>.awaited`
+            // with null payload for `on_timeout = "fire_with_default"`.
+            // Cheap on every tick: pending list is typically tiny.
             trg_pump.sweep_pending_awaits();
 
             // Process socket commands. After each, drain ONLY context
@@ -333,7 +312,7 @@ impl NesttyWindow {
             glib::ControlFlow::Continue
         });
 
-        // `window.restored` event publication (Phase WR-1).
+        // `window.restored` event publication.
         //
         // Watch the toplevel's `GDK_TOPLEVEL_STATE_SUSPENDED` bit and
         // publish `window.restored` on the 1→0 transition — i.e. the

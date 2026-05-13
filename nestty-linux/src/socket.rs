@@ -34,13 +34,10 @@ pub fn broadcast(bus: &EventBus, event: &Event) {
 pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<SocketCommand> {
     let (tx, rx) = mpsc::channel();
 
-    // Defer to the daemon's hardened prep: it atomically creates the
-    // parent at 0700, REFUSES if the existing dir isn't owner-owned by
-    // us (DirBuilder::mode only sets perms on fresh creates — an
-    // attacker-pre-created lax-perms dir would otherwise slip through),
-    // and unlinks a stale socket only after a `ConnectionRefused`
-    // connect probe. Identical bind side as `daemon::bind_listener` —
-    // chmod 0600 the bound socket so fs-perms gate `connect(2)`.
+    // Reuse `nesttyd`'s hardened prep+bind: atomic 0700 parent with
+    // ownership check (DirBuilder::mode only sets perms on fresh
+    // creates — naive code lets an attacker-precreated lax dir slip
+    // through), and chmod 0600 on the bound socket.
     let path = std::path::Path::new(socket_path);
     match nestty_daemon::socket::prepare_socket_path(path) {
         nestty_daemon::socket::SocketPrep::Fresh
@@ -546,11 +543,7 @@ pub fn dispatch(
         }
 
         _ => {
-            // Step 5b: in-process supervisor is gone. Plugin actions
-            // and daemon-hosted methods fall through to here; proxy
-            // them to nesttyd on a worker thread so the GTK timer
-            // never blocks. Reply lands on cmd.reply asynchronously
-            // with the daemon's response (or no_daemon / overloaded).
+            // Unknown to GUI — proxy to the daemon on a worker thread.
             crate::daemon_forward::forward(cmd.request.clone(), cmd.reply.clone());
         }
     }
@@ -1440,7 +1433,7 @@ fn handle_claude_start(
         }
     };
 
-    // Phase 18.2: prompt seeding via tmux paste-buffer. Caller can
+    // Prompt seeding via tmux paste-buffer. Caller can
     // pass a (possibly multi-line) prompt that we deliver to claude's
     // REPL once the session is alive. `prompt` and `resume_session`
     // are mutually exclusive — `--resume` restores an existing

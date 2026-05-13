@@ -1,9 +1,8 @@
 //! Boolean expression DSL for trigger `condition` clauses.
 //!
-//! Phase 10.2 extends `[[triggers]]` with an optional `condition`
-//! string evaluated against the firing `Event` payload + the current
-//! `Context`. It exists to express patterns the positive-only
-//! payload-match in `WhenSpec` cannot:
+//! Evaluated against the firing `Event` payload + the current
+//! `Context`. Exists for patterns the positive-only payload-match in
+//! `WhenSpec` cannot express:
 //! - "skip if I declined": `event.my_response_status != "declined"`
 //! - "skip the weekly 1:1": `event.recurring_id != "weekly-1on1"`
 //! - "only physical-location meetings": `event.location != null`
@@ -784,7 +783,7 @@ mod tests {
         assert!(!p_eval("false", &e, None).unwrap());
     }
 
-    // -- Real-world Phase 10.2 usage --
+    // -- Real-world usage patterns --
 
     #[test]
     fn skip_declined_pattern() {

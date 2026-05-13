@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn old_request_format_still_parses() {
-        // Wire from a pre-step-4 client (no target_client_id field).
+        // Wire missing the optional target_client_id field.
         let s = r#"{"id":"x","method":"ping","params":{}}"#;
         let req: Request = serde_json::from_str(s).unwrap();
         assert!(req.target_client_id.is_none());

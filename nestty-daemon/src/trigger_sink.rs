@@ -159,11 +159,10 @@ impl TriggerSink for LiveTriggerSink {
                 );
                 return Ok(json!({ "queued": true }));
             }
-            // Sync path: invoke inline and propagate the actual
-            // ActionResult so the engine can log Err / increment
-            // `fired` only on Ok, matching the pre-Phase-9.4 contract.
-            // `try_invoke` runs inline regardless of flag, but we've
-            // already guarded against `is_blocking == true` above.
+            // Sync path: propagate the ActionResult so the engine
+            // increments `fired` only on Ok and logs Err.
+            // `try_invoke` runs inline regardless of the blocking flag —
+            // already guarded against blocking above.
             return self
                 .registry
                 .try_invoke(action, params)

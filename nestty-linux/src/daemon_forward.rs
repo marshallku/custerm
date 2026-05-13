@@ -1,11 +1,6 @@
-//! Forwarder for unknown socket-dispatch methods. When the GUI's
-//! per-instance socket receives a Request that the in-process
-//! `ActionRegistry` doesn't have and no legacy `match` arm handles
-//! (mostly daemon-hosted plugin actions since Step 5b), the request is
-//! queued onto a bounded `ThreadPool` and proxied over the daemon
-//! socket. The reply travels back through the original `SocketCommand`'s
-//! reply channel. Critical: forwarding runs on worker threads, never on
-//! the GTK timer that drives `socket::dispatch`.
+//! Proxies unknown GUI-socket Requests to the daemon. Runs on worker
+//! threads so the GTK timer that drives `socket::dispatch` is never
+//! blocked on a slow daemon/plugin reply.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -18,8 +13,7 @@ use nestty_core::thread_pool::{Cancelable, ThreadPool};
 
 const POOL_WORKERS: usize = 4;
 const POOL_QUEUE: usize = 16;
-/// Slightly longer than the daemon's per-method invoke timeout (120s) so
-/// the daemon's outer timeout fires first.
+/// > daemon's 120s outer timeout — wedged-pump safety net only.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(125);
 
 static POOL: OnceLock<std::sync::Arc<ThreadPool>> = OnceLock::new();
@@ -132,10 +126,9 @@ fn forward_once(socket_path: &str, request: &Request) -> Response {
     }
 }
 
-/// Queues `request` for daemon-side dispatch on a worker. The reply
-/// (success, error, `no_daemon`, or `overloaded`) lands on `reply` and
-/// always carries the original request id. Returns immediately, so the
-/// caller (GTK timer) doesn't block.
+/// Returns immediately (caller never blocks). Reply on `reply` may be
+/// success, daemon error, `no_daemon`, or `overloaded`; always echoes
+/// the original request id.
 pub fn forward(request: Request, reply: Sender<Response>) {
     let job = Box::new(ForwardJob { request, reply });
     if let Err(rejected) = pool().try_execute(job) {

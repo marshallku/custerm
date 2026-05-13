@@ -76,22 +76,13 @@ pub struct GuiClient {
     pub client_id: String,
     pub capabilities: HashSet<String>,
     pub want_primary: bool,
-    /// Bounded so a wedged GUI socket writer can't let the event
-    /// forwarder accumulate memory without limit. See the buffer-size
-    /// rationale where this channel is created (`socket.rs`).
     writer_tx: SyncSender<String>,
-    /// `None` after `fail_all_pending` (= unregister) so a stale Arc held
-    /// across a disconnect can't insert a new pending entry that nobody
-    /// will ever resolve.
+    /// `None` post-unregister — a stale `Arc<GuiClient>` held across a
+    /// disconnect cannot insert a pending entry nobody will resolve.
     pending: Mutex<Option<HashMap<String, Sender<Response>>>>,
-    /// Held so `fail_all_pending` can `shutdown(SHUT_RDWR)` the daemon
-    /// side of the socket. That gives the GUI's reader EOF and the
-    /// daemon's reader EOF too, so a heartbeat-triggered unregister
-    /// terminates the connection and lets the GUI reconnect_loop fire.
+    /// Lets `fail_all_pending` shutdown(Both) the daemon side, so both
+    /// readers EOF and the GUI's reconnect_loop fires.
     shutdown_handle: Mutex<Option<UnixStream>>,
-    /// Flag set by `unregister` so the event forwarder thread exits at
-    /// its next `recv_timeout` tick. Without this the forwarder would
-    /// keep holding an `EventBus` subscriber slot after disconnect.
     forwarder_stop: Arc<AtomicBool>,
 }
 
@@ -128,11 +119,8 @@ impl GuiClient {
                 );
             }
         };
-        // try_send (not send): a full buffer must NOT block this thread,
-        // because the heartbeat loop calls `invoke` and a block here
-        // would prevent the very miss-count that's supposed to detect
-        // and tear down a wedged GUI. Full → treat like disconnected;
-        // heartbeat will increment misses and unregister.
+        // Heartbeat shares this path; blocking on a full buffer would
+        // prevent the miss-count that tears down a wedged GUI.
         if self.writer_tx.try_send(line).is_err() {
             self.remove_pending(&invoke_id);
             return Response::error(
@@ -172,15 +160,11 @@ impl GuiClient {
         }
     }
 
-    /// Marks the client disconnected (pending becomes `None`) and fails
-    /// every currently-pending invoke with the given error. Subsequent
-    /// `invoke` calls also fail fast with `gui_disconnected`. Also shuts
-    /// down the underlying socket so the daemon's connection reader and
-    /// the GUI's reader both see EOF — the GUI's reconnect_loop then
-    /// fires.
+    /// Drains pending Invokes with `err`, marks the client disconnected
+    /// (subsequent `invoke` fail-fast), and tears down the socket.
     pub fn fail_all_pending(&self, err: ResponseError) {
-        // Stop the event forwarder first so it doesn't push more lines
-        // through writer_tx after the connection is being torn down.
+        // Stop forwarder BEFORE shutdown — otherwise it can push more
+        // lines into writer_tx that nothing will ever read.
         self.forwarder_stop.store(true, Ordering::SeqCst);
         let drained = self.pending.lock().unwrap().take();
         if let Some(map) = drained {
@@ -213,9 +197,8 @@ impl GuiRegistry {
         Arc::new(Self::default())
     }
 
-    /// Returns `(client_id, is_primary)`. Always acquires locks in order
-    /// `clients → order → primary` (see `unregister`/`route` for the same
-    /// ordering — diverging would deadlock).
+    /// Returns `(client_id, is_primary)`. Lock order: clients → order →
+    /// primary (same as `unregister`/`route`; reversing deadlocks).
     pub fn register(
         self: &Arc<Self>,
         capabilities: HashSet<String>,
@@ -224,9 +207,8 @@ impl GuiRegistry {
         shutdown_handle: Option<UnixStream>,
     ) -> (String, bool) {
         let client_id = uuid::Uuid::new_v4().to_string();
-        // Snapshot for logging before `capabilities` moves into the client.
-        // Re-locking `self.clients` afterwards just to format caps would
-        // add an avoidable panic point on a poisoned mutex.
+        // Snapshot before `capabilities` moves into the client — avoids
+        // re-locking just to format the log line.
         let caps_summary = {
             let mut v: Vec<&str> = capabilities.iter().map(String::as_str).collect();
             v.sort();
@@ -327,15 +309,13 @@ impl GuiRegistry {
         self.clients.lock().unwrap().get(client_id).cloned()
     }
 
-    /// Starts a per-client thread that drains the daemon EventBus and
-    /// forwards each event over the GUI's writer channel as a wire
-    /// `Event` line. Per protocol § Resolved decisions #1, GUI auto-
-    /// subscribes to all events on register.
+    /// Drains the daemon `EventBus` into the GUI's writer channel as
+    /// wire `Event` lines (protocol § auto-subscribe-all).
     ///
-    /// Call site MUST be `handle_gui_register` AFTER `send_line(&writer_tx,
-    /// &resp)` has shipped the registration ack — starting the forwarder
-    /// earlier races with the ack and lets the GUI's `await_register_ack`
-    /// see an Event line before the Response (Step 5b plan-round-3 C1).
+    /// MUST be called only after the `gui.register` ack has been queued
+    /// on `writer_tx`. Calling earlier races the first event past the
+    /// GUI's `await_register_ack`, which reads the first line as a
+    /// `Response`.
     pub fn start_event_forwarder(&self, client_id: &str, bus: Arc<EventBus>) {
         let Some(client) = self.get(client_id) else {
             return;
@@ -343,9 +323,6 @@ impl GuiRegistry {
         let weak_client = Arc::downgrade(&client);
         let stop = client.forwarder_stop.clone();
         let cid = client_id.to_string();
-        // Subscribe to every event ("*" matches all kinds — see EventBus
-        // pattern semantics) with a bounded queue so a wedged writer
-        // can't accumulate unbounded memory.
         let rx = bus.subscribe("*");
         let _ = thread::Builder::new()
             .name(format!(
@@ -370,10 +347,8 @@ fn forwarder_loop(
                 let Some(client) = weak_client.upgrade() else {
                     return;
                 };
-                // Carry `source` across the wire so the GUI side can
-                // republish with the same provenance — required for
-                // `TriggerEngine::try_promote_or_drop_preflight` to
-                // accept `<action>.completed` from daemon-hosted plugins.
+                // `source` MUST round-trip — the GUI trigger engine's
+                // preflight-promotion gates on it.
                 let wire = WireEvent::new(ev.kind, ev.payload).with_source(ev.source);
                 let line = match serde_json::to_string(&wire) {
                     Ok(s) => s,
@@ -385,13 +360,9 @@ fn forwarder_loop(
                 use std::sync::mpsc::TrySendError;
                 match client.writer_tx.try_send(line) {
                     Ok(_) => {}
-                    // Channel full: GUI socket wedged. Drop this event
-                    // so we don't block the loop (and starve our own
-                    // stop-flag check). Heartbeat is on the same
-                    // writer_tx — it'll fail-fast too, unregister, and
-                    // close the connection. event loss is acceptable
-                    // because (a) the GUI is already malfunctioning and
-                    // (b) the unregister torch-down recovers cleanly.
+                    // Drop on Full to keep the stop-flag check alive;
+                    // heartbeat on the same channel will tear down the
+                    // wedged GUI.
                     Err(TrySendError::Full(_)) => {
                         log::debug!("event forwarder: writer_tx full, dropping event");
                     }

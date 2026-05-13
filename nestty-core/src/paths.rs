@@ -72,9 +72,12 @@ pub fn daemon_socket_path() -> Option<PathBuf> {
     }
 }
 
+/// True for `/tmp/nestty-{PID}.sock` (older builds) or
+/// `<runtime_dir>/gui-{PID}.sock` (current). Used by `daemon_socket_path`
+/// to dodge a child shell that inherited a per-instance GUI socket from
+/// its parent nestty.
 fn is_legacy_per_instance_socket(p: &std::path::Path) -> bool {
     let s = p.to_string_lossy();
-    // Legacy form: `/tmp/nestty-{PID}.sock` (pre-Step-5b.4 GUI socket).
     if let Some(rest) = s.strip_prefix("/tmp/nestty-")
         && let Some(num) = rest.strip_suffix(".sock")
         && !num.is_empty()
@@ -82,11 +85,6 @@ fn is_legacy_per_instance_socket(p: &std::path::Path) -> bool {
     {
         return true;
     }
-    // Hardened form: `<runtime_dir>/gui-{PID}.sock` (Step-5b.4 onward).
-    // Same shape but owner-only directory. The point of this check is to
-    // recognize it as a per-instance GUI socket, NOT the daemon socket
-    // (which is `<runtime_dir>/socket`), so `daemon_socket_path()` can
-    // fall back appropriately when a child shell inherits `NESTTY_SOCKET`.
     if let Some(parent) = p.parent()
         && parent == runtime_dir()
         && let Some(name) = p.file_name().and_then(|n| n.to_str())

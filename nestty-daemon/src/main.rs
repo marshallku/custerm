@@ -1,11 +1,5 @@
-//! `nesttyd` binary entry.
-//!
-//! Hosts the daemon-side `ActionRegistry` (`system.ping`, `system.log`,
-//! `daemon.info`) and — when `NESTTYD_HOST_PLUGINS=1` — a
-//! `ServiceSupervisor` that activates discovered plugins. The flag is
-//! transitional: nestty-linux's GUI window still hosts its own supervisor,
-//! so unconditional plugin hosting would double-spawn. Removed when the
-//! GUI becomes a socket client (migration step 4–5).
+//! `nesttyd` binary entry. Hosts the daemon-side `ActionRegistry`
+//! (builtins + plugins via `ServiceSupervisor`) and the GUI registry.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -73,9 +67,6 @@ fn main() -> ExitCode {
         }
     };
 
-    // Step 5b: daemon is the sole plugin host. The legacy in-process
-    // supervisor in nestty-linux is gone (was a transitional double-
-    // spawn risk during the 4→5 migration).
     let supervisor_guard: Arc<ServiceSupervisor> = activate_supervisor(&actions, &event_bus);
 
     let state = DaemonState::new(actions, event_bus.clone());

@@ -765,9 +765,8 @@ mod tests {
 
     #[test]
     fn interpolates_nested_event_paths() {
-        // Phase 14.2 prep: dot-path access through nested objects so
-        // `{event.await.text}` and `{event.action_result.thread_ts}`
-        // can resolve. Pre-14.2 only top-level keys worked.
+        // Dot-path access through nested objects so
+        // `{event.await.text}` and `{event.action_result.thread_ts}` resolve.
         let t = Trigger {
             name: "t".into(),
             when: WhenSpec {
@@ -1443,9 +1442,9 @@ mod tests {
             });
         }
 
-        // Mock claude.start — records params; returns a stub
-        // shape matching Phase 18.1's response so any further
-        // chained trigger has data to interpolate from.
+        // Mock claude.start — records params; returns a stub matching
+        // the real response shape so chained triggers have data to
+        // interpolate from.
         {
             let recorder = claude_calls.clone();
             registry.register("claude.start", move |params| {
@@ -1787,7 +1786,7 @@ mod tests {
         assert_eq!(claude_calls.load(Ordering::SeqCst), 0);
     }
 
-    // -- Phase 14.2: await primitive --
+    // -- await primitive --
     //
     // The shape under test: a trigger with `await` registers a pending
     // entry on action success, then drains when an event matching the

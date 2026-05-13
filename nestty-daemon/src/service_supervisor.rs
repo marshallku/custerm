@@ -52,7 +52,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 const DEFAULT_INIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Single global action-reply timeout. Sized to accommodate long-running
-/// LLM completions (10-90s); per-action overrides are a future addition.
+/// LLM completions (10-90s).
 const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_PENDING_BUFFER: usize = 64;
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -188,13 +188,11 @@ pub type ApprovedProvides = HashMap<(String, String), Vec<String>>;
 /// order of `[plugin].name` BEFORE any process is spawned, so spawn order,
 /// mtimes, and filesystem layout don't influence which plugin wins.
 pub fn resolve_provides(plugins: &[LoadedPlugin]) -> (ApprovedProvides, Vec<ProvideConflict>) {
-    // Sort by `[plugin].name` first, then by `dir` path as a stable
-    // tiebreaker. Without the secondary key, two plugins with the
-    // same manifest name (which the loader currently doesn't reject —
-    // see roadmap caveat) would resolve via filesystem enumeration
-    // order, which differs across runs and machines. The directory
-    // path is stable per install. Duplicate names are warned about
-    // separately so the user notices and renames one of them.
+    // Sort by `[plugin].name` then by `dir` as a stable tiebreaker.
+    // The loader doesn't reject duplicate manifest names; without the
+    // secondary key, ordering would depend on filesystem enumeration
+    // (differs across runs/machines). Duplicates surface as separate
+    // warnings so the user notices.
     let mut ordered: Vec<&LoadedPlugin> = plugins.iter().collect();
     ordered.sort_by(|a, b| {
         a.manifest
@@ -452,20 +450,15 @@ impl ServiceSupervisor {
         // currently `Stopped` or `Failed`; the event itself is NOT
         // forwarded via this path.
         //
-        // Known caveat (tracked in roadmap): the very first event that
-        // activates the service is dropped from delivery unless the
-        // user also declares the same glob in `subscribes`. The
-        // post-init `subscribes` forwarders subscribe AFTER init
-        // completes, so any event that arrived during init is gone by
-        // the time they exist. Authors who need both activation AND
-        // delivery should put the glob in both lists for Phase 9.1; a
-        // future iteration will pre-subscribe `subscribes` at
-        // supervisor::new so the buffer survives across init.
+        // The very first event that activates the service is dropped
+        // from delivery: post-init `subscribes` forwarders subscribe
+        // AFTER init completes, so an event that arrived during init is
+        // gone by the time they exist. Workaround: declare the glob in
+        // both `provides` and `subscribes`.
         //
         // `Failed` is included alongside `Stopped` so init failures
-        // don't permanently inert an event-activated service, per the
-        // lifecycle contract (`docs/service-plugins.md`): activation
-        // re-arms `Failed`.
+        // don't permanently inert an event-activated service (lifecycle
+        // contract: activation re-arms `Failed`).
         for (glob, handle) in &supervisor.on_event_rules {
             let rx = supervisor.bus.subscribe_unbounded(glob.clone());
             let sup = supervisor.clone();

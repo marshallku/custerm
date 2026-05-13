@@ -201,10 +201,7 @@ pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
 pub struct DaemonState {
     pub actions: Arc<ActionRegistry>,
     pub gui: Arc<GuiRegistry>,
-    /// Reference held for the event-bridge to subscribe to. Each GUI gets
-    /// a forwarder thread (started in `handle_gui_register` AFTER the ack
-    /// is sent) that drains an `event_bus.subscribe("*")` and writes
-    /// `protocol::Event` lines to the GUI's writer channel.
+    /// Forwarded to each registered GUI via `start_event_forwarder`.
     pub event_bus: EventBus,
 }
 
@@ -246,19 +243,13 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
             return;
         }
     };
-    // Third fd, handed to GuiClient on register so heartbeat-triggered
-    // unregister can `shutdown(SHUT_RDWR)` the connection from outside
-    // this reader thread.
+    // Third fd handed to GuiClient so unregister (heartbeat or other)
+    // can shutdown(Both) from outside this reader thread.
     let shutdown_stream = stream.try_clone().ok();
 
-    // Bounded — `auto-subscribe-all` plus a wedged GUI socket writer
-    // would otherwise let `forwarder_loop` accumulate unbounded events
-    // in the channel. 512 lines is plenty of headroom for normal bursts
-    // and far below any memory pressure. When the buffer fills, the
-    // forwarder blocks on `send`; heartbeat-miss eventually unregisters
-    // the client and `fail_all_pending` shuts the socket down, which
-    // wakes the writer (and hence the blocked forwarder) with EOF /
-    // Disconnect — see `gui_registry::forwarder_loop`.
+    // Bounded so the event forwarder can't accumulate unbounded memory
+    // behind a wedged socket writer. Caller (heartbeat / invoke) treats
+    // Full as disconnect; see `GuiClient::invoke`.
     let (writer_tx, writer_rx) = mpsc::sync_channel::<String>(512);
     thread::spawn(move || {
         let mut writer = write_stream;
@@ -307,10 +298,8 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
                     );
                     send_line(&writer_tx, &resp);
                     if let Some(cid) = new_client_id {
-                        // Start AFTER the ack has been queued. Starting
-                        // earlier would race with the registration
-                        // Response line and break `await_register_ack`
-                        // on the GUI (Step 5b round-3 C1 fix).
+                        // MUST come after the ack is queued — see
+                        // `start_event_forwarder` doc.
                         state
                             .gui
                             .start_event_forwarder(&cid, state.event_bus.clone());

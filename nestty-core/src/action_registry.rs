@@ -155,11 +155,9 @@ impl ActionRegistry {
                 .ok_or_else(|| not_found_error(name))?
         };
         let result = handler(params);
-        // Phase 14.1 fan-out applies uniformly across dispatch
-        // primitives. invoke is the simplest path (used by the
-        // default TriggerSink impl below) — without publishing
-        // here, a chained trigger that lands via the default sink
-        // would silently miss every completion event.
+        // Default TriggerSink resolves chained actions through this
+        // path; without publishing here, completion events for those
+        // chains would be silently lost.
         if !silent {
             publish_completion(self.completion_bus.as_deref(), name, &result);
         }
@@ -668,7 +666,7 @@ mod tests {
         assert!(!reg.is_blocking("missing"));
     }
 
-    // -- Phase 14.1: completion-event fan-out --
+    // -- completion-event fan-out --
 
     #[test]
     fn try_dispatch_publishes_completed_on_ok() {
@@ -736,8 +734,7 @@ mod tests {
 
     #[test]
     fn registry_without_completion_bus_does_not_publish() {
-        // Pre-Phase-14.1 semantics — used by tests that don't want
-        // to think about the bus.
+        // Bus-free shape for tests that don't need fan-out.
         let reg = Arc::new(ActionRegistry::new());
         reg.register("ping", |_| Ok(json!("pong")));
         let captured = Arc::new(Mutex::new(None::<ActionResult>));

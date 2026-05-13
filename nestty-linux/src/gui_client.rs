@@ -1,10 +1,7 @@
-//! Daemon-client mode for nestty-linux: connects to `nesttyd`, advertises
-//! GUI capabilities via `gui.register`, and forwards inbound `Invoke`
-//! requests through the existing dispatch pump.
-//!
-//! Always-on since Step 5a. The reconnect loop tolerates a missing
-//! daemon — backoff polls quietly while the GUI keeps running through
-//! its own in-process supervisor/socket.
+//! Daemon-client thread: connects to `nesttyd`, advertises GUI
+//! capabilities via `gui.register`, and forwards inbound `Invoke`
+//! requests through the existing dispatch pump. A missing daemon is
+//! benign — the reconnect loop polls quietly with capped backoff.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -23,12 +20,8 @@ use crate::socket::SocketCommand;
 
 const PROTOCOL_VERSION: u32 = nestty_core::protocol::PROTOCOL_VERSION;
 
-/// Daemon→GUI invoke workers are mostly blocked on the GTK reply channel
-/// (`recv_timeout(125s)`), not on CPU. The size cap exists to stop a
-/// runaway plugin/webview burst from accumulating an unbounded number of
-/// idle waiters, not to maximize throughput. 8/32 is large enough for
-/// realistic concurrent webview + plugin command load and small enough
-/// to make pathological bursts surface as `overloaded` quickly.
+/// Workers spend most of their time waiting on the GTK reply channel,
+/// so the cap is concurrency-limiting, not throughput-tuning.
 const POOL_WORKERS: usize = 8;
 const POOL_QUEUE: usize = 32;
 
@@ -45,30 +38,17 @@ const CAPABILITIES: &[&str] = &[
     "search",
 ];
 
-/// Reconnect backoff bounds.
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Spawns the reconnect loop. Each iteration connects, registers, and
-/// handles Invokes until the daemon connection drops; then waits a
-/// backoff interval and retries. Backoff resets to 1s after a successful
-/// register.
 pub fn spawn(dispatch_tx: Sender<SocketCommand>, event_bus: Arc<EventBus>) {
     thread::Builder::new()
         .name("nestty-gui-client".into())
         .spawn(move || {
-            // Process-lifetime pool. Sharing across reconnects keeps
-            // ThreadPool::Drop (which drains the queue and joins workers,
-            // each potentially holding a 125s reply timeout) off the
-            // reconnect path.
-            //
-            // `generation` invalidates queued jobs across a disconnect:
-            // each `run()` invocation bumps it, and every `GuiInvokeJob`
-            // captures the generation it was admitted under. A worker
-            // that picks up a stale job (admitted while connection N was
-            // alive, executed after connection N+1 took over) writes an
-            // overloaded response back through its now-dead writer_tx
-            // instead of dispatching the side-effecting method.
+            // Pool is process-lifetime: per-reconnect Drop would block
+            // up to `pool_queue * 125s` joining slow invoke workers.
+            // `generation` invalidates jobs admitted under an older
+            // connection so they bail out before mutating GTK state.
             let pool = nestty_core::thread_pool::ThreadPool::new(POOL_WORKERS, POOL_QUEUE);
             let generation = Arc::new(AtomicU64::new(0));
             reconnect_loop(dispatch_tx, pool, generation, event_bus);
@@ -84,14 +64,11 @@ fn reconnect_loop(
 ) {
     let mut backoff = BACKOFF_INITIAL;
     loop {
-        // daemon_socket_path (not socket_path) so a GUI launched from
-        // inside another nestty doesn't try to handshake the daemon
-        // protocol against the parent GUI's per-instance socket. Also
-        // returns None when the well-known runtime_dir is not owner-only,
-        // blocking the /tmp/nestty-{victim_uid} pre-creation attack.
+        // daemon_socket_path filters inherited per-instance NESTTY_SOCKET
+        // and refuses untrusted runtime dirs.
         let Some(socket_path) = nestty_core::paths::daemon_socket_path() else {
             log::debug!(
-                "gui_client: daemon socket path untrusted (likely /tmp/nestty-{{uid}} not 0700-owner-only); sleeping {:?}",
+                "gui_client: daemon socket path untrusted; sleeping {:?}",
                 backoff
             );
             thread::sleep(backoff);
@@ -134,11 +111,9 @@ fn run(
     registered: std::sync::Arc<std::sync::atomic::AtomicBool>,
     event_bus: Arc<EventBus>,
 ) -> Result<(), String> {
-    // Bump generation on entry AND on every exit (Drop guard). The exit
-    // bump is the critical one: between EOF and the next `run()` call
-    // the reconnect_loop sleeps for backoff, and without immediate
-    // invalidation a queued stale job could still pass the generation
-    // check during that window and side-effect through the GTK pump.
+    // Exit bump invalidates queued stale jobs IMMEDIATELY on disconnect,
+    // not on the next `run()` — otherwise the reconnect backoff sleep
+    // is a window where a stale job can still pass the generation check.
     struct GenGuard<'a>(&'a Arc<AtomicU64>);
     impl Drop for GenGuard<'_> {
         fn drop(&mut self) {
@@ -182,18 +157,14 @@ fn run(
         };
 
         if let Some(method) = value.get("invoke").and_then(|v| v.as_str()) {
-            // _ping handled inline on the reader thread — cheap echo,
-            // no GTK round-trip, no pool slot consumed. Keeps heartbeat
-            // responsive under burst load that saturates the pool.
+            // _ping inline so heartbeat stays responsive even when the
+            // pool is saturated.
             if method == "_ping" {
                 if let Err(e) = handle_ping(value, &writer_tx) {
                     log::warn!("[nestty] gui_client ping reply: {e}");
                 }
                 continue;
             }
-            // Slow path: bounded pool. Saturation → cancel inline,
-            // which writes back an `overloaded` Response so daemon's
-            // GuiClient::invoke unblocks immediately.
             let job = Box::new(GuiInvokeJob {
                 value,
                 dispatch_tx: dispatch_tx.clone(),
@@ -205,16 +176,11 @@ fn run(
                 rejected.cancel();
             }
         } else if value.get("ok").is_some() {
-            // Response to our gui.register or a heartbeat reply later.
             log::debug!("[nestty] gui_client response: {value}");
         } else if value.get("type").is_some() {
-            // Auto-subscribed Event stream. Bridge to the local bus so
-            // GUI-side triggers can await on daemon-published events
-            // (chained workflows). Wire carries `source` — preserve it
-            // so the trigger engine's preflight-await promotion (which
-            // gates on COMPLETION_EVENT_SOURCE) accepts forwarded
-            // `<action>.completed` events from daemon-hosted plugins.
-            // Falls back to "daemon" when an older daemon omits source.
+            // `source` must round-trip — the local trigger engine's
+            // preflight-promotion gates on COMPLETION_EVENT_SOURCE for
+            // daemon-hosted plugin completions.
             match serde_json::from_value::<WireEvent>(value) {
                 Ok(wire) => {
                     let source = wire.source.unwrap_or_else(|| "daemon".to_string());
@@ -294,20 +260,18 @@ struct GuiInvokeJob {
     value: Value,
     dispatch_tx: Sender<SocketCommand>,
     writer_tx: Sender<String>,
-    /// Bumped by every `run()` invocation. A job with `admitted_gen`
-    /// less than the current value comes from a dropped connection and
-    /// must NOT dispatch — `tab.new`, `terminal.exec`, `webview.*`, etc.
-    /// would otherwise side-effect after the daemon already failed the
-    /// pending invoke via `fail_all_pending`.
+    /// Connection-generation gate: a worker that picks up a job after
+    /// its admitting connection died MUST NOT dispatch side-effecting
+    /// methods through GTK — the daemon has already failed the pending
+    /// invoke.
     generation: Arc<AtomicU64>,
     admitted_gen: u64,
 }
 
 impl GuiInvokeJob {
     fn write_overloaded(value: &Value, writer_tx: &Sender<String>) {
-        // Best-effort id extraction. If parsing fails the daemon falls
-        // back to its 5/120s gui_timeout — not ideal, but cancel/stale
-        // paths must never panic.
+        // Best-effort id extraction — `cancel` MUST NOT panic on
+        // malformed input.
         let id = value
             .get("id")
             .and_then(|v| v.as_str())
@@ -330,10 +294,6 @@ impl GuiInvokeJob {
 impl Cancelable for GuiInvokeJob {
     fn run(self: Box<Self>) {
         let this = *self;
-        // Generation check: if the connection we were admitted under is
-        // gone, treat as stale and write overloaded back through the
-        // (now-dead) writer_tx. Critical — without this, queued jobs
-        // would side-effect through the GTK dispatcher after disconnect.
         if this.admitted_gen != this.generation.load(Ordering::SeqCst) {
             Self::write_overloaded(&this.value, &this.writer_tx);
             return;
@@ -362,8 +322,7 @@ fn handle_invoke(
     if dispatch_tx.send(cmd).is_err() {
         return Err("GTK dispatch channel closed".into());
     }
-    // Larger than the daemon's max per-method timeout (120s) so the
-    // daemon's outer timeout fires first; this is the wedged-pump safety net.
+    // > daemon's 120s outer timeout — wedged-pump safety net only.
     let resp = match reply_rx.recv_timeout(Duration::from_secs(125)) {
         Ok(r) => r,
         Err(_) => Response::error(
