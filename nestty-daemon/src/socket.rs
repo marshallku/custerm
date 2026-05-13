@@ -12,7 +12,10 @@ use std::thread;
 
 use nestty_core::action_registry::ActionRegistry;
 use nestty_core::event_bus::EventBus as CoreEventBus;
-use nestty_core::protocol::{Request, Response};
+use nestty_core::protocol::{PROTOCOL_VERSION, Request, Response};
+use serde_json::Value;
+
+use crate::gui_registry::{GuiRegistry, method_capability, method_invoke_timeout};
 
 pub type EventBus = Arc<CoreEventBus>;
 
@@ -197,11 +200,15 @@ pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
 
 pub struct DaemonState {
     pub actions: Arc<ActionRegistry>,
+    pub gui: Arc<GuiRegistry>,
 }
 
 impl DaemonState {
     pub fn new(actions: Arc<ActionRegistry>) -> Arc<Self> {
-        Arc::new(Self { actions })
+        Arc::new(Self {
+            actions,
+            gui: GuiRegistry::new(),
+        })
     }
 }
 
@@ -226,68 +233,221 @@ pub fn run_accept_loop(listener: UnixListener, state: Arc<DaemonState>) {
 }
 
 fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
-    let read_half = match stream.try_clone() {
+    let write_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
             log::warn!("nesttyd try_clone failed: {e}");
             return;
         }
     };
-    let reader = BufReader::new(read_half);
-    let mut writer = stream;
+
+    // Per-connection writer: serializes outbound lines so multiple
+    // threads (the reader replying to a Request, the daemon dispatch
+    // issuing an Invoke) can share the connection.
+    let (writer_tx, writer_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let mut writer = write_stream;
+        while let Ok(line) = writer_rx.recv() {
+            if writeln!(writer, "{line}").is_err() {
+                return;
+            }
+        }
+    });
+
+    let reader = BufReader::new(stream);
+    let mut registered_client_id: Option<String> = None;
 
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(e) => {
                 log::debug!("nesttyd connection read err: {e}");
-                return;
+                break;
             }
         };
         if line.trim().is_empty() {
             continue;
         }
 
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => dispatch(&req, &state),
-            Err(e) => Response::error(
-                String::new(),
-                "invalid_request",
-                &format!("malformed JSON: {e}"),
-            ),
-        };
-
-        let encoded = match serde_json::to_string(&response) {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("nesttyd response serialize error: {e}");
-                continue;
+        match parse_wire(&line) {
+            WireMessage::Request(req) => {
+                if req.method == "gui.register" {
+                    if registered_client_id.is_some() {
+                        send_line(
+                            &writer_tx,
+                            &Response::error(
+                                req.id.clone(),
+                                "already_registered",
+                                "gui.register called twice on the same connection",
+                            ),
+                        );
+                        continue;
+                    }
+                    let (resp, new_client_id) =
+                        handle_gui_register(&req, &state, writer_tx.clone());
+                    send_line(&writer_tx, &resp);
+                    if let Some(cid) = new_client_id {
+                        registered_client_id = Some(cid);
+                    }
+                    continue;
+                }
+                let resp = dispatch(&req, &state);
+                send_line(&writer_tx, &resp);
             }
-        };
-        if writeln!(writer, "{encoded}").is_err() {
-            return;
+            WireMessage::Response(resp) => {
+                // From a registered GUI replying to one of our Invokes.
+                if let Some(ref cid) = registered_client_id
+                    && let Some(client) = state.gui.get(cid)
+                {
+                    client.resolve(resp);
+                }
+            }
+            WireMessage::Unknown(reason) => {
+                send_line(
+                    &writer_tx,
+                    &Response::error(String::new(), "invalid_request", &reason),
+                );
+            }
         }
+    }
+
+    if let Some(cid) = registered_client_id {
+        state.gui.unregister(&cid);
     }
 }
 
-/// Routes through `state.actions` if registered, else `unknown_method`.
-/// `LEGACY_DISPATCH_METHODS` (GUI-owned) gets a hint in the error message
-/// until migration step 4 wires the GUI-client proxy.
+enum WireMessage {
+    Request(Request),
+    Response(Response),
+    Unknown(String),
+}
+
+fn parse_wire(line: &str) -> WireMessage {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return WireMessage::Unknown(format!("malformed JSON: {line:.200}"));
+    };
+    if value.get("ok").is_some() {
+        match serde_json::from_value::<Response>(value) {
+            Ok(r) => WireMessage::Response(r),
+            Err(e) => WireMessage::Unknown(format!("malformed Response: {e}")),
+        }
+    } else if value.get("method").is_some() {
+        match serde_json::from_value::<Request>(value) {
+            Ok(r) => WireMessage::Request(r),
+            Err(e) => WireMessage::Unknown(format!("malformed Request: {e}")),
+        }
+    } else {
+        WireMessage::Unknown("missing discriminator (no `ok` or `method`)".into())
+    }
+}
+
+fn send_line(tx: &mpsc::Sender<String>, response: &Response) {
+    match serde_json::to_string(response) {
+        Ok(s) => {
+            let _ = tx.send(s);
+        }
+        Err(e) => log::warn!("nesttyd response serialize error: {e}"),
+    }
+}
+
+fn handle_gui_register(
+    req: &Request,
+    state: &Arc<DaemonState>,
+    writer_tx: mpsc::Sender<String>,
+) -> (Response, Option<String>) {
+    let caps = req
+        .params
+        .get("capabilities")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let want_primary = req
+        .params
+        .get("want_primary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let client_version = req
+        .params
+        .get("protocol_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(PROTOCOL_VERSION as u64);
+    if client_version != PROTOCOL_VERSION as u64 {
+        return (
+            Response::error(
+                req.id.clone(),
+                "incompatible",
+                &format!(
+                    "daemon protocol_version={PROTOCOL_VERSION}, gui sent protocol_version={client_version}"
+                ),
+            ),
+            None,
+        );
+    }
+
+    let (client_id, is_primary) = state.gui.register(caps, want_primary, writer_tx);
+    let resp = Response::success(
+        req.id.clone(),
+        serde_json::json!({
+            "client_id": client_id,
+            "primary": is_primary,
+            "daemon_version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": PROTOCOL_VERSION,
+        }),
+    );
+    (resp, Some(client_id))
+}
+
+/// `state.actions` first, then GUI-owned proxy via `gui_registry`, else
+/// `unknown_method`.
 pub fn dispatch(req: &Request, state: &Arc<DaemonState>) -> Response {
     if state.actions.has(&req.method) {
         return dispatch_via_registry(req, &state.actions);
     }
 
-    let hint = if LEGACY_DISPATCH_METHODS.contains(&req.method.as_str()) {
-        " (GUI-owned method; daemon does not yet proxy these — start the GUI or wait for migration step 4)"
-    } else {
-        ""
-    };
+    if method_capability(&req.method).is_some() {
+        return dispatch_via_gui(req, &state.gui);
+    }
+
     Response::error(
         req.id.clone(),
         "unknown_method",
-        &format!("nesttyd has no action named {}{hint}", req.method),
+        &format!("nesttyd has no action named {}", req.method),
     )
+}
+
+fn dispatch_via_gui(req: &Request, gui: &Arc<GuiRegistry>) -> Response {
+    match gui.route(&req.method, req.target_client_id.as_deref()) {
+        Ok(client) => {
+            let timeout = method_invoke_timeout(&req.method);
+            let resp = client.invoke(&req.method, req.params.clone(), timeout);
+            // The GUI Response carries the invoke_id; rewrite to the
+            // original caller's request id.
+            Response {
+                id: req.id.clone(),
+                ok: resp.ok,
+                result: resp.result,
+                error: resp.error,
+            }
+        }
+        Err("no_gui") => Response::error(
+            req.id.clone(),
+            "no_gui",
+            &format!(
+                "no GUI registered with capability for `{}`; start nestty or pass --target_client_id",
+                req.method
+            ),
+        ),
+        Err("unknown_client") => Response::error(
+            req.id.clone(),
+            "unknown_client",
+            "target_client_id does not match any registered GUI",
+        ),
+        Err(other) => Response::error(req.id.clone(), other, "GUI routing failed"),
+    }
 }
 
 /// Bridges callback-based `try_dispatch` to a sync return so the
@@ -381,18 +541,13 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_legacy_gui_method_returns_unknown_with_hint() {
+    fn dispatch_gui_owned_method_without_gui_returns_no_gui() {
         let state = mk_state_with_ping();
         let req = Request::new("xyz", "tab.new", json!({}));
         let resp = dispatch(&req, &state);
         assert!(!resp.ok);
         let err = resp.error.expect("error");
-        assert_eq!(err.code, "unknown_method");
-        assert!(
-            err.message.contains("GUI-owned"),
-            "should hint at GUI-owned classification, got: {}",
-            err.message
-        );
+        assert_eq!(err.code, "no_gui");
     }
 
     #[test]
@@ -508,6 +663,77 @@ mod tests {
         assert_eq!(resp.id, "rt-1");
 
         drop(stream);
+        let _ = std::fs::remove_file(&path_clone);
+    }
+
+    #[test]
+    fn end_to_end_gui_register_and_invoke_roundtrip() {
+        let path = tmp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = bind_listener(&path).expect("bind");
+        let state = mk_state_with_ping();
+        let path_clone = path.clone();
+        let _server = thread::spawn(move || run_accept_loop(listener, state));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // 1) GUI connects and registers.
+        let gui_stream = UnixStream::connect(&path_clone).expect("connect gui");
+        let mut gui_write = gui_stream.try_clone().expect("clone gui");
+        let mut gui_read = BufReader::new(gui_stream);
+        let reg_req = Request::new(
+            "reg-1",
+            "gui.register",
+            json!({
+                "window_id": "test-win",
+                "capabilities": ["tab"],
+                "want_primary": true,
+                "protocol_version": 1
+            }),
+        );
+        gui_write
+            .write_all((serde_json::to_string(&reg_req).unwrap() + "\n").as_bytes())
+            .expect("write register");
+        let mut line = String::new();
+        gui_read.read_line(&mut line).expect("read register reply");
+        let reg_resp: Response = serde_json::from_str(line.trim()).expect("parse register reply");
+        assert!(reg_resp.ok, "register failed: {reg_resp:?}");
+        let result = reg_resp.result.expect("register has result");
+        assert_eq!(result["primary"], json!(true));
+        assert!(result["client_id"].is_string());
+
+        // 2) Separate client invokes tab.list. Daemon must route to our GUI.
+        let client_stream = UnixStream::connect(&path_clone).expect("connect client");
+        let mut client_write = client_stream.try_clone().expect("clone client");
+        let mut client_read = BufReader::new(client_stream);
+        let tab_req = Request::new("tab-1", "tab.list", json!({}));
+        client_write
+            .write_all((serde_json::to_string(&tab_req).unwrap() + "\n").as_bytes())
+            .expect("write tab.list");
+
+        // 3) GUI side reads the Invoke and replies.
+        let mut invoke_line = String::new();
+        gui_read.read_line(&mut invoke_line).expect("read invoke");
+        let invoke: nestty_core::protocol::Invoke =
+            serde_json::from_str(invoke_line.trim()).expect("parse invoke");
+        assert_eq!(invoke.invoke, "tab.list");
+        let gui_resp = Response::success(invoke.id.clone(), json!({"count": 2, "current": 0}));
+        gui_write
+            .write_all((serde_json::to_string(&gui_resp).unwrap() + "\n").as_bytes())
+            .expect("write gui response");
+
+        // 4) Client receives the forwarded response with its own request id.
+        let mut client_line = String::new();
+        client_read
+            .read_line(&mut client_line)
+            .expect("read client reply");
+        let client_resp: Response =
+            serde_json::from_str(client_line.trim()).expect("parse client reply");
+        assert!(client_resp.ok);
+        assert_eq!(client_resp.id, "tab-1");
+        let r = client_resp.result.expect("result");
+        assert_eq!(r["count"], json!(2));
+        assert_eq!(r["current"], json!(0));
+
         let _ = std::fs::remove_file(&path_clone);
     }
 }

@@ -110,6 +110,46 @@ fn register_builtins(actions: &Arc<ActionRegistry>) {
         }))
         .map_err(|e| internal_error(format!("daemon.info serialization failed: {e}")))
     });
+    actions.register("theme.list", |_| {
+        let themes: Vec<&str> = nestty_core::theme::Theme::list().to_vec();
+        // `current` is GUI-state (per-window). Daemon reports null; GUI
+        // resolves its own current theme through GUI-owned routing later.
+        Ok(json!({ "themes": themes, "current": serde_json::Value::Null }))
+    });
+    actions.register("plugin.list", |_| {
+        let plugins: Vec<_> = nestty_core::plugin::discover_plugins()
+            .into_iter()
+            .map(|p| {
+                let m = &p.manifest;
+                json!({
+                    "name": m.plugin.name,
+                    "title": m.plugin.title,
+                    "version": m.plugin.version,
+                    "description": m.plugin.description,
+                    "panels": m.panels.iter().map(|pd| json!({
+                        "name": pd.name,
+                        "title": pd.title,
+                        "file": pd.file,
+                        "icon": pd.icon,
+                    })).collect::<Vec<_>>(),
+                    "commands": m.commands.iter().map(|c| json!({
+                        "name": c.name,
+                        "exec": c.exec,
+                        "description": c.description,
+                    })).collect::<Vec<_>>(),
+                    "modules": m.modules.iter().map(|md| json!({
+                        "name": md.name,
+                        "exec": md.exec,
+                        "interval": md.interval,
+                        "position": md.position,
+                        "order": md.order,
+                        "class": md.class,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        Ok(json!({ "plugins": plugins }))
+    });
 }
 
 /// Accepts `1`, `true`, `yes` (case-insensitive). Everything else,

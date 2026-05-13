@@ -1374,6 +1374,7 @@ fn parse_inbound(raw: &str) -> Option<InboundFrame> {
             id: id_str,
             method,
             params,
+            target_client_id: None,
         })),
         _ => Some(InboundFrame::Notification { method, params }),
     }

@@ -23,6 +23,7 @@ pub fn send_command(
         id: uuid::Uuid::new_v4().to_string(),
         method: method.to_string(),
         params,
+        target_client_id: None,
     };
 
     let mut writer = stream.try_clone()?;
@@ -54,6 +55,7 @@ pub fn subscribe(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         id: uuid::Uuid::new_v4().to_string(),
         method: "event.subscribe".to_string(),
         params: serde_json::json!({}),
+        target_client_id: None,
     };
 
     let mut writer = stream.try_clone()?;
