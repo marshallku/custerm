@@ -20,6 +20,40 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MAX_MISSES: u32 = 2;
 
+/// Allowed keys for the per-GUI env subset that a registered client
+/// may publish via `gui.register`'s `gui_env` field. Forwarded into
+/// `system.spawn` children so triggers can reach the user's
+/// compositor / Wayland session (`hyprctl`, `notify-send`, etc.). The
+/// list is intentionally small and reviewed at the daemon boundary —
+/// without this filter a malicious GUI could leak `LD_PRELOAD`,
+/// `PATH`, or session secrets into spawned children.
+pub const GUI_ENV_ALLOWED_KEYS: &[&str] = &[
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
+/// Apply [`GUI_ENV_ALLOWED_KEYS`] filtering at the daemon trust
+/// boundary. Called from `handle_gui_register` on every register
+/// payload — GUI-side filtering alone (the client could be a mock)
+/// is not enough.
+pub fn filter_gui_env(raw: &Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(obj) = raw.as_object() else {
+        return out;
+    };
+    for k in GUI_ENV_ALLOWED_KEYS {
+        if let Some(v) = obj.get(*k).and_then(|v| v.as_str()) {
+            out.insert((*k).to_string(), v.to_string());
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy)]
 struct HeartbeatConfig {
     interval: Duration,
@@ -69,6 +103,11 @@ pub struct GuiClient {
     pub client_id: String,
     pub capabilities: HashSet<String>,
     pub want_primary: bool,
+    /// Daemon-filtered subset of the GUI's process env, forwarded by
+    /// the trigger sink into `system.spawn` children. Filtered via
+    /// [`filter_gui_env`] at registration — the daemon never trusts
+    /// the raw GUI input.
+    pub gui_env: HashMap<String, String>,
     writer_tx: SyncSender<String>,
     /// `None` post-unregister — a stale `Arc<GuiClient>` held across a
     /// disconnect cannot insert a pending entry nobody will resolve.
@@ -196,6 +235,7 @@ impl GuiRegistry {
         self: &Arc<Self>,
         capabilities: HashSet<String>,
         want_primary: bool,
+        gui_env: HashMap<String, String>,
         writer_tx: SyncSender<String>,
         shutdown_handle: Option<UnixStream>,
     ) -> (String, bool) {
@@ -211,6 +251,7 @@ impl GuiRegistry {
             client_id: client_id.clone(),
             capabilities,
             want_primary,
+            gui_env,
             writer_tx,
             pending: Mutex::new(Some(HashMap::new())),
             shutdown_handle: Mutex::new(shutdown_handle),
@@ -300,6 +341,17 @@ impl GuiRegistry {
 
     pub fn get(&self, client_id: &str) -> Option<Arc<GuiClient>> {
         self.clients.lock().unwrap().get(client_id).cloned()
+    }
+
+    /// Returns the primary GUI's filtered env subset, or `None` if no
+    /// primary is currently registered (headless mode). Lock order
+    /// `clients → primary` mirrors `route()` to avoid deadlocking
+    /// against any caller that holds clients first.
+    pub fn primary_gui_env(&self) -> Option<HashMap<String, String>> {
+        let clients = self.clients.lock().unwrap();
+        let primary = self.primary.lock().unwrap().clone();
+        let primary_id = primary?;
+        clients.get(&primary_id).map(|c| c.gui_env.clone())
     }
 
     /// Drains the daemon `EventBus` into the GUI's writer channel as
@@ -440,10 +492,80 @@ mod tests {
     }
 
     #[test]
+    fn filter_gui_env_keeps_allowed_strips_disallowed() {
+        let raw = json!({
+            "HYPRLAND_INSTANCE_SIGNATURE": "sig-1",
+            "DISPLAY": ":0",
+            "PATH": "/tmp/evil",
+            "LD_PRELOAD": "/tmp/bad.so",
+            "OPENAI_API_KEY": "sk-secret",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+        });
+        let filtered = filter_gui_env(&raw);
+        assert_eq!(
+            filtered
+                .get("HYPRLAND_INSTANCE_SIGNATURE")
+                .map(String::as_str),
+            Some("sig-1")
+        );
+        assert_eq!(filtered.get("DISPLAY").map(String::as_str), Some(":0"));
+        assert_eq!(
+            filtered.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/1000")
+        );
+        assert!(!filtered.contains_key("PATH"), "PATH must be filtered out");
+        assert!(
+            !filtered.contains_key("LD_PRELOAD"),
+            "LD_PRELOAD must be filtered out"
+        );
+        assert!(
+            !filtered.contains_key("OPENAI_API_KEY"),
+            "secrets must be filtered out"
+        );
+    }
+
+    #[test]
+    fn filter_gui_env_rejects_non_string_values() {
+        let raw = json!({"DISPLAY": 42, "WAYLAND_DISPLAY": "wayland-0"});
+        let filtered = filter_gui_env(&raw);
+        assert!(
+            !filtered.contains_key("DISPLAY"),
+            "non-string values rejected"
+        );
+        assert_eq!(
+            filtered.get("WAYLAND_DISPLAY").map(String::as_str),
+            Some("wayland-0")
+        );
+    }
+
+    #[test]
+    fn primary_gui_env_returns_filtered_set_for_primary() {
+        let reg = GuiRegistry::new();
+        let (tx, _rx) = sync_channel::<String>(64);
+        let mut env = HashMap::new();
+        env.insert(
+            "HYPRLAND_INSTANCE_SIGNATURE".to_string(),
+            "sig-x".to_string(),
+        );
+        let (_, _) = reg.register(mk_caps(&["tab"]), true, env, tx, None);
+        let got = reg.primary_gui_env().expect("primary env present");
+        assert_eq!(
+            got.get("HYPRLAND_INSTANCE_SIGNATURE").map(String::as_str),
+            Some("sig-x")
+        );
+    }
+
+    #[test]
+    fn primary_gui_env_returns_none_with_no_primary() {
+        let reg = GuiRegistry::new();
+        assert!(reg.primary_gui_env().is_none());
+    }
+
+    #[test]
     fn first_want_primary_becomes_primary() {
         let reg = GuiRegistry::new();
         let (tx, _rx) = sync_channel::<String>(64);
-        let (_, is_primary) = reg.register(mk_caps(&["tab"]), true, tx, None);
+        let (_, is_primary) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx, None);
         assert!(is_primary);
     }
 
@@ -451,10 +573,10 @@ mod tests {
     fn want_primary_false_stays_secondary() {
         let reg = GuiRegistry::new();
         let (tx, _rx) = sync_channel::<String>(64);
-        let (_, is_primary) = reg.register(mk_caps(&["tab"]), false, tx, None);
+        let (_, is_primary) = reg.register(mk_caps(&["tab"]), false, HashMap::new(), tx, None);
         assert!(!is_primary);
         let (tx2, _rx2) = sync_channel::<String>(64);
-        let (_, is_primary2) = reg.register(mk_caps(&["tab"]), true, tx2, None);
+        let (_, is_primary2) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx2, None);
         assert!(is_primary2);
     }
 
@@ -462,9 +584,9 @@ mod tests {
     fn second_register_with_want_primary_stays_secondary() {
         let reg = GuiRegistry::new();
         let (tx1, _rx1) = sync_channel::<String>(64);
-        let (_, p1) = reg.register(mk_caps(&["tab"]), true, tx1, None);
+        let (_, p1) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx1, None);
         let (tx2, _rx2) = sync_channel::<String>(64);
-        let (_, p2) = reg.register(mk_caps(&["tab"]), true, tx2, None);
+        let (_, p2) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx2, None);
         assert!(p1);
         assert!(!p2);
     }
@@ -473,7 +595,7 @@ mod tests {
     fn route_returns_primary_for_matching_capability() {
         let reg = GuiRegistry::new();
         let (tx, _rx) = sync_channel::<String>(64);
-        let (cid, _) = reg.register(mk_caps(&["tab", "split"]), true, tx, None);
+        let (cid, _) = reg.register(mk_caps(&["tab", "split"]), true, HashMap::new(), tx, None);
         let client = reg.route("tab.list", None).expect("routed");
         assert_eq!(client.client_id, cid);
     }
@@ -488,7 +610,7 @@ mod tests {
     fn route_no_gui_when_capability_missing() {
         let reg = GuiRegistry::new();
         let (tx, _rx) = sync_channel::<String>(64);
-        reg.register(mk_caps(&["split"]), true, tx, None); // no "tab" cap
+        reg.register(mk_caps(&["split"]), true, HashMap::new(), tx, None); // no "tab" cap
         assert_eq!(reg.route("tab.list", None).err(), Some("no_gui"));
     }
 
@@ -496,9 +618,10 @@ mod tests {
     fn route_target_client_id_picks_specific() {
         let reg = GuiRegistry::new();
         let (tx_primary, _rx_p) = sync_channel::<String>(64);
-        let (_, _) = reg.register(mk_caps(&["tab"]), true, tx_primary, None);
+        let (_, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx_primary, None);
         let (tx_secondary, _rx_s) = sync_channel::<String>(64);
-        let (secondary_id, _) = reg.register(mk_caps(&["tab"]), false, tx_secondary, None);
+        let (secondary_id, _) =
+            reg.register(mk_caps(&["tab"]), false, HashMap::new(), tx_secondary, None);
         let client = reg.route("tab.list", Some(&secondary_id)).expect("routed");
         assert_eq!(client.client_id, secondary_id);
     }
@@ -516,7 +639,7 @@ mod tests {
     fn route_non_gui_owned_method_returns_not_gui_owned() {
         let reg = GuiRegistry::new();
         let (tx, _rx) = sync_channel::<String>(64);
-        reg.register(mk_caps(&["tab"]), true, tx, None);
+        reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx, None);
         assert_eq!(reg.route("system.ping", None).err(), Some("not_gui_owned"));
     }
 
@@ -524,11 +647,11 @@ mod tests {
     fn unregister_primary_promotes_most_recent_want_primary() {
         let reg = GuiRegistry::new();
         let (tx1, _rx1) = sync_channel::<String>(64);
-        let (id1, _) = reg.register(mk_caps(&["tab"]), true, tx1, None);
+        let (id1, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx1, None);
         let (tx2, _rx2) = sync_channel::<String>(64);
-        let (id2, _) = reg.register(mk_caps(&["tab"]), true, tx2, None);
+        let (id2, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx2, None);
         let (tx3, _rx3) = sync_channel::<String>(64);
-        let (id3, _) = reg.register(mk_caps(&["tab"]), true, tx3, None);
+        let (id3, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), tx3, None);
         // Drop the original primary (id1). Most-recent (id3) should win,
         // not id2 (the second-oldest).
         reg.unregister(&id1);
@@ -546,7 +669,7 @@ mod tests {
     fn invoke_timeout_returns_gui_timeout_error() {
         let reg = GuiRegistry::new();
         let (writer_tx, _writer_rx) = sync_channel(64);
-        let (_, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        let (_, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         let client = reg.route("tab.list", None).unwrap();
         let resp = client.invoke("tab.list", json!({}), Duration::from_millis(50));
         assert!(!resp.ok);
@@ -561,7 +684,7 @@ mod tests {
         let reg = GuiRegistry::new();
         let (writer_tx, writer_rx) = sync_channel::<String>(64);
         drop(writer_rx);
-        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         let client = reg.get(&cid).unwrap();
         let weak_client = Arc::downgrade(&client);
         drop(client);
@@ -596,7 +719,7 @@ mod tests {
         // surface gui_disconnected, not wait for the full timeout.
         let reg = GuiRegistry::new();
         let (writer_tx, _writer_rx) = sync_channel::<String>(64);
-        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         let client = reg.get(&cid).unwrap();
         reg.unregister(&cid);
         let start = std::time::Instant::now();
@@ -614,7 +737,7 @@ mod tests {
     fn unregister_fails_pending_invokes_with_disconnect() {
         let reg = GuiRegistry::new();
         let (writer_tx, _writer_rx) = sync_channel(64);
-        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         let client = reg.get(&cid).unwrap();
         // Issue a pending Invoke from a worker, unregister, expect it to
         // surface gui_disconnected.
@@ -638,7 +761,7 @@ mod tests {
         let reg = GuiRegistry::new();
         let bus = Arc::new(EventBus::new());
         let (writer_tx, writer_rx) = sync_channel::<String>(64);
-        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         reg.start_event_forwarder(&cid, bus.clone());
         // Give the forwarder a tick to enter recv_timeout.
         thread::sleep(Duration::from_millis(50));
@@ -664,7 +787,7 @@ mod tests {
         let reg = GuiRegistry::new();
         let (writer_tx, writer_rx) = sync_channel::<String>(1);
         drop(writer_rx);
-        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         let client = reg.get(&cid).unwrap();
         // First call hits the dropped-receiver path (Disconnected).
         let start = std::time::Instant::now();
@@ -686,7 +809,7 @@ mod tests {
         let reg = GuiRegistry::new();
         let bus = Arc::new(EventBus::new());
         let (writer_tx, writer_rx) = sync_channel::<String>(64);
-        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         reg.start_event_forwarder(&cid, bus.clone());
         thread::sleep(Duration::from_millis(50));
         // Publish a BRIDGED event — should be skipped.
@@ -722,7 +845,7 @@ mod tests {
         let reg = GuiRegistry::new();
         let bus = Arc::new(EventBus::new());
         let (writer_tx, writer_rx) = sync_channel::<String>(64);
-        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, HashMap::new(), writer_tx, None);
         reg.start_event_forwarder(&cid, bus.clone());
         thread::sleep(Duration::from_millis(50));
         bus.publish(nestty_core::event_bus::Event::new(

@@ -615,10 +615,18 @@ fn handle_gui_register(
         );
     }
 
+    // Daemon-side env filter at the trust boundary: any registered
+    // client could be a mock, so the GUI-side curation list is not
+    // load-bearing. Only keys in `GUI_ENV_ALLOWED_KEYS` survive.
+    let gui_env = req
+        .params
+        .get("gui_env")
+        .map(crate::gui_registry::filter_gui_env)
+        .unwrap_or_default();
     let (client_id, is_primary) =
         state
             .gui
-            .register(caps, want_primary, writer_tx, shutdown_handle);
+            .register(caps, want_primary, gui_env, writer_tx, shutdown_handle);
     let resp = Response::success(
         req.id.clone(),
         serde_json::json!({
