@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
@@ -48,6 +49,12 @@ const ENV_POOL_QUEUE: &str = "NESTTYD_POOL_QUEUE";
 const ENV_HOST_TRIGGERS: &str = "NESTTYD_HOST_TRIGGERS";
 
 const PUMP_TICK: Duration = Duration::from_millis(50);
+
+/// Daemon config file mtime poll interval. Two seconds is a fair
+/// trade-off: faster than user perception for trigger reloads, but
+/// slow enough that we don't churn the syscall table when nobody is
+/// editing.
+const WATCHER_TICK: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -95,12 +102,25 @@ fn main() -> ExitCode {
     // a registered primary GUI via `gui.route(action, None)`.
     let gui = GuiRegistry::new();
     let context = Arc::new(ContextService::new());
-    let triggers_cfg = load_triggers_config();
-    let pump = build_trigger_engine(&actions, &gui, &context, &event_bus, &triggers_cfg);
+    let (triggers_cfg, initial_mtime) = load_triggers_config();
+    let cached_triggers = Arc::new(Mutex::new(triggers_cfg.clone()));
+    let engine = build_trigger_engine(&actions, &gui, &context, &event_bus, &triggers_cfg);
+    // PumpState — and the bus subscriptions it owns — only exists when
+    // the daemon is dispatch-authoritative. With host_triggers=false
+    // the engine holds the trigger set internally but no receivers are
+    // created, so daemon bus traffic does not accumulate.
+    let pump_state: Option<Arc<Mutex<PumpState>>> = if host_triggers {
+        Some(build_pump_state(&event_bus, &triggers_cfg))
+    } else {
+        None
+    };
     log::info!(
         "trigger engine: {} configured | {} bus pattern(s) | dispatch={}",
         triggers_cfg.len(),
-        pump.0.trigger_subs_len(),
+        pump_state
+            .as_ref()
+            .map(|p| p.lock().unwrap().trigger_subs_len())
+            .unwrap_or(0),
         if host_triggers { "ON" } else { "OFF" }
     );
 
@@ -118,11 +138,34 @@ fn main() -> ExitCode {
         activate_supervisor(&actions, &event_bus, &plugins);
 
     let pump_stop = Arc::new(AtomicBool::new(false));
-    let pump_thread = if host_triggers {
-        Some(spawn_pump_thread(pump, context.clone(), pump_stop.clone()))
-    } else {
-        None
-    };
+    let pump_thread = pump_state.as_ref().map(|p| {
+        spawn_pump_thread(
+            p.clone(),
+            engine.clone(),
+            context.clone(),
+            pump_stop.clone(),
+        )
+    });
+
+    // Config-file watcher runs unconditionally — daemon's own engine
+    // tracks `[[triggers]]` edits even with no GUI attached (headless
+    // case). When `host_triggers=false`, the watcher updates engine
+    // state without touching bus subscriptions (no PumpState exists);
+    // when `=true`, it follows the GUI's hot-reload ordering
+    // (set_triggers → pump_all → reconcile). `initial_mtime` was
+    // captured during `load_triggers_config()` so an edit landing in
+    // the window between main()'s load and the watcher's first tick
+    // is detected on that first tick.
+    let watcher_stop = Arc::new(AtomicBool::new(false));
+    let watcher_thread = spawn_config_watcher(
+        engine.clone(),
+        pump_state.clone(),
+        context.clone(),
+        event_bus.clone(),
+        cached_triggers.clone(),
+        initial_mtime,
+        watcher_stop.clone(),
+    );
 
     let state = DaemonState::new(
         actions,
@@ -137,10 +180,14 @@ fn main() -> ExitCode {
     socket::run_accept_loop(listener, state);
 
     pump_stop.store(true, Ordering::SeqCst);
+    watcher_stop.store(true, Ordering::SeqCst);
     if let Some(handle) = pump_thread
         && let Err(panic) = handle.join()
     {
         log::error!("trigger pump thread panicked: {panic:?}");
+    }
+    if let Err(panic) = watcher_thread.join() {
+        log::error!("config watcher thread panicked: {panic:?}");
     }
 
     // Arc::drop does not call shutdown_all; we must invoke it explicitly
@@ -156,43 +203,61 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn load_triggers_config() -> Vec<Trigger> {
-    match NesttyConfig::load() {
-        Ok(cfg) => cfg.triggers,
+/// Returns the loaded triggers AND the mtime sampled at load time.
+/// The watcher seeds its baseline from this mtime so an edit landing
+/// between main()'s load and the watcher's first tick is detected on
+/// that first tick rather than ignored until the next edit.
+fn load_triggers_config() -> (Vec<Trigger>, Option<std::time::SystemTime>) {
+    let path = NesttyConfig::config_path();
+    let mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    match NesttyConfig::load_from(&path) {
+        Ok(cfg) => (cfg.triggers, mtime),
         Err(e) => {
             log::warn!("trigger config load failed: {e:?}; starting daemon with empty trigger set");
-            Vec::new()
+            (Vec::new(), mtime)
         }
     }
 }
 
-/// Build the trigger machinery: ContextService consumer wiring + sink +
-/// engine + pump-state subscriptions. Registers `context.snapshot` on
-/// the daemon's registry against the same ContextService. Returns the
-/// engine + pump that the pump thread drives (engine is held for the
-/// thread lifetime; pump owns the trigger subscriptions).
+/// Build the engine + register `context.snapshot`. Does NOT create
+/// the PumpState — that's deferred to host-triggers-on mode so we
+/// don't accumulate unbounded trigger subscriptions with no pump
+/// thread to drain them.
 fn build_trigger_engine(
     actions: &Arc<ActionRegistry>,
     gui: &Arc<GuiRegistry>,
     context: &Arc<ContextService>,
     event_bus: &Arc<nestty_core::event_bus::EventBus>,
     triggers_cfg: &[Trigger],
-) -> (PumpState, Arc<TriggerEngine>) {
+) -> Arc<TriggerEngine> {
     let sink: Arc<dyn TriggerSink> = Arc::new(DaemonTriggerSink::new(actions.clone(), gui.clone()));
     let engine = Arc::new(TriggerEngine::with_publish_bus(sink, event_bus.clone()));
     engine.set_triggers(triggers_cfg.to_vec());
-    let mut pump = PumpState::new(event_bus);
-    pump.reconcile_triggers(event_bus, triggers_cfg);
     let ctx_for_snapshot = context.clone();
     actions.register_silent("context.snapshot", move |_| {
         serde_json::to_value(ctx_for_snapshot.snapshot())
             .map_err(|e| internal_error(format!("context snapshot serialize: {e}")))
     });
-    (pump, engine)
+    engine
+}
+
+/// Build + reconcile PumpState. Only call this when the daemon is
+/// host_triggers-enabled; the pump thread that drains the
+/// subscriptions is spawned alongside.
+fn build_pump_state(
+    event_bus: &Arc<nestty_core::event_bus::EventBus>,
+    triggers_cfg: &[Trigger],
+) -> Arc<Mutex<PumpState>> {
+    let mut pump = PumpState::new(event_bus);
+    pump.reconcile_triggers(event_bus, triggers_cfg);
+    Arc::new(Mutex::new(pump))
 }
 
 fn spawn_pump_thread(
-    (pump, engine): (PumpState, Arc<TriggerEngine>),
+    pump: Arc<Mutex<PumpState>>,
+    engine: Arc<TriggerEngine>,
     context: Arc<ContextService>,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
@@ -201,11 +266,109 @@ fn spawn_pump_thread(
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 thread::sleep(PUMP_TICK);
-                pump.pump_all(&context, &engine);
+                pump.lock().unwrap().pump_all(&context, &engine);
                 engine.sweep_pending_awaits();
             }
         })
         .expect("spawn pump thread")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_config_watcher(
+    engine: Arc<TriggerEngine>,
+    pump_state: Option<Arc<Mutex<PumpState>>>,
+    context: Arc<ContextService>,
+    event_bus: Arc<nestty_core::event_bus::EventBus>,
+    cached_triggers: Arc<Mutex<Vec<Trigger>>>,
+    initial_mtime: Option<std::time::SystemTime>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("nestty-config-watcher".into())
+        .spawn(move || {
+            config_watcher_loop(
+                engine,
+                pump_state,
+                context,
+                event_bus,
+                cached_triggers,
+                initial_mtime,
+                stop,
+                &NesttyConfig::config_path(),
+            );
+        })
+        .expect("spawn config watcher thread")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn config_watcher_loop(
+    engine: Arc<TriggerEngine>,
+    pump_state: Option<Arc<Mutex<PumpState>>>,
+    context: Arc<ContextService>,
+    event_bus: Arc<nestty_core::event_bus::EventBus>,
+    cached_triggers: Arc<Mutex<Vec<Trigger>>>,
+    initial_mtime: Option<std::time::SystemTime>,
+    stop: Arc<AtomicBool>,
+    path: &Path,
+) {
+    // Seed from the mtime sampled at the time of the initial config
+    // load, NOT from a fresh sample on watcher startup. The latter
+    // would silently swallow any edit that landed between main()'s
+    // load and the watcher entering this function.
+    let mut last_mtime = initial_mtime;
+    while !stop.load(Ordering::SeqCst) {
+        thread::sleep(WATCHER_TICK);
+        let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        if mtime == last_mtime {
+            continue;
+        }
+        last_mtime = mtime;
+        match NesttyConfig::load_from(path) {
+            Ok(cfg) => apply_reloaded_triggers(
+                &engine,
+                pump_state.as_ref(),
+                &context,
+                &event_bus,
+                &cached_triggers,
+                cfg.triggers,
+            ),
+            Err(e) => log::warn!(
+                "config watcher: parse error on reload: {e:?}; keeping previous trigger set"
+            ),
+        }
+    }
+}
+
+/// Hot-reload contract:
+/// - Always: `engine.set_triggers(new)` + refresh cached_triggers.
+/// - When `pump_state` is `Some` (host_triggers=true): mirror the
+///   GUI's `watch_config` ordering — `pump_all` on OLD subscribers
+///   to flush pending events, then `reconcile_triggers`. Skipping
+///   `pump_all` would discard pending events the new trigger set
+///   would have matched during a pattern-narrowing reload.
+/// - When `pump_state` is `None` (host_triggers=false): bus
+///   subscriptions don't exist at all — nothing to reconcile and
+///   nothing to flush. The engine's internal trigger list is the
+///   only thing that updates.
+fn apply_reloaded_triggers(
+    engine: &Arc<TriggerEngine>,
+    pump_state: Option<&Arc<Mutex<PumpState>>>,
+    context: &Arc<ContextService>,
+    event_bus: &Arc<nestty_core::event_bus::EventBus>,
+    cached_triggers: &Arc<Mutex<Vec<Trigger>>>,
+    new_triggers: Vec<Trigger>,
+) {
+    engine.set_triggers(new_triggers.clone());
+    if let Some(ps) = pump_state {
+        let mut ps = ps.lock().unwrap();
+        ps.pump_all(context, engine);
+        ps.reconcile_triggers(event_bus, &new_triggers);
+    }
+    *cached_triggers.lock().unwrap() = new_triggers;
+    log::info!(
+        "trigger config reloaded ({} triggers)",
+        cached_triggers.lock().unwrap().len()
+    );
 }
 
 fn build_pool() -> Arc<ThreadPool> {
@@ -523,4 +686,153 @@ fn activate_supervisor(
         env!("CARGO_PKG_VERSION"),
         &reserved,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nestty_core::event_bus::EventBus;
+    use nestty_core::trigger::WhenSpec;
+    use serde_json::Value;
+
+    fn mk_trigger(name: &str, kind: &str) -> Trigger {
+        Trigger {
+            name: name.into(),
+            when: WhenSpec {
+                event_kind: kind.into(),
+                payload_match: serde_json::Map::new(),
+            },
+            action: "system.log".into(),
+            params: Value::Null,
+            condition: None,
+            r#await: None,
+        }
+    }
+
+    fn mk_pump_bundle() -> (
+        Arc<EventBus>,
+        Arc<TriggerEngine>,
+        Arc<Mutex<PumpState>>,
+        Arc<ContextService>,
+    ) {
+        let bus = Arc::new(EventBus::new());
+        let actions = Arc::new(ActionRegistry::new());
+        let sink: Arc<dyn nestty_core::trigger::TriggerSink> =
+            actions as Arc<dyn nestty_core::trigger::TriggerSink>;
+        let engine = Arc::new(TriggerEngine::with_publish_bus(sink, bus.clone()));
+        let pump = Arc::new(Mutex::new(PumpState::new(&bus)));
+        let ctx = Arc::new(ContextService::new());
+        (bus, engine, pump, ctx)
+    }
+
+    #[test]
+    fn apply_reloaded_triggers_replaces_engine_and_reconciles() {
+        let (bus, engine, pump, ctx) = mk_pump_bundle();
+        let cached = Arc::new(Mutex::new(Vec::<Trigger>::new()));
+        let new = vec![
+            mk_trigger("a", "panel.focused"),
+            mk_trigger("b", "terminal.cwd_changed"),
+        ];
+        apply_reloaded_triggers(&engine, Some(&pump), &ctx, &bus, &cached, new.clone());
+        assert_eq!(engine.count(), 2);
+        assert_eq!(pump.lock().unwrap().trigger_subs_len(), 2);
+        assert_eq!(cached.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn apply_reloaded_triggers_without_pump_only_updates_engine() {
+        // host_triggers=false path — no PumpState exists, so the
+        // engine's internal trigger list updates but no bus
+        // subscriptions are touched (and none should accumulate).
+        let (bus, engine, _pump, ctx) = mk_pump_bundle();
+        let cached = Arc::new(Mutex::new(Vec::<Trigger>::new()));
+        apply_reloaded_triggers(
+            &engine,
+            None,
+            &ctx,
+            &bus,
+            &cached,
+            vec![mk_trigger("a", "panel.focused")],
+        );
+        assert_eq!(engine.count(), 1);
+    }
+
+    #[test]
+    fn config_watcher_picks_up_mtime_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "nestty-watch-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.toml");
+        // Initial: empty triggers
+        std::fs::write(&path, "").expect("write initial");
+
+        let (bus, engine, _pump, ctx) = mk_pump_bundle();
+        let cached = Arc::new(Mutex::new(Vec::<Trigger>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let path_clone = path.clone();
+        let engine_clone = engine.clone();
+        let ctx_clone = ctx.clone();
+        let bus_clone = bus.clone();
+        let cached_clone = cached.clone();
+        let stop_clone = stop.clone();
+        let initial_mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let handle = thread::spawn(move || {
+            config_watcher_loop(
+                engine_clone,
+                None,
+                ctx_clone,
+                bus_clone,
+                cached_clone,
+                initial_mtime,
+                stop_clone,
+                &path_clone,
+            );
+        });
+
+        // Sleep past the first tick, then rewrite with a trigger. The
+        // 2s WATCHER_TICK makes this a 5s test — slow but adequate for
+        // verifying the poll loop end-to-end.
+        thread::sleep(Duration::from_millis(2500));
+        std::fs::write(
+            &path,
+            r#"
+[[triggers]]
+name = "added"
+action = "system.log"
+params = { message = "hi" }
+[triggers.when]
+event_kind = "panel.focused"
+"#,
+        )
+        .expect("write update");
+
+        thread::sleep(Duration::from_millis(2500));
+        assert_eq!(
+            engine.count(),
+            1,
+            "watcher should have picked up the new trigger"
+        );
+        assert_eq!(cached.lock().unwrap().len(), 1);
+
+        stop.store(true, Ordering::SeqCst);
+        // join with a generous timeout via a polling check
+        for _ in 0..30 {
+            if handle.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        handle.join().expect("watcher thread joined");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
