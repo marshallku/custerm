@@ -178,6 +178,18 @@ pub enum SplitCommand {
 pub enum EventCommand {
     /// Subscribe to terminal events (streams JSON lines)
     Subscribe,
+    /// Publish an event onto the daemon's bus. Useful for firing
+    /// `[[triggers]]` from shell scripts. Source is daemon-stamped
+    /// (`client.<pid>` via SO_PEERCRED); timestamp is daemon-stamped.
+    Publish {
+        /// Event kind (e.g. `panel.focused`, `my.custom`). Cannot end
+        /// in `.completed` or `.failed` — those are reserved for the
+        /// action-registry completion contract.
+        kind: String,
+        /// Optional JSON payload. Defaults to `{}`. Use shell quoting
+        /// (single quotes) to pass spaces / nested JSON.
+        payload: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -470,6 +482,7 @@ impl Cli {
             .to_string(),
             Command::Event(cmd) => match cmd {
                 EventCommand::Subscribe => "event.subscribe",
+                EventCommand::Publish { .. } => "events.publish",
             }
             .to_string(),
             Command::Webview(cmd) => match cmd {

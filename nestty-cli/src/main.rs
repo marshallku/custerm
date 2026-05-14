@@ -18,6 +18,16 @@ fn main() {
         return;
     }
 
+    // `nestctl event publish` bypasses the generic `discover_socket`
+    // (which prefers GUI per-instance sockets) and connects directly
+    // to the daemon — `events.publish` is daemon-only. Done BEFORE
+    // `socket_path` resolution so an invalid JSON payload fails
+    // without ever touching a socket (the generic resolver probes
+    // NESTTY_SOCKET + discover_socket as a side effect).
+    if let Command::Event(EventCommand::Publish { kind, payload }) = &cli.command {
+        std::process::exit(dispatch_publish(kind, payload.as_deref(), cli.json));
+    }
+
     let socket_path = cli.socket.clone().unwrap_or_else(|| {
         std::env::var("NESTTY_SOCKET")
             .ok()
@@ -148,6 +158,55 @@ fn best_connectable_with_prefix(
         }
     }
     None
+}
+
+fn dispatch_publish(kind: &str, payload: Option<&str>, json: bool) -> i32 {
+    // Local JSON parse so a malformed payload fails before opening the
+    // daemon socket. Defaults to `{}` when omitted.
+    let payload_value: serde_json::Value = match payload {
+        Some(raw) => match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error [invalid_argument]: payload is not valid JSON: {e}");
+                return 1;
+            }
+        },
+        None => serde_json::json!({}),
+    };
+    let Some(socket_path) = nestty_core::paths::daemon_socket_path() else {
+        eprintln!(
+            "Error [no_daemon]: daemon socket path is untrusted or runtime dir missing; is nesttyd running?"
+        );
+        return 1;
+    };
+    let params = serde_json::json!({
+        "kind": kind,
+        "payload": payload_value,
+    });
+    match client::send_command(&socket_path.to_string_lossy(), "events.publish", params) {
+        Ok(response) => {
+            if response.ok {
+                if let Some(result) = response.result {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        print_result(&result);
+                    }
+                }
+                0
+            } else if let Some(err) = response.error {
+                eprintln!("Error [{}]: {}", err.code, err.message);
+                1
+            } else {
+                eprintln!("Error: response indicated failure but had no error body");
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to connect: {e}");
+            1
+        }
+    }
 }
 
 fn print_result(value: &serde_json::Value) {
