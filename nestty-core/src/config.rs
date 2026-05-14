@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -252,17 +252,20 @@ impl NesttyConfig {
     }
 
     pub fn load() -> Result<Self> {
-        let config_path = Self::config_path();
+        Self::load_from(&Self::config_path())
+    }
 
-        if !config_path.exists() {
+    /// Path-taking loader. Daemon config watcher uses this with a
+    /// monitored path; tests use it with an isolated tempfile.
+    /// Returns the default config when the path doesn't exist
+    /// (matches `load()`'s contract — first-run users have no file
+    /// yet and we don't want startup to fail).
+    pub fn load_from(path: &Path) -> Result<Self> {
+        if !path.exists() {
             return Ok(Self::default());
         }
-
-        let contents = std::fs::read_to_string(&config_path)?;
-        let config: NesttyConfig = toml::from_str(&contents)
-            .map_err(|e| crate::error::NesttyError::Config(e.to_string()))?;
-
-        Ok(config)
+        let contents = std::fs::read_to_string(path)?;
+        toml::from_str(&contents).map_err(|e| crate::error::NesttyError::Config(e.to_string()))
     }
 
     pub fn write_default() -> Result<PathBuf> {
@@ -313,5 +316,66 @@ name = "catppuccin-mocha"
 "##;
         std::fs::write(&path, default_config)?;
         Ok(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nestty-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn load_from_missing_path_returns_default() {
+        let dir = tmp_dir();
+        let path = dir.join("does-not-exist.toml");
+        let cfg = NesttyConfig::load_from(&path).expect("load");
+        assert!(cfg.triggers.is_empty());
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn load_from_parses_triggers_section() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[triggers]]
+name = "t1"
+action = "system.log"
+params = { message = "hi" }
+[triggers.when]
+event_kind = "x.fired"
+"#,
+        )
+        .expect("write");
+        let cfg = NesttyConfig::load_from(&path).expect("load");
+        assert_eq!(cfg.triggers.len(), 1);
+        assert_eq!(cfg.triggers[0].name, "t1");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn load_from_bubbles_toml_parse_error() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "this is not valid toml = = =").expect("write");
+        let err = NesttyConfig::load_from(&path).unwrap_err();
+        assert!(matches!(err, crate::error::NesttyError::Config(_)));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 }
