@@ -218,25 +218,28 @@ pub struct DaemonState {
 impl DaemonState {
     pub fn new(
         actions: Arc<ActionRegistry>,
+        gui: Arc<GuiRegistry>,
         event_bus: EventBus,
         plugins: Arc<Vec<LoadedPlugin>>,
         socket_path: PathBuf,
     ) -> Arc<Self> {
         Arc::new(Self {
             actions,
-            gui: GuiRegistry::new(),
+            gui,
             event_bus,
             plugins,
             socket_path,
         })
     }
 
-    /// Test-only constructor with empty plugins + placeholder socket path.
-    /// Production callers should pass real values.
+    /// Test-only constructor with empty plugins + placeholder socket path
+    /// and a fresh `GuiRegistry`. Production callers should pass real
+    /// values and share the registry with the trigger sink.
     #[cfg(test)]
     pub fn new_for_test(actions: Arc<ActionRegistry>, event_bus: EventBus) -> Arc<Self> {
         Self::new(
             actions,
+            GuiRegistry::new(),
             event_bus,
             Arc::new(Vec::new()),
             PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),

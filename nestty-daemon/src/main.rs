@@ -7,16 +7,25 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+
 use nestty_core::action_registry::{ActionRegistry, internal_error, invalid_params};
+use nestty_core::config::NesttyConfig;
+use nestty_core::context::ContextService;
 use nestty_core::paths;
 use nestty_core::plugin::LoadedPlugin;
 use nestty_core::protocol::ResponseError;
 use nestty_core::thread_pool::ThreadPool;
+use nestty_core::trigger::{Trigger, TriggerEngine, TriggerSink};
+use nestty_daemon::daemon_trigger_sink::DaemonTriggerSink;
+use nestty_daemon::gui_registry::GuiRegistry;
 use nestty_daemon::plugin_exec::{ShellError, spawn_plugin_shell};
 use nestty_daemon::service_supervisor::ServiceSupervisor;
 use nestty_daemon::socket::{
     self, DaemonState, LEGACY_DISPATCH_METHODS, SocketPrep, new_event_bus,
 };
+use nestty_daemon::trigger_pump::PumpState;
 use nestty_daemon::trigger_sink::TRIGGER_ONLY_RESERVED_METHODS;
 use serde_json::json;
 
@@ -32,6 +41,13 @@ const MODULE_RUN_TIMEOUT: Duration = Duration::from_secs(8);
 const ENV_E2E_ACTIONS: &str = "NESTTYD_E2E_TEST_ACTIONS";
 const ENV_POOL_WORKERS: &str = "NESTTYD_POOL_WORKERS";
 const ENV_POOL_QUEUE: &str = "NESTTYD_POOL_QUEUE";
+/// Stage A introduces the daemon-side TriggerEngine but leaves the pump
+/// dispatch OFF by default. Set to `1`/`true`/`yes` to drive `pump_all`
+/// on the 50ms tick. Until Stage B+C (atomic cut-over) the GUI's local
+/// engine remains authoritative.
+const ENV_HOST_TRIGGERS: &str = "NESTTYD_HOST_TRIGGERS";
+
+const PUMP_TICK: Duration = Duration::from_millis(50);
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -73,6 +89,21 @@ fn main() -> ExitCode {
         register_e2e_actions(&actions);
     }
 
+    // GuiRegistry is built before the trigger sink so both share the
+    // same registry instance — the sink's fallthrough worker resolves
+    // a registered primary GUI via `gui.route(action, None)`.
+    let gui = GuiRegistry::new();
+    let context = Arc::new(ContextService::new());
+    let triggers_cfg = load_triggers_config();
+    let pump = build_trigger_engine(&actions, &gui, &context, &event_bus, &triggers_cfg);
+    let host_triggers = env_flag_enabled(ENV_HOST_TRIGGERS);
+    log::info!(
+        "trigger engine: {} configured | {} bus pattern(s) | dispatch={}",
+        triggers_cfg.len(),
+        pump.0.trigger_subs_len(),
+        if host_triggers { "ON" } else { "OFF" }
+    );
+
     // Bind before activating plugins so a bind failure can't orphan
     // eagerly-spawned children.
     let listener = match socket::bind_listener(&socket_path) {
@@ -86,10 +117,30 @@ fn main() -> ExitCode {
     let supervisor_guard: Arc<ServiceSupervisor> =
         activate_supervisor(&actions, &event_bus, &plugins);
 
-    let state = DaemonState::new(actions, event_bus.clone(), plugins, socket_path.clone());
+    let pump_stop = Arc::new(AtomicBool::new(false));
+    let pump_thread = if host_triggers {
+        Some(spawn_pump_thread(pump, context.clone(), pump_stop.clone()))
+    } else {
+        None
+    };
+
+    let state = DaemonState::new(
+        actions,
+        gui,
+        event_bus.clone(),
+        plugins,
+        socket_path.clone(),
+    );
 
     log::info!("nesttyd listening on {}", socket_path.display());
     socket::run_accept_loop(listener, state);
+
+    pump_stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = pump_thread
+        && let Err(panic) = handle.join()
+    {
+        log::error!("trigger pump thread panicked: {panic:?}");
+    }
 
     // Arc::drop does not call shutdown_all; we must invoke it explicitly
     // for cooperative plugin shutdown before unlinking the socket.
@@ -102,6 +153,58 @@ fn main() -> ExitCode {
     socket::cleanup_socket(&socket_path);
     log::info!("nesttyd shut down");
     ExitCode::SUCCESS
+}
+
+fn load_triggers_config() -> Vec<Trigger> {
+    match NesttyConfig::load() {
+        Ok(cfg) => cfg.triggers,
+        Err(e) => {
+            log::warn!("trigger config load failed: {e:?}; starting daemon with empty trigger set");
+            Vec::new()
+        }
+    }
+}
+
+/// Build the trigger machinery: ContextService consumer wiring + sink +
+/// engine + pump-state subscriptions. Registers `context.snapshot` on
+/// the daemon's registry against the same ContextService. Returns the
+/// engine + pump that the pump thread drives (engine is held for the
+/// thread lifetime; pump owns the trigger subscriptions).
+fn build_trigger_engine(
+    actions: &Arc<ActionRegistry>,
+    gui: &Arc<GuiRegistry>,
+    context: &Arc<ContextService>,
+    event_bus: &Arc<nestty_core::event_bus::EventBus>,
+    triggers_cfg: &[Trigger],
+) -> (PumpState, Arc<TriggerEngine>) {
+    let sink: Arc<dyn TriggerSink> = Arc::new(DaemonTriggerSink::new(actions.clone(), gui.clone()));
+    let engine = Arc::new(TriggerEngine::with_publish_bus(sink, event_bus.clone()));
+    engine.set_triggers(triggers_cfg.to_vec());
+    let mut pump = PumpState::new(event_bus);
+    pump.reconcile_triggers(event_bus, triggers_cfg);
+    let ctx_for_snapshot = context.clone();
+    actions.register_silent("context.snapshot", move |_| {
+        serde_json::to_value(ctx_for_snapshot.snapshot())
+            .map_err(|e| internal_error(format!("context snapshot serialize: {e}")))
+    });
+    (pump, engine)
+}
+
+fn spawn_pump_thread(
+    (pump, engine): (PumpState, Arc<TriggerEngine>),
+    context: Arc<ContextService>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("nestty-trigger-pump".into())
+        .spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                thread::sleep(PUMP_TICK);
+                pump.pump_all(&context, &engine);
+                engine.sweep_pending_awaits();
+            }
+        })
+        .expect("spawn pump thread")
 }
 
 fn build_pool() -> Arc<ThreadPool> {
