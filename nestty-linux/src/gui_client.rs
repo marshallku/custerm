@@ -63,6 +63,34 @@ const CAPABILITIES: &[&str] = &[
     "search",
 ];
 
+/// Curated env keys the GUI exports to the daemon via `gui.register`'s
+/// `gui_env` field. Daemon re-validates against its own whitelist
+/// (see `nestty-daemon::gui_registry::GUI_ENV_ALLOWED_KEYS`), so this
+/// list is a UX nicety, not a trust boundary — keys not in the
+/// daemon's whitelist get silently dropped server-side.
+const GUI_ENV_CURATED_KEYS: &[&str] = &[
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
+/// Build a `{key: value}` JSON object of the GUI process's curated
+/// session env vars to send in `gui.register`. Only keys actually
+/// present in the GUI env are included; absent ones are skipped.
+fn capture_gui_env() -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for k in GUI_ENV_CURATED_KEYS {
+        if let Ok(v) = std::env::var(k) {
+            out.insert((*k).to_string(), Value::String(v));
+        }
+    }
+    out
+}
+
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
@@ -369,6 +397,7 @@ fn register(writer_tx: &Sender<String>) -> Result<String, String> {
             "want_primary": true,
             "version": env!("CARGO_PKG_VERSION"),
             "protocol_version": PROTOCOL_VERSION,
+            "gui_env": capture_gui_env(),
         }),
     );
     let line = serde_json::to_string(&req).map_err(|e| format!("serialize register: {e}"))?;
