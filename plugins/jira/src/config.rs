@@ -329,6 +329,18 @@ fn dirs_config_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Tests that mutate `NESTTY_JIRA_*` env vars must serialize against
+    // each other — cargo runs tests in parallel by default, so the
+    // earlier "single-threaded" SAFETY comments were aspirational, not
+    // enforced. Poisoned guard is recovered so a panic in one test
+    // doesn't cascade-fail the rest.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn validate_base_url_accepts_atlassian_cloud_hosts() {
@@ -467,7 +479,7 @@ mod tests {
 
     #[test]
     fn config_strips_trailing_slash_from_base_url() {
-        // SAFETY: tests run single-threaded for env mutation
+        let _g = env_lock();
         unsafe {
             std::env::set_var("NESTTY_JIRA_BASE_URL", "https://x.atlassian.net/");
             std::env::set_var("NESTTY_JIRA_EMAIL", "a@b.com");
@@ -485,7 +497,7 @@ mod tests {
         // RPC mode must not fail when env credentials are missing —
         // the plugin falls back to the store. Only `auth` subcommand
         // requires the env (checked separately in main::run_auth).
-        // SAFETY: tests run single-threaded for env mutation
+        let _g = env_lock();
         unsafe {
             std::env::remove_var("NESTTY_JIRA_BASE_URL");
             std::env::remove_var("NESTTY_JIRA_EMAIL");
@@ -508,7 +520,7 @@ mod tests {
         // valid stored creds and auth_status would lie about live
         // state until the first 401. Trimmed → empty → fall through
         // to store.
-        // SAFETY: tests run single-threaded for env mutation
+        let _g = env_lock();
         unsafe {
             std::env::set_var("NESTTY_JIRA_BASE_URL", "   ");
             std::env::set_var("NESTTY_JIRA_EMAIL", "  \t  ");
@@ -591,7 +603,7 @@ mod tests {
         // Even with optional env, a present-but-malformed value is
         // still a hard error so a typo doesn't silently mask the
         // stored URL.
-        // SAFETY: tests run single-threaded for env mutation
+        let _g = env_lock();
         unsafe {
             std::env::set_var("NESTTY_JIRA_BASE_URL", "ftp://x.atlassian.net");
             std::env::remove_var("NESTTY_JIRA_EMAIL");
