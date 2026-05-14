@@ -112,7 +112,8 @@ All built-in shortcuts use `Ctrl+Shift` — Ctrl-only keys pass through to termi
 | `Ctrl+Shift+E`                      | Split horizontal                    |
 | `Ctrl+Shift+O`                      | Split vertical                      |
 | `Ctrl+Shift+N` / `Ctrl+Shift+Right` | Focus next pane                     |
-| `Ctrl+Shift+P` / `Ctrl+Shift+Left`  | Focus previous pane                 |
+| `Ctrl+Shift+Left`                   | Focus previous pane                 |
+| `Ctrl+Shift+P`                      | Command palette (filter-and-dispatch any registered action) |
 | `Ctrl+Shift+Tab`                    | Next tab                            |
 | `Ctrl+Shift+1-9`                    | Switch to tab N                     |
 

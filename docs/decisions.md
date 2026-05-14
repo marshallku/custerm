@@ -372,3 +372,26 @@ Under the final design, the SERVICE sees each invoke exactly once across the ful
 **Test coverage:** 3 unit tests on the admission primitives — `waiter_permit_decrements_on_drop`, `waiter_permit_decrements_once_even_under_panic` (panic-unwind preserves the slot release), and `env_waiter_max_falls_back_to_default_on_invalid` (env parse + zero rejection). The full dispatch_invocation path is exercised by the existing e2e (step 5 heartbeat survival, step 7 pool saturation, step 8 plugin RPC round-trip) which transitively cover the counter admission and waiter-thread lifecycle.
 
 **See:** `nestty-daemon/src/service_supervisor.rs` (`waiter_active` counter, `waiter_max` cap, `WaiterPermit` drop-guard, `env_waiter_max` helper, `dispatch_invocation` admission + send + spawn).
+
+## 29. Command Palette (Phase 8 closing)
+
+**Problem:** Phase 8 closed `ActionRegistry` + completion-event fan-out, but the user still had no in-GUI way to enumerate or fire registered/legacy actions. The roadmap-declared affordance was a Ctrl+Shift+P modal — a fuzzy filter over the registry.
+
+**Decision:** Build a minimal GTK4 modal palette in `nestty-linux/src/command_palette.rs`:
+- Modal `Window` (transient on the main window) containing a `SearchEntry` + scrolled `ListBox`.
+- Action surface = `actions.names()` (GUI registry — `system.ping`, `system.log`, `context.snapshot` today) ∪ `LEGACY_DISPATCH_METHODS` (~45 entries re-exported from `nestty_daemon::socket`).
+- Substring filter (case-insensitive, whitespace-trimmed). Fuzzy matching is a follow-up; substring is sufficient for ≤100 entries.
+- Enter on the SearchEntry dispatches the currently selected ListBox row through the existing `dispatch_tx` SocketCommand pump. Empty params (`{}`); actions that need params will surface `invalid_params` via the normal reply path — documented v1 limitation.
+- Up/Down navigates the list while focus stays in the SearchEntry. Esc closes (handled both via a capture-phase `EventControllerKey` and via SearchEntry's `stop-search` signal as a safety net — without the capture phase the SearchEntry's built-in Esc handler ate the event and the palette wouldn't dismiss).
+
+**Destructive-action confirmation (codex review C3 round 1):** `tab.close` with empty params would close the active terminal — accidental data loss if the user typed it + hit Enter to dispatch. Added a `DESTRUCTIVE_ACTIONS: &["tab.close"]` const; before dispatching one of those, show a `gtk4::AlertDialog` with `[Cancel, Confirm]` where Cancel is BOTH default and cancel button (codex review C1 round 2 — Confirm-as-default would let a second stray Enter complete the destruction). The user must explicitly select Confirm to proceed.
+
+**Focus restoration (codex review I1 round 2):** the palette captures `mgr.active_panel()` before opening and calls `panel.grab_focus()` on close (Esc, Cancel, or post-dispatch) so typing returns to the previously focused terminal/webview.
+
+**User-keybinding precedence:** `Ctrl+Shift+P` is a built-in default, but `nestty`'s `check_custom_keybinding` runs BEFORE the built-in match — so a user `config.toml` entry like `"ctrl+shift+p" = "spawn:..."` shadows the palette binding. This is intentional: the custom-keybindings feature exists specifically to let users override defaults. Users who want the palette and an existing Ctrl+Shift+P spawn binding move their custom binding to a different key.
+
+**Visible action surface limitation (codex review C2 round 1):** the palette only enumerates GUI-reachable actions today. Daemon-hosted plugin actions (`kb.search`, `slack.send_message`, etc.) ARE dispatchable through socket dispatch's `daemon_forward` fallback, but they're registered in `nesttyd`'s registry, not the GUI's — and the GUI has no `actions.list` RPC to enumerate them. Documented v2 follow-up. The 48 listed entries already cover the dominant interactive workflow surface.
+
+**Tradeoff:** No param prompt in v1. Adding a form builder for actions that need params would double the diff and pull in an opinion about the form-rendering layer. v2 can wire a second-stage form (or just let the user `nestctl call <method> --params '{...}'` for parametric actions).
+
+**See:** `nestty-linux/src/command_palette.rs` (full implementation + 5 unit tests on `filter_actions`), `nestty-linux/src/tabs.rs` (Ctrl+Shift+P key arm + Ctrl+Shift+Left for prev-pane), `nestty-linux/src/window.rs` (TabManager::new wired with actions registry).

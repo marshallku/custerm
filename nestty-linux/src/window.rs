@@ -239,6 +239,7 @@ impl NesttyWindow {
             event_bus.clone(),
             plugins.clone(),
             dispatch_tx,
+            actions.clone(),
         );
 
         // Status bar

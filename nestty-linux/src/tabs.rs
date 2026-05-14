@@ -38,6 +38,9 @@ pub struct TabManager {
     plugins: Rc<Vec<LoadedPlugin>>,
     /// Sender to dispatch socket commands (for plugin JS bridge)
     dispatch_tx: std::sync::mpsc::Sender<SocketCommand>,
+    /// In-process action registry; used by the Ctrl+Shift+P command
+    /// palette to enumerate registered actions.
+    actions: std::sync::Arc<nestty_core::action_registry::ActionRegistry>,
 }
 
 impl TabManager {
@@ -47,6 +50,7 @@ impl TabManager {
         event_bus: EventBus,
         plugins: Vec<LoadedPlugin>,
         dispatch_tx: std::sync::mpsc::Sender<SocketCommand>,
+        actions: std::sync::Arc<nestty_core::action_registry::ActionRegistry>,
     ) -> Rc<Self> {
         let notebook = gtk4::Notebook::new();
         notebook.set_scrollable(true);
@@ -85,6 +89,7 @@ impl TabManager {
             user_toggled: Rc::new(RefCell::new(false)),
             plugins: Rc::new(plugins),
             dispatch_tx,
+            actions,
         });
 
         // Apply initial collapsed state
@@ -1481,9 +1486,15 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
                 mgr.focus_direction(FocusDirection::Next);
                 glib::Propagation::Stop
             }
-            // Ctrl+Shift+P / Ctrl+Shift+Left: prev pane
-            gdk::Key::P | gdk::Key::Left => {
+            // Ctrl+Shift+Left: prev pane
+            gdk::Key::Left => {
                 mgr.focus_direction(FocusDirection::Prev);
+                glib::Propagation::Stop
+            }
+            // Ctrl+Shift+P: command palette (was prev-pane; Ctrl+Shift+Left
+            // keeps that role)
+            gdk::Key::P => {
+                crate::command_palette::open(&win, &mgr.actions, &mgr.dispatch_tx, &mgr);
                 glib::Propagation::Stop
             }
             // Ctrl+Shift+Tab: next tab
