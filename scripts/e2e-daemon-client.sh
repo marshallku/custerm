@@ -381,6 +381,141 @@ um_code=$(python3 -c "import sys,json; print((json.loads(sys.argv[1])['unknown_m
 [[ "$um_code" == "not_found" ]] || fail "_module.run unknown module: expected error.code='not_found', got $um_code"
 pass "negative paths return not_found"
 
+step 9 "GUI→daemon bridge via _bus.publish + echo gate"
+# Verifies the Stage B bridge: a registered GUI can publish events
+# onto the daemon bus, those events get `bridge_id` set, and the
+# symmetric daemon→GUI forwarder DOES NOT echo them back to the
+# originating GUI. Positive control: a daemon-native completion
+# event (`bridge_id=None`) still flows through.
+BRIDGE_LOG="$WORK/bridge.log"
+python3 - "$SOCKET" >"$BRIDGE_LOG" 2>&1 <<'PY'
+import json, socket, sys, threading, time, uuid
+
+sock_path = sys.argv[1]
+
+# Test 1: unauthorized — fresh connection, no register, _bus.publish
+# should be rejected.
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+f = s.makefile("rwb", buffering=0)
+req = {"id": "unauth-1", "method": "_bus.publish",
+       "params": {"kind": "e2e.test", "source": "unauth",
+                  "timestamp_ms": 1, "payload": {}}}
+f.write((json.dumps(req) + "\n").encode())
+unauth_resp = json.loads(f.readline())
+s.close()
+
+# Test 2: register + _bus.publish + listen for echo + positive control.
+gui = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+gui.connect(sock_path)
+gf = gui.makefile("rwb", buffering=0)
+reg = {"id": str(uuid.uuid4()), "method": "gui.register",
+       "params": {"window_id": str(uuid.uuid4()),
+                  "capabilities": ["tab","split","terminal"],
+                  "want_primary": True, "protocol_version": 1}}
+gf.write((json.dumps(reg) + "\n").encode())
+reg_resp = json.loads(gf.readline())
+host_triggers = reg_resp.get("result", {}).get("host_triggers")
+
+# Send _bus.publish — daemon should publish on bus with bridge_id set.
+pub_id = str(uuid.uuid4())
+pub = {"id": pub_id, "method": "_bus.publish",
+       "params": {"kind": "e2e.bridge_test", "source": "e2e-mock",
+                  "timestamp_ms": 42, "payload": {"marker": "v1"}}}
+gf.write((json.dumps(pub) + "\n").encode())
+
+# Collect events / responses for 1.5s. Expectations:
+#   - one Response with id=pub_id, ok=true, result.queued=true
+#   - ZERO Events of type=e2e.bridge_test (echo gate verified)
+# Then trigger positive control:
+#   - daemon-native __test.slow_blocking from a SEPARATE connection
+#     produces __test.slow_blocking.completed with source=nestty.action
+#     and bridge_id=None → forwarder DOES deliver
+collected = []
+stop = threading.Event()
+def drain():
+    # Read bytes raw + split on '\n'. Avoids readline's interaction
+    # with socket-level timeouts on a file wrapper.
+    buf = bytearray()
+    gui.settimeout(0.2)
+    while not stop.is_set():
+        try:
+            chunk = gui.recv(4096)
+            if not chunk:
+                return
+            buf.extend(chunk)
+            while b"\n" in buf:
+                line, _, rest = buf.partition(b"\n")
+                buf = bytearray(rest)
+                if not line.strip():
+                    continue
+                try:
+                    collected.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except socket.timeout:
+            continue
+        except OSError:
+            return
+t = threading.Thread(target=drain, daemon=True)
+t.start()
+
+# Fire positive control after a short delay so the echo window
+# is fully sampled. Longer total window helps when CI hosts are slow
+# to schedule the drain thread.
+time.sleep(0.5)
+ctrl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+ctrl.connect(sock_path)
+cf = ctrl.makefile("rwb", buffering=0)
+ctrl_req = {"id": str(uuid.uuid4()), "method": "__test.slow_blocking",
+            "params": {"ms": 50}}
+cf.write((json.dumps(ctrl_req) + "\n").encode())
+cf.readline()
+ctrl.close()
+
+time.sleep(2.0)
+stop.set()
+gui.close()
+
+print(json.dumps({
+    "unauth": unauth_resp,
+    "host_triggers_advertised": host_triggers,
+    "register_ok": reg_resp.get("ok"),
+    "publish_resp": next((m for m in collected if m.get("id") == pub_id), None),
+    "echoed_test_kind": [
+        m for m in collected
+        if m.get("type") == "e2e.bridge_test"
+    ],
+    "saw_positive_control": any(
+        m.get("type") == "__test.slow_blocking.completed"
+        and m.get("source") == "nestty.action"
+        for m in collected
+    ),
+}))
+PY
+B_SUMMARY=$(tail -n1 "$BRIDGE_LOG")
+unauth_code=$(python3 -c "import sys,json; print((json.loads(sys.argv[1])['unauth'].get('error') or {}).get('code'))" "$B_SUMMARY")
+[[ "$unauth_code" == "unauthorized" ]] || fail "_bus.publish without register: expected unauthorized, got $unauth_code"
+pass "_bus.publish rejects unregistered caller (unauthorized)"
+
+ht_advertised=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['host_triggers_advertised'])" "$B_SUMMARY")
+[[ "$ht_advertised" == "False" || "$ht_advertised" == "True" ]] || fail "host_triggers ack field missing"
+pass "register ack advertises host_triggers (got $ht_advertised)"
+
+pub_ok=$(python3 -c "import sys,json; print((json.loads(sys.argv[1]).get('publish_resp') or {}).get('ok'))" "$B_SUMMARY")
+[[ "$pub_ok" == "True" ]] || fail "registered _bus.publish: expected ok=true, got $pub_ok (summary: $B_SUMMARY)"
+pub_queued=$(python3 -c "import sys,json; print(((json.loads(sys.argv[1]).get('publish_resp') or {}).get('result') or {}).get('queued'))" "$B_SUMMARY")
+[[ "$pub_queued" == "True" ]] || fail "registered _bus.publish: expected result.queued=true, got $pub_queued (summary: $B_SUMMARY)"
+pass "registered _bus.publish accepted with queued=true"
+
+echoes=$(python3 -c "import sys,json; print(len(json.loads(sys.argv[1])['echoed_test_kind']))" "$B_SUMMARY")
+[[ "$echoes" == "0" ]] || fail "bridge echo gate leaked $echoes copies of e2e.bridge_test back to the GUI"
+pass "bridge echo gate: zero e2e.bridge_test echoes"
+
+ctrl_seen=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['saw_positive_control'])" "$B_SUMMARY")
+[[ "$ctrl_seen" == "True" ]] || fail "positive control: daemon-native completion didn't reach the GUI; can't trust the echo-absence above"
+pass "positive control: __test.slow_blocking.completed delivered (forwarder alive)"
+
 echo
 echo "=== AUTO E2E COMPLETE ==="
 echo
