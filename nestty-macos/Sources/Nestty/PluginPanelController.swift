@@ -177,11 +177,6 @@ final class PluginPanelController: NSViewController, NesttyPanel {
             reply(Self.errorJSON(code: "internal_error", message: "ActionRegistry gone"))
             return
         }
-        // PR2: tryDispatchOrFallback routes daemon-owned actions to
-        // DaemonClient.forward when the plugin/method isn't registered
-        // locally. The fallback's daemon_unavailable / unknown_method
-        // RPCErrors flow through the same `if err = result as? RPCError`
-        // branch below.
         registry.tryDispatchOrFallback(method, params: params) { result in
             if let err = result as? RPCError {
                 reply(Self.errorJSON(code: err.code, message: err.message))

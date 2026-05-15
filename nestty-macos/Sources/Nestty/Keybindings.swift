@@ -163,11 +163,6 @@ enum Keybindings {
             guard pair.count == 2 else { continue }
             params[String(pair[0])] = String(pair[1])
         }
-        // PR2: route through tryDispatchOrFallback so daemon-owned actions
-        // forwarded automatically (registered locally first, fallback to
-        // daemon if not). Unknown method now surfaces as `unknown_method`
-        // RPCError from the fallback rather than the old "not registered"
-        // log line.
         registry.tryDispatchOrFallback(method, params: params) { result in
             if let err = result as? RPCError {
                 let msg = "[nestty] keybinding action \(method) failed: \(err.code) — \(err.message)\n"

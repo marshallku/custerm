@@ -1,28 +1,17 @@
 import Darwin
 import Foundation
 
-/// Thin Swift wrapper around `lockf(2)` for single-flight gating.
+/// `lockf(F_TLOCK)` wrapper for single-flight gating.
 ///
-/// Used by `AutoSpawn` to ensure only one process forks `nesttyd` when
-/// multiple Nestty.app instances launch concurrently with no daemon running.
-/// `lockf(F_TLOCK)` semantics: non-blocking exclusive advisory lock on a byte
-/// range; for our single-byte file the range and per-fd lock are equivalent
-/// to `flock`'s per-fd whole-file lock.
-///
-/// **Why `lockf` not `flock`**: Swift's Darwin module exports `struct flock`
-/// (the byte-range descriptor used by `fcntl`), which collides with the
-/// `flock(_:_:)` function's name — Swift resolves the type first and the
-/// function call fails to compile. `lockf` has no name collision.
-///
-/// **Not** an actor — auto-spawn flow is straight-line synchronous, and the
-/// fd is owned exclusively by one helper at a time.
+/// `lockf` rather than `flock` because Swift's Darwin module exports
+/// `struct flock` (the fcntl byte-range descriptor), which shadows the
+/// `flock(_:_:)` function name and breaks the call site. `lockf` has no
+/// such collision; for our single-byte lock file the per-fd advisory
+/// semantics are equivalent.
 final class FileLock {
     private let fd: Int32
     private(set) var holding = false
 
-    /// Open or create the lock file. The file itself is just an inode anchor;
-    /// its content is irrelevant. Permissions 0o600 since `~/Library/Caches/`
-    /// is per-user.
     init(path: URL) throws {
         let cstr = path.path(percentEncoded: false)
         let opened = open(cstr, O_CREAT | O_RDWR, 0o600)
@@ -38,9 +27,8 @@ final class FileLock {
         Darwin.close(fd)
     }
 
-    /// Non-blocking exclusive acquire. Returns `true` on success, `false` if
-    /// another process holds it (`EAGAIN` / `EWOULDBLOCK`). Throws on real
-    /// errors.
+    /// Non-blocking. Returns `false` when another process holds it
+    /// (`EAGAIN`/`EACCES` per POSIX); throws on real errors.
     func tryAcquire() throws -> Bool {
         let rc = Darwin.lockf(fd, F_TLOCK, 0)
         if rc == 0 {
@@ -48,14 +36,12 @@ final class FileLock {
             return true
         }
         if errno == EAGAIN || errno == EACCES {
-            // Both are acceptable "held by someone else" returns per POSIX
             return false
         }
-        let err = String(cString: strerror(errno))
-        throw FileLockError.lockfFailed(message: err)
+        throw FileLockError.lockfFailed(message: String(cString: strerror(errno)))
     }
 
-    /// Release the lock. Idempotent.
+    /// Idempotent.
     func release() {
         guard holding else { return }
         _ = Darwin.lockf(fd, F_ULOCK, 0)

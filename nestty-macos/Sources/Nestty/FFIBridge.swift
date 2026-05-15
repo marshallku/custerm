@@ -303,12 +303,8 @@ final class NesttyEngine: @unchecked Sendable {
                 FileHandle.standardError.write(Data("[nestty-engine] action callback fired but no ActionRegistry attached: \(actionName)\n".utf8))
                 return
             }
-            // PR2: tryDispatchOrFallback so trigger-fired actions that point
-            // at daemon-owned plugins (kb.search, slack.message, etc.) get
-            // forwarded automatically. Fire-and-forget completion still
-            // discards results — when await semantics land we'll plumb
-            // success/error back into the Rust engine via a separate FFI
-            // call.
+            // Fire-and-forget. Plumbing the action result back into the
+            // Rust engine waits for await semantics.
             registry.tryDispatchOrFallback(actionName, params: params) { _ in }
         }
     }

@@ -147,12 +147,10 @@ final class ActionRegistry {
         completion: @escaping (Any?) -> Void,
     ) -> Bool {
         guard let entry = entries[method] else { return false }
-        // PR3: `silentCompletion` lets daemon-routed invokes suppress local
-        // fan-out — daemon-side ActionRegistry already publishes
-        // `<method>.completed` (PR7), and PR4b will bridge those events back
-        // through DaemonClient. Republishing here would double-fire.
-        // Mirrors Linux's `silent_completion: true` flag in `gui_client.rs`'s
-        // GuiInvokeJob dispatch path.
+        // `silentCompletion` mirrors Linux `gui_client.rs`'s
+        // `silent_completion: true` — daemon-routed invokes already publish
+        // `<method>.completed` daemon-side, so a local republish would
+        // double-fire once the event bridge lands.
         let bus = (entry.silent || silentCompletion) ? nil : eventBus
         let wrapped: (Any?) -> Void = { [weak bus] value in
             if let bus {
@@ -164,19 +162,12 @@ final class ActionRegistry {
         return true
     }
 
-    /// Try `tryDispatch`; if it misses, route through the optional fallback
-    /// handler (set by `setFallbackHandler`). When neither matches, complete
-    /// with `RPCError(unknown_method, ...)` so callers don't have to write
-    /// the same fall-through ladder. Used by `Keybindings`, `PluginPanel`,
-    /// and the FFI trigger callback — all paths that aren't `SocketServer`
-    /// (which keeps its legacy switch + fallback ordering for back-compat).
-    ///
-    /// PR2: fallback handler is wired in `AppDelegate` to forward to
-    /// daemon when `DaemonClient.isConnected` is true, else returns
-    /// `daemon_unavailable`. Daemon-forward path is **silent** (does not
-    /// trigger `<method>.completed` fan-out) because daemon-side
-    /// `ActionRegistry` already publishes that event and bridging it back
-    /// (PR4b) would double-fire.
+    /// Like `tryDispatch`, but routes misses through the optional fallback
+    /// handler (set by `setFallbackHandler`). When neither matches, completes
+    /// with `RPCError(unknown_method, …)` so callers skip the fall-through
+    /// ladder. SocketServer keeps its own legacy-switch path and only calls
+    /// fallback at its default arm; the other call sites have no legacy
+    /// switch and want fallback inline.
     func tryDispatchOrFallback(
         _ method: String,
         params: [String: Any],
@@ -190,9 +181,7 @@ final class ActionRegistry {
         }
     }
 
-    /// Install the catch-all forward handler. Called once during app
-    /// startup after `DaemonClient` is constructed. Replacing on a later
-    /// call overwrites — there's only one fallback path on macOS today.
+    /// Single-slot. Calling again overwrites.
     func setFallbackHandler(_ handler: @escaping FallbackHandler) {
         fallbackHandler = handler
     }

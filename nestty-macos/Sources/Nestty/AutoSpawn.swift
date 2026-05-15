@@ -1,39 +1,23 @@
 import Darwin
 import Foundation
 
-/// Single-flight `nesttyd` auto-spawn helper. Mirrors the intent (not the
-/// thread model) of Linux's manual-`nesttyd &` UX, but adds a "GUI tries to
-/// auto-spawn so the user doesn't have to remember" convenience.
+/// Single-flight `nesttyd` auto-spawn helper. Nestty.app-only;
+/// `nestctl` does not auto-spawn (matches Linux UX).
 ///
-/// Flow (called by DaemonClient when first connect attempt fails):
-///   1. Acquire `~/Library/Caches/nestty/.spawn.lock` via `flock(LOCK_EX|LOCK_NB)`.
-///      - Lock acquired → proceed to (2).
-///      - `EWOULDBLOCK` → another process is spawning. Sleep 50ms; caller retries connect.
-///   2. Live socket probe (1s budget, 100ms per attempt × 10): attempt connect to
-///      `~/Library/Caches/nestty/socket`. If it succeeds, another process won the race
-///      and bound between our first attempt and acquiring the lock — release lock, return.
-///   3. Locate `nesttyd` binary (PATH first, then `~/.cargo/bin/nesttyd`).
-///   4. Detached spawn via `/bin/sh -c "nohup nesttyd >/dev/null 2>&1 &"` so the child
-///      survives Nestty.app exit (no SIGHUP cascade) and we don't need `posix_spawn`
-///      ceremony.
-///   5. Protocol-level probe: connect + send `system.ping`, wait ≤500ms for `{ok:true}`.
-///      Repeat up to 6 attempts (3s total budget per codex round 2 I4 — manifest
-///      discovery + command registration happen before bind, so daemon may take
-///      a moment to listen).
-///   6. Release lock.
+/// Flow:
+///   1. `lockf(F_TLOCK)` `~/Library/Caches/nestty/.spawn.lock` — held → bail.
+///   2. Live socket probe — another process may have won the race between
+///      our failed connect and lock acquisition.
+///   3. Locate `nesttyd` binary (PATH, then `~/.cargo/bin/nesttyd`).
+///   4. Detached spawn via `nohup nesttyd … &`.
+///   5. `system.ping` probe with 3s budget — bind happens before plugin
+///      activation but manifest discovery + command registration happen
+///      before bind, so the daemon may need a moment to listen.
 ///
-/// **No** stub when nesttyd binary missing — return failure, DaemonClient stays in
-/// disconnected state, ActionRegistry fallback returns `daemon_unavailable` (matches
-/// user-decided narrower fallback contract).
-///
-/// **No** nestctl auto-spawn (codex round 2 C2). Linux nestctl doesn't auto-spawn
-/// either; this helper is Nestty.app-only.
+/// Returns true only when the daemon answers `system.ping` ok. False keeps
+/// `DaemonClient` in disconnected state; `ActionRegistry` fallback then
+/// surfaces `daemon_unavailable`.
 enum AutoSpawn {
-    /// Try to bring up `nesttyd`. Returns true if the daemon socket is now
-    /// alive AND responsive to `system.ping`. Returns false on any failure
-    /// (binary missing, fork failed, no ping response within budget).
-    /// Caller (DaemonClient) interprets false as "stay disconnected, retry
-    /// connect via reconnect loop".
     static func ensureRunning() -> Bool {
         do {
             try NesttyPaths.ensureRuntimeDir()
@@ -51,13 +35,9 @@ enum AutoSpawn {
         }
 
         do {
-            let acquired = try lock.tryAcquire()
-            if !acquired {
-                // Another process holds the lock. Don't wait inside the
-                // lock; caller's reconnect loop will retry connect, and
-                // by then either (a) the other spawner finished and
-                // socket is alive, or (b) it failed and the lock is free
-                // for us next iteration.
+            // Don't wait under the lock — caller's reconnect loop polls;
+            // the other spawner will either succeed or release.
+            if try !lock.tryAcquire() {
                 log("spawn lock held by another process — caller should retry connect")
                 return false
             }
@@ -67,14 +47,11 @@ enum AutoSpawn {
         }
         defer { lock.release() }
 
-        // Step 2: live socket probe — someone may have bound between our
-        // first failed connect and acquiring the lock.
         if probeSocket(timeout: 1.0) {
             log("daemon socket alive at lock-acquire (race winner) — skipping spawn")
             return true
         }
 
-        // Step 3-4: locate + spawn.
         guard let nesttydPath = locateBinary() else {
             log("nesttyd binary not found in PATH or ~/.cargo/bin — install via `cargo install --path nestty-daemon`")
             return false
@@ -82,8 +59,6 @@ enum AutoSpawn {
         if !spawnDetached(path: nesttydPath) {
             return false
         }
-
-        // Step 5: protocol-level probe with 3s overall budget.
         return waitForPing(budget: 3.0, perAttempt: 0.5)
     }
 
@@ -93,8 +68,8 @@ enum AutoSpawn {
         let env = ProcessInfo.processInfo.environment
         let pathString = env["PATH"] ?? "/usr/local/bin:/usr/bin:/bin"
         var dirs = pathString.split(separator: ":").map { String($0) }
-        // Cargo's default bin dir — common for Rust users on macOS, not always on PATH
-        // when launching a `.app` from Finder/Dock.
+        // `~/.cargo/bin` is the common Rust install dir but isn't on the
+        // PATH a `.app` inherits from Finder/Dock.
         let cargoBin = NSHomeDirectory() + "/.cargo/bin"
         if !dirs.contains(cargoBin) { dirs.append(cargoBin) }
         let fm = FileManager.default
@@ -105,20 +80,13 @@ enum AutoSpawn {
         return nil
     }
 
-    /// Detached spawn so the child outlives Nestty.app. `nohup` suppresses
-    /// SIGHUP, `&` backgrounds. stdout/stderr to /dev/null because
-    /// Nestty.app's stderr is not a TTY the user reads.
+    /// Detached spawn so the child outlives Nestty.app.
     ///
-    /// **NESTTY_SOCKET handling** (codex round 2 C1): `nesttyd` honors the
-    /// inherited `NESTTY_SOCKET` to choose its bind path. `NesttyPaths.daemonSocket()`
-    /// deliberately ignores legacy per-GUI-socket overrides (so launching
-    /// Nestty.app from a child shell still routes the client to the daemon).
-    /// To keep the daemon's bind path in sync with the client's connect
-    /// path, we explicitly set `NESTTY_SOCKET` on the child to the *resolved*
-    /// daemon socket path. Without this, a child shell launched from
-    /// Nestty.app inherits a per-GUI socket env, the daemon binds there,
-    /// the Swift client probes `~/Library/Caches/nestty/socket`, and the
-    /// two never meet.
+    /// `nesttyd` honors inherited `NESTTY_SOCKET` for its bind path, but
+    /// `NesttyPaths.daemonSocket()` ignores legacy per-GUI overrides — so
+    /// the env we inherit could send the daemon to a different path than
+    /// the client probes. Explicitly set the child's env to our resolved
+    /// daemon socket to keep the two in sync.
     private static func spawnDetached(path: URL) -> Bool {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -137,10 +105,7 @@ enum AutoSpawn {
         return proc.terminationStatus == 0
     }
 
-    /// Try a Unix socket connect. No protocol traffic — just verifies the
-    /// listener is bound. Used for the race-winner check at step 2.
-    /// **Closes** the probe fd before returning success so we don't leak
-    /// (codex round-2 review I1).
+    /// Connect-only probe (no protocol traffic). Closes the fd on success.
     private static func probeSocket(timeout: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -153,8 +118,6 @@ enum AutoSpawn {
         return false
     }
 
-    /// Protocol probe: connect, send `{"id": "<uuid>", "method": "system.ping"}`,
-    /// read response line, verify `ok=true`. Caller controls retry budget.
     private static func waitForPing(budget: TimeInterval, perAttempt: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(budget)
         var attempt = 0
@@ -208,10 +171,9 @@ enum AutoSpawn {
         }
         if sent <= 0 { return false }
 
-        // Read up to 4KB of response, line-buffered. Use SO_RCVTIMEO so a
-        // wedged daemon doesn't block forever; perAttempt budget enforced
-        // by caller's loop.
-        var tv = timeval(tv_sec: 0, tv_usec: 500_000) // 500ms
+        // SO_RCVTIMEO so a wedged daemon doesn't block — caller's loop
+        // owns the per-attempt budget.
+        var tv = timeval(tv_sec: 0, tv_usec: 500_000)
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
         var buf = [UInt8](repeating: 0, count: 4096)
@@ -220,8 +182,6 @@ enum AutoSpawn {
         }
         if n <= 0 { return false }
         let line = String(decoding: buf.prefix(n), as: UTF8.self)
-        // Minimal parse: presence of `"ok":true` is enough; full JSON parse
-        // is overkill for a probe.
         return line.contains("\"ok\":true") && line.contains(id)
     }
 
