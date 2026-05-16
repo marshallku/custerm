@@ -42,10 +42,11 @@ final class ContextService: @unchecked Sendable {
     private var activePanel: String?
     private var panelCwds: [String: String] = [:]
 
-    /// Apply one bus event to the context. Idempotent — replaying the same
-    /// event sequence yields the same final state. Unknown event kinds are
-    /// silently ignored, matching Linux's `_ => {}` arm.
-    func apply(eventKind: String, data: [String: Any]) {
+    /// Apply one bus event to the context. Idempotent. Non-context kinds
+    /// and non-dict payloads are silently ignored — bus carries
+    /// `serde_json::Value`-shaped payloads (object/array/scalar/null).
+    func apply(eventKind: String, data: Any?) {
+        guard let data = data as? [String: Any] else { return }
         switch eventKind {
         case "panel.focused":
             guard let id = data["panel_id"] as? String, !id.isEmpty else { return }

@@ -196,10 +196,13 @@ final class NesttyEngine: @unchecked Sendable {
         kind: String,
         source: String = "macos.eventbus",
         context: [String: Any]? = nil,
-        payload: [String: Any],
+        payload: Any?,
     ) -> Int {
         guard let handle else { return 0 }
-        let payloadStr: String = if let data = try? JSONSerialization.data(withJSONObject: payload),
+        // `.fragmentsAllowed` so scalar / array / null payloads (matches
+        // serde_json::Value on the engine side) serialize.
+        let payloadObject: Any = payload ?? NSNull()
+        let payloadStr: String = if let data = try? JSONSerialization.data(withJSONObject: payloadObject, options: [.fragmentsAllowed]),
                                     let s = String(data: data, encoding: .utf8)
         {
             s

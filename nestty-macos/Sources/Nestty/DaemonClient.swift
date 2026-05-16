@@ -98,6 +98,14 @@ final class DaemonClient: @unchecked Sendable {
     typealias InvokeHandler = @MainActor @Sendable (_ id: String, _ method: String, _ params: [String: Any], _ reply: @Sendable @escaping (String) -> Void) -> Void
     var invokeHandler: InvokeHandler?
 
+    /// Called from the reader thread for every inbound `Event`. AppDelegate
+    /// re-broadcasts on the local `EventBus` with a fresh `bridgeId` so PR 4b's
+    /// outbound forwarder can echo-skip. `data` mirrors `serde_json::Value`
+    /// (object/array/scalar/NSNull); the daemon wire has no `timestamp_ms`,
+    /// so the local broadcast assigns one.
+    typealias InboundEventHandler = @Sendable (_ type: String, _ source: String, _ data: Any?) -> Void
+    var inboundEventHandler: InboundEventHandler?
+
     private static let invokeQueueCap = 32 // mirrors Linux POOL_QUEUE
     private var invokeInFlight = 0 // guarded by stateLock
 
@@ -158,6 +166,9 @@ final class DaemonClient: @unchecked Sendable {
         lastAck = ack
         stateLock.unlock()
         log("registered with nesttyd: ack=\(ack)")
+        if ack.hostTriggers {
+            log("WARN host_triggers=true but local engine cut-over not yet implemented — daemon-side and local-side triggers may both fire for the same event")
+        }
 
         return Session(fd: fd, writer: writer)
     }
@@ -273,10 +284,12 @@ final class DaemonClient: @unchecked Sendable {
             handleResponse(id: id, value: value)
             return
         }
-        if value["type"] != nil {
-            // Inbound bus events — bridged to local EventBus once event
-            // bridging lands. Currently dropped.
-            log("ignoring Event: type=\(value["type"] ?? "?")")
+        if let type = value["type"] as? String {
+            let source = (value["source"] as? String) ?? "daemon"
+            // `data` may be NSNull / array / scalar / dict — pass through
+            // verbatim. AppDelegate's handler stamps a fresh bridge_id and
+            // republishes onto local EventBus.
+            inboundEventHandler?(type, source, value["data"])
             return
         }
         log("ignoring unknown line: \(line.prefix(200))")

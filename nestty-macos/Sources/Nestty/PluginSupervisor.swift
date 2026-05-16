@@ -587,8 +587,9 @@ final class PluginProcess: @unchecked Sendable {
                 if let params = obj["params"] as? [String: Any],
                    let kind = params["kind"] as? String
                 {
-                    let payload = (params["payload"] as? [String: Any]) ?? [:]
-                    eventBus?.broadcast(event: kind, data: payload)
+                    // serde_json::Value mirror: object / array / scalar / null
+                    // all valid; pass through without dict-narrowing.
+                    eventBus?.broadcast(event: kind, data: params["payload"])
                 }
             default:
                 log("[nestty-plugin] \(pluginName): unknown notification \(method)")

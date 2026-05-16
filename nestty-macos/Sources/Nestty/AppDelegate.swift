@@ -77,6 +77,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             client.forward(method: method, params: params, completion: completion)
         }
+        // Daemon `Event` (notifications, plugin completion fan-out, etc.)
+        // republishes onto our local bus with a fresh bridge_id. The
+        // bridge_id marks the event as "already crossed" so PR 4b's
+        // outbound forwarder will skip it instead of echoing back.
+        // Local nesttyEngine still fires triggers from this republish —
+        // when daemon owns triggers (`host_triggers=true`), PR 4b cuts
+        // the local engine over to suppress double-fire.
+        // Capture `eventBus` directly — `AppDelegate` is `@MainActor`, so a
+        // `@Sendable` closure capturing `self` would violate isolation when
+        // invoked from `DaemonClient`'s reader thread. `EventBus` is
+        // `@unchecked Sendable` and broadcast is thread-safe.
+        let bus = eventBus
+        daemonClient?.inboundEventHandler = { type, source, data in
+            bus.broadcast(
+                event: type,
+                source: source,
+                data: data,
+                bridgeId: UUID().uuidString,
+            )
+        }
         // Install invoke handler BEFORE start() so the first inbound Invoke
         // routes through handleCommand instead of being dropped.
         daemonClient?.invokeHandler = { [weak self] id, method, params, reply in
