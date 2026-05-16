@@ -37,8 +37,54 @@ enum Keybindings {
     struct Binding {
         let modifiers: NSEvent.ModifierFlags
         let key: String // lowercased character, e.g. "g"
+        /// Layout-position keyCode resolved from `key` at parse time when
+        /// the name is in `nameToKeyCode`. `matches` prefers this so
+        /// non-Latin IMEs (Korean, JP, …) — which translate `p` to `ㅖ`
+        /// before the event reaches us — don't shadow the binding. nil
+        /// for keys not in the table; falls back to char comparison.
+        let keyCode: UInt16?
         let command: String // raw value from config: "spawn:..." or "action:..."
     }
+
+    /// gdk-style key name → macOS `kVK_*` constant. Covers letters,
+    /// digits, common punctuation, brackets, function keys, and the
+    /// keys nestty itself binds (Cmd+Shift+P palette, Cmd+T tab, …).
+    /// Names are kept consistent with the Linux config schema so a
+    /// shared `[keybindings]` block parses identically on both.
+    ///
+    /// Constants come from `<HIToolbox/Events.h>`; hardcoding them is
+    /// stable across macOS versions (Apple's commit to ANSI keycode
+    /// values predates OS X) and avoids pulling in `Carbon` solely for
+    /// the kVK_* enum.
+    ///
+    /// **Naming nuances vs Linux**:
+    /// - `backspace` → `kVK_Delete` (0x33) — the key labeled Delete on
+    ///   mac keyboards. Mirrors gdk `BackSpace`.
+    /// - `delete` → `kVK_ForwardDelete` (0x75) — the standalone Forward
+    ///   Delete key. Mirrors gdk `Delete`.
+    /// - `return` / `enter` both alias 0x24 (gdk uses `Return`).
+    static let nameToKeyCode: [String: UInt16] = [
+        "a": 0x00, "s": 0x01, "d": 0x02, "f": 0x03, "h": 0x04, "g": 0x05,
+        "z": 0x06, "x": 0x07, "c": 0x08, "v": 0x09, "b": 0x0B, "q": 0x0C,
+        "w": 0x0D, "e": 0x0E, "r": 0x0F, "y": 0x10, "t": 0x11,
+        "o": 0x1F, "u": 0x20, "i": 0x22, "p": 0x23, "l": 0x25, "j": 0x26,
+        "k": 0x28, "n": 0x2D, "m": 0x2E,
+        "1": 0x12, "2": 0x13, "3": 0x14, "4": 0x15, "5": 0x17,
+        "6": 0x16, "7": 0x1A, "8": 0x1C, "9": 0x19, "0": 0x1D,
+        "equal": 0x18, "minus": 0x1B,
+        "bracketright": 0x1E, "bracketleft": 0x21,
+        "apostrophe": 0x27, "semicolon": 0x29,
+        "backslash": 0x2A, "comma": 0x2B, "slash": 0x2C, "period": 0x2F,
+        "grave": 0x32,
+        "return": 0x24, "enter": 0x24,
+        "tab": 0x30, "space": 0x31,
+        "backspace": 0x33, "delete": 0x75,
+        "escape": 0x35, "esc": 0x35,
+        "left": 0x7B, "right": 0x7C, "down": 0x7D, "up": 0x7E,
+        "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76, "f5": 0x60,
+        "f6": 0x61, "f7": 0x62, "f8": 0x64, "f9": 0x65, "f10": 0x6D,
+        "f11": 0x67, "f12": 0x6F,
+    ]
 
     /// Parse the raw TOML dict into compiled bindings. Invalid combos
     /// (unknown modifier, empty key) are dropped with a stderr warning so
@@ -84,19 +130,25 @@ enum Keybindings {
             FileHandle.standardError.write(Data(msg.utf8))
             return nil
         }
-        return Binding(modifiers: mods, key: key, command: command)
+        return Binding(modifiers: mods, key: key, keyCode: nameToKeyCode[key], command: command)
     }
 
     /// Compare an NSEvent against a binding. Modifiers must match exactly
     /// (so `cmd+g` doesn't fire on `cmd+shift+g` — that'd be surprising).
-    /// Key compared against `charactersIgnoringModifiers` lowercased so
-    /// `shift+g` config matches the underlying `g` key with shift held.
+    /// When `binding.keyCode` is set (parsed key name was in
+    /// `nameToKeyCode`), match on layout-position keyCode — this is
+    /// IME-immune. For names outside the table, fall back to the
+    /// historical `charactersIgnoringModifiers` comparison so unusual
+    /// key names still work (with the IME caveat).
     static func matches(_ event: NSEvent, _ binding: Binding) -> Bool {
         // Mask out caps lock / numpad noise — only the four real modifier
         // flags are part of the binding contract.
         let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
         let actualMods = event.modifierFlags.intersection(interesting)
         guard actualMods == binding.modifiers else { return false }
+        if let bindingKeyCode = binding.keyCode {
+            return event.keyCode == bindingKeyCode
+        }
         let keyChar = (event.charactersIgnoringModifiers ?? "").lowercased()
         return keyChar == binding.key
     }

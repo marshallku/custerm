@@ -599,18 +599,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Cmd+Shift+P, mac convention (VSCode/Zed). User keybindings already
     /// run before this — a `cmd+shift+p` entry in `[keybindings]` shadows
     /// the palette, mirroring Linux's "user binding wins" precedence.
-    ///
-    /// `keyCode == kVK_ANSI_P` (0x23) is matched on physical key position
-    /// rather than `charactersIgnoringModifiers` because non-Latin IMEs
-    /// (Korean, Japanese, …) translate `p` into the IME's character
-    /// (e.g. Korean `ㅖ`) before the event reaches us, breaking a
-    /// character-based match. The keyCode is layout-position-based and
-    /// IME-immune.
+    /// keyCode source `Keybindings.nameToKeyCode` is shared so a future
+    /// rename / re-mapping flows through both the user-binding parser and
+    /// this built-in shortcut without divergence.
     private func matchesCommandPaletteShortcut(_ event: NSEvent) -> Bool {
         let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
         let mods = event.modifierFlags.intersection(interesting)
         guard mods == [.command, .shift] else { return false }
-        return event.keyCode == 0x23
+        guard let pCode = Keybindings.nameToKeyCode["p"] else { return false }
+        return event.keyCode == pCode
     }
 
     /// Returns true when the palette opened (event must be swallowed).
