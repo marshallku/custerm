@@ -119,6 +119,18 @@ final class NesttyEngine: @unchecked Sendable {
     /// "set once, read many" pattern that doesn't need a lock.
     nonisolated(unsafe) var actionRegistry: ActionRegistry?
 
+    /// Gates `dispatchEvent`. Daemon-first cut-over flips this to false when
+    /// `gui.register` ack reports `host_triggers=true` so daemon-side and
+    /// local-side triggers don't double-fire on the same event. Drop guard
+    /// in `DaemonClient.handleDisconnect` flips it back to true.
+    ///
+    /// In-flight engine state (await preflight) is preserved across the
+    /// disable→enable cycle — `setTriggers([])` would reset it but also
+    /// require config reload to restore. Chained workflows that span a
+    /// cut-over boundary are unsupported either way.
+    private var enabled = true
+    private let enableLock = NSLock()
+
     init() {
         // nestty_engine_create returns OpaquePointer? directly (Swift's clang
         // importer maps the forward-declared C struct that way). No cast.
@@ -191,6 +203,13 @@ final class NesttyEngine: @unchecked Sendable {
     /// `ContextService.snapshot()` taken AFTER `apply`-ing the current
     /// event to satisfy the apply-before-dispatch ordering Linux uses
     /// in `Pump::pump_all`.
+    /// Cut-over hook called from `DaemonClient` register / disconnect.
+    /// Thread-safe via `enableLock`; safe to call from any thread.
+    func setEnabled(_ value: Bool) {
+        enableLock.lock(); defer { enableLock.unlock() }
+        enabled = value
+    }
+
     @discardableResult
     func dispatchEvent(
         kind: String,
@@ -198,6 +217,10 @@ final class NesttyEngine: @unchecked Sendable {
         context: [String: Any]? = nil,
         payload: Any?,
     ) -> Int {
+        enableLock.lock()
+        let isEnabled = enabled
+        enableLock.unlock()
+        guard isEnabled else { return 0 }
         guard let handle else { return 0 }
         // `.fragmentsAllowed` so scalar / array / null payloads (matches
         // serde_json::Value on the engine side) serialize.

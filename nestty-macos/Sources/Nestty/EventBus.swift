@@ -43,8 +43,13 @@ final class EventBus: @unchecked Sendable {
         return ch
     }
 
-    func subscribeTyped() -> TypedEventChannel {
-        let ch = TypedEventChannel()
+    /// `kinds == nil` accepts every event; otherwise only events whose
+    /// `type` is in the allowlist enqueue. Mirror of Linux's per-kind
+    /// `subscribe_unbounded`. `EventBus.broadcast` pre-checks the allowlist
+    /// to avoid lock churn for filtered drops; the channel internal also
+    /// re-checks as a backstop against direct callers.
+    func subscribeTyped(kinds: Set<String>? = nil) -> TypedEventChannel {
+        let ch = TypedEventChannel(allowlist: kinds)
         lock.withLock { typedChannels.append(ch) }
         return ch
     }
@@ -87,8 +92,11 @@ final class EventBus: @unchecked Sendable {
         }
 
         var deadTyped: [ObjectIdentifier] = []
-        for ch in typedSnap where !ch.send(busEvent) {
-            deadTyped.append(ObjectIdentifier(ch))
+        for ch in typedSnap {
+            // Pre-check skips enqueue + lock for filtered events (e.g.
+            // forwarder channel that excludes terminal.output).
+            guard ch.accepts(busEvent.type) else { continue }
+            if !ch.send(busEvent) { deadTyped.append(ObjectIdentifier(ch)) }
         }
 
         if !deadJSON.isEmpty || !deadTyped.isEmpty {
@@ -148,15 +156,28 @@ final class EventChannel: @unchecked Sendable {
     }
 }
 
-/// Single-subscriber FIFO queue for typed `BusEvent`. Same shape as
-/// `EventChannel` so subscribers compose identically.
+/// Single-subscriber FIFO queue for typed `BusEvent` with optional kind
+/// allowlist. Allowlist-filtered events return `true` from `send` (silent
+/// drop) — `false` is reserved for `closed` so EventBus doesn't prune a
+/// channel just because the event didn't match its filter.
 final class TypedEventChannel: @unchecked Sendable {
+    let allowlist: Set<String>?
+
     private var queue: [BusEvent] = []
     private let sema = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var closed = false
 
+    init(allowlist: Set<String>? = nil) {
+        self.allowlist = allowlist
+    }
+
+    func accepts(_ kind: String) -> Bool {
+        allowlist == nil || allowlist!.contains(kind)
+    }
+
     func send(_ event: BusEvent) -> Bool {
+        guard accepts(event.type) else { return true }
         lock.lock()
         guard !closed else { lock.unlock(); return false }
         queue.append(event)
@@ -173,8 +194,14 @@ final class TypedEventChannel: @unchecked Sendable {
         }
     }
 
+    /// Drops queued backlog and signals receive() to return nil. Drop guard
+    /// for forwarder shutdown — stale events at disconnect are conceptually
+    /// dead, daemon will see the next event after reconnect.
     func close() {
-        lock.withLock { closed = true }
+        lock.lock()
+        closed = true
+        queue.removeAll()
+        lock.unlock()
         sema.signal()
     }
 }

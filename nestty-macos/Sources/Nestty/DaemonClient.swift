@@ -23,10 +23,23 @@ final class DaemonClient: @unchecked Sendable {
 
     private(set) var lastAck: RegisterAck?
 
-    init(socket: URL, capabilities: [String]) {
+    /// Forwarder needs subscribe access on the bus, not just publish, so
+    /// `EventBus` is constructor-injected (lifecycle is intrinsic to
+    /// DaemonClient — wouldn't make sense to swap mid-flight).
+    private let eventBus: EventBus
+
+    init(socket: URL, capabilities: [String], eventBus: EventBus) {
         socketURL = socket
         self.capabilities = capabilities
+        self.eventBus = eventBus
     }
+
+    /// Called by AppDelegate-side wiring on register / disconnect with the
+    /// daemon's `host_triggers` flag. `true` ⇒ disable local engine (daemon
+    /// owns trigger firing), `false` ⇒ re-enable local fallback. Invoked
+    /// from background threads; callers must be thread-safe (NesttyEngine's
+    /// `setEnabled` is NSLock-guarded).
+    var cutoverHandler: (@Sendable (Bool) -> Void)?
 
     /// Idempotent. Second call is a no-op.
     func start() {
@@ -109,6 +122,22 @@ final class DaemonClient: @unchecked Sendable {
     private static let invokeQueueCap = 32 // mirrors Linux POOL_QUEUE
     private var invokeInFlight = 0 // guarded by stateLock
 
+    /// Allowlist of bus event kinds forwarded to daemon via `_bus.publish`.
+    /// Mirror of `nestty-linux/src/gui_client.rs` `GUI_TO_DAEMON_FORWARD_KINDS`
+    /// — keep in sync. `terminal.output` deliberately excluded
+    /// (per-keystroke saturation, no trigger value).
+    ///
+    /// `tab.opened` is a macOS-publish artifact mapped to Linux `tab.created`
+    /// at forward time so daemon-side triggers see the canonical name.
+    private static let forwardKinds: Set<String> = [
+        "panel.exited", "panel.focused", "panel.title_changed",
+        "tab.closed", "tab.created", "tab.opened", "tab.renamed",
+        "terminal.cwd_changed", "terminal.shell_precmd", "terminal.shell_preexec",
+        "webview.loaded", "webview.navigated", "webview.title_changed",
+        "window.restored",
+    ]
+    private var forwarderChannel: TypedEventChannel? // per-connection
+
     /// 1 MiB including the trailing newline (mirror of
     /// `nestty-daemon::socket::read_line_capped`).
     private static let maxFrameBytes = 1024 * 1024
@@ -166,11 +195,47 @@ final class DaemonClient: @unchecked Sendable {
         lastAck = ack
         stateLock.unlock()
         log("registered with nesttyd: ack=\(ack)")
+
+        // host_triggers cut-over: forwarder FIRST so events between
+        // start-forwarder and engine-disable still reach daemon (Linux
+        // ordering, gui_client.rs:226). Then disable local engine.
         if ack.hostTriggers {
-            log("WARN host_triggers=true but local engine cut-over not yet implemented — daemon-side and local-side triggers may both fire for the same event")
+            stateLock.lock()
+            forwarderChannel = startForwarder(writer: writer)
+            stateLock.unlock()
+            cutoverHandler?(true)
         }
 
         return Session(fd: fd, writer: writer)
+    }
+
+    private func startForwarder(writer: WriterChannel) -> TypedEventChannel {
+        let channel = eventBus.subscribeTyped(kinds: Self.forwardKinds)
+        Thread.detachNewThread { [weak self] in
+            while let event = channel.receive() {
+                // Echo skip: events republished from daemon carry bridgeId.
+                guard event.bridgeId == nil else { continue }
+                guard let line = self?.encodeBusPublish(event) else { continue }
+                writer.sendBlocking(line)
+            }
+        }
+        return channel
+    }
+
+    private func encodeBusPublish(_ event: BusEvent) -> String? {
+        // macOS publishes `tab.opened`; Linux daemon expects `tab.created`.
+        let kind = (event.type == "tab.opened") ? "tab.created" : event.type
+        let req: [String: Any] = [
+            "id": UUID().uuidString,
+            "method": "_bus.publish",
+            "params": [
+                "kind": kind,
+                "source": event.source,
+                "timestamp_ms": event.timestampMs,
+                "payload": event.data ?? NSNull(),
+            ],
+        ]
+        return encodeJSONLine(req)
     }
 
     private func registerOn(fd: Int32) -> RegisterAck? {
@@ -410,6 +475,16 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     private func handleDisconnect() {
+        // Drop guard: re-enable local engine FIRST so GUI-only triggers
+        // (terminal.cwd_changed → local action) keep firing through the
+        // reconnect-backoff window. Mirror of Linux HostTriggersGuard
+        // Drop impl.
+        let hadForwarder = forwarderChannel != nil
+        if hadForwarder {
+            cutoverHandler?(false)
+        }
+        forwarderChannel?.close()
+
         // Bump generation FIRST so a stale reply that races in is dropped
         // by handleResponse's gen check before we drain.
         stateLock.lock()
@@ -419,12 +494,13 @@ final class DaemonClient: @unchecked Sendable {
         pending.removeAll()
         currentWriter?.shutdown()
         currentWriter = nil
+        forwarderChannel = nil
         stateLock.unlock()
 
         for (_, entry) in drained {
             entry.completion(RPCError(code: "daemon_unavailable", message: "daemon disconnected mid-flight"))
         }
-        log("disconnected — drained \(drained.count) pending forward(s)")
+        log("disconnected — drained \(drained.count) pending forward(s), forwarder=\(hadForwarder)")
     }
 
     private func timeoutPending(id: String, gen: UInt64) {
@@ -582,6 +658,20 @@ final class WriterChannel: @unchecked Sendable {
         return true
     }
 
+    /// Blocks until the queue has capacity OR the channel is shut down.
+    /// Used by the daemon-event forwarder so saturation back-pressures the
+    /// bus rather than silently dropping events the daemon needs.
+    func sendBlocking(_ line: String) {
+        cond.lock()
+        defer { cond.unlock() }
+        while !stopped, normal.count >= Self.normalCap {
+            cond.wait()
+        }
+        if stopped { return }
+        normal.append(line)
+        cond.signal()
+    }
+
     /// Control frames (heartbeat replies). Tiny in practice (one `_ping` per
     /// daemon heartbeat interval), so unbounded is safe.
     func sendControl(_ line: String) {
@@ -591,10 +681,12 @@ final class WriterChannel: @unchecked Sendable {
         cond.unlock()
     }
 
+    /// Wakes both the drain thread and any blocked `sendBlocking` callers
+    /// so they exit via the `stopped` check.
     func shutdown() {
         cond.lock()
         stopped = true
-        cond.signal()
+        cond.broadcast()
         cond.unlock()
     }
 
@@ -608,12 +700,24 @@ final class WriterChannel: @unchecked Sendable {
                 cond.unlock()
                 return
             }
-            let next: String? = if !control.isEmpty {
-                control.removeFirst()
+            // Wake `sendBlocking` only when the *normal* queue crossed
+            // from full to not-full — signaling on control-only dequeue or
+            // every normal dequeue would burn cycles.
+            let normalWasFull = normal.count >= Self.normalCap
+            let next: String?
+            let normalDequeued: Bool
+            if !control.isEmpty {
+                next = control.removeFirst()
+                normalDequeued = false
             } else if !normal.isEmpty {
-                normal.removeFirst()
+                next = normal.removeFirst()
+                normalDequeued = true
             } else {
-                nil
+                next = nil
+                normalDequeued = false
+            }
+            if normalWasFull, normalDequeued {
+                cond.signal()
             }
             cond.unlock()
 

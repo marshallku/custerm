@@ -65,7 +65,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         daemonClient = DaemonClient(
             socket: NesttyPaths.daemonSocket(),
             capabilities: ["tab", "split", "webview", "background", "statusbar", "terminal", "agent.ui", "plugin.open", "search", "session"],
+            eventBus: eventBus,
         )
+        // Capture engine on main actor so the @Sendable closure body has
+        // a sendable reference (NesttyEngine itself is `@unchecked Sendable`).
+        let engine = nesttyEngine
+        daemonClient?.cutoverHandler = { hostTriggers in
+            engine.setEnabled(!hostTriggers)
+        }
         actionRegistry.setFallbackHandler { [weak self] method, params, completion in
             guard let client = self?.daemonClient else {
                 completion(RPCError(code: "daemon_unavailable", message: "DaemonClient not initialized"))
