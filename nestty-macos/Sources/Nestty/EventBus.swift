@@ -205,11 +205,3 @@ final class TypedEventChannel: @unchecked Sendable {
         sema.signal()
     }
 }
-
-private extension NSLock {
-    @discardableResult
-    func withLock<T>(_ body: () -> T) -> T {
-        lock(); defer { unlock() }
-        return body()
-    }
-}

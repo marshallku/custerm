@@ -25,3 +25,13 @@ final class SendableBox<T>: @unchecked Sendable {
         self.value = value
     }
 }
+
+extension NSLock {
+    /// Scoped acquire/release. `defer` ensures release on every exit
+    /// (return / throw / loop break).
+    @discardableResult
+    func withLock<T>(_ body: () -> T) -> T {
+        lock(); defer { unlock() }
+        return body()
+    }
+}

@@ -134,30 +134,7 @@ enum AutoSpawn {
     }
 
     private static func connectOnce() -> Int32? {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let path = NesttyPaths.daemonSocket().path(percentEncoded: false)
-        let cstr = path.utf8CString
-        if cstr.count > MemoryLayout.size(ofValue: addr.sun_path) {
-            close(fd)
-            return nil
-        }
-        withUnsafeMutablePointer(to: &addr.sun_path) { p in
-            p.withMemoryRebound(to: CChar.self, capacity: cstr.count) { dst in
-                _ = cstr.withUnsafeBufferPointer { src in
-                    memcpy(dst, src.baseAddress, cstr.count)
-                }
-            }
-        }
-        let rc = withUnsafePointer(to: &addr) { addrPtr -> Int32 in
-            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        if rc != 0 { close(fd); return nil }
-        return fd
+        UnixSocket.connect(path: NesttyPaths.daemonSocket().path(percentEncoded: false))
     }
 
     private static func pingOnce(timeout _: TimeInterval) -> Bool {
