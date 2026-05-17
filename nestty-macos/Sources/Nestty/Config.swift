@@ -76,6 +76,14 @@ struct NesttyConfig {
     /// and Phase 10 flips the default. Per-pane: each new tab/split reads
     /// the live config value at construction time.
     let rendererBackend: RendererBackend
+    /// `[renderer] transparent_default_bg = true` makes default-bg cells
+    /// transparent on the alacritty backend, so a configured background
+    /// image shows through blank cells. Off by default — cursor
+    /// visibility against image backgrounds wins over aesthetic
+    /// transparency. Cells with explicit ANSI bg colors and reverse-video
+    /// cells still materialize opaquely (Zed pattern). No-op on the
+    /// SwiftTerm backend.
+    let transparentDefaultBg: Bool
     /// Tier 1.4 — `[tabs] position` (top/bottom). left/right deferred.
     let tabsPosition: TabsPosition
     /// Tier 4.2 — `[statusbar]` config (enabled/position/height). Modules
@@ -136,6 +144,7 @@ struct NesttyConfig {
             backgroundOpacity: clamp01(raw.background?.opacity ?? defaults.backgroundOpacity),
             osc52: raw.security?.osc52 ?? defaults.osc52,
             rendererBackend: RendererBackend.parse(raw.renderer?.backend),
+            transparentDefaultBg: raw.renderer?.transparentDefaultBg ?? defaults.transparentDefaultBg,
             tabsPosition: raw.tabs?.position.map(TabsPosition.parse) ?? defaults.tabsPosition,
             statusBar: StatusBarConfig(
                 enabled: raw.statusbar?.enabled ?? defaults.statusBar.enabled,
@@ -166,6 +175,7 @@ struct NesttyConfig {
             backgroundOpacity: 1.0,
             osc52: .deny,
             rendererBackend: .swiftterm,
+            transparentDefaultBg: false,
             tabsPosition: .top,
             statusBar: .defaults,
             keybindings: [:],
@@ -276,6 +286,12 @@ private struct RawConfig: Decodable {
 
 private struct RendererSection: Decodable {
     var backend: String?
+    var transparentDefaultBg: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case backend
+        case transparentDefaultBg = "transparent_default_bg"
+    }
 }
 
 private struct StatusBarSection: Decodable {

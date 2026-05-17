@@ -37,6 +37,8 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
 
     private var termHandle: NesttyTermFFI.Handle?
     private var renderView: AlacrittyRenderView?
+    private var backgroundView: NSImageView?
+    private var tintView: NSView?
     private var shellStarted = false
 
     init(config: NesttyConfig, theme: NesttyTheme, cwd: String? = nil, initialInput: String? = nil) {
@@ -52,11 +54,54 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
         fatalError("init(coder:) has not been implemented")
     }
 
+    /// Layered view hierarchy mirroring `TerminalViewController`:
+    ///   container (focus-forwarding NSView)
+    ///   ├─ backgroundView (NSImageView, hidden until image set)
+    ///   ├─ tintView (NSView with dark overlay layer)
+    ///   └─ renderView (AlacrittyRenderView, transparent layer when image active)
+    ///
+    /// External focus calls target `panel.view` (the container); the
+    /// container forwards becomeFirstResponder to the render view so
+    /// keystrokes still reach `keyDown` / NSTextInputClient.
     override func loadView() {
-        let render = AlacrittyRenderView(theme: theme, font: resolveFont(family: config.fontFamily, size: CGFloat(config.fontSize)))
-        render.translatesAutoresizingMaskIntoConstraints = false
+        let frame = NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let container = FocusForwardingView(frame: frame)
+        container.wantsLayer = true
+
+        let bg = NSImageView(frame: container.bounds)
+        bg.autoresizingMask = [.width, .height]
+        bg.imageScaling = .scaleAxesIndependently
+        bg.wantsLayer = true
+        bg.isHidden = true
+        container.addSubview(bg)
+        backgroundView = bg
+
+        let tint = NSView(frame: container.bounds)
+        tint.autoresizingMask = [.width, .height]
+        tint.wantsLayer = true
+        tint.isHidden = true
+        container.addSubview(tint)
+        tintView = tint
+
+        let render = AlacrittyRenderView(
+            theme: theme,
+            font: resolveFont(family: config.fontFamily, size: CGFloat(config.fontSize)),
+            transparentDefaultBg: config.transparentDefaultBg,
+        )
+        render.frame = container.bounds
+        render.autoresizingMask = [.width, .height]
+        container.addSubview(render)
         renderView = render
-        view = render
+        container.focusTarget = render
+
+        view = container
+
+        // Apply background from config if set. Runs before viewDidAppear,
+        // which is fine: NSImageView accepts an image even off-screen, and
+        // we re-snap layer state in applyBackground itself.
+        if let path = config.backgroundPath {
+            applyBackground(path: path, tint: config.backgroundTint, opacity: config.backgroundOpacity)
+        }
     }
 
     override func viewDidLayout() {
@@ -82,14 +127,44 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
             termHandle?.input(Array(initialInput.utf8))
         }
         renderView?.bind(handle: termHandle)
-        view.window?.makeFirstResponder(view)
+        // Target the render view explicitly. The container forwards too
+        // (belt and braces for callers that already have a reference to
+        // `panel.view`), but going direct skips the second hop.
+        if let render = renderView {
+            view.window?.makeFirstResponder(render)
+        }
     }
 
-    // MARK: - NesttyPanel — background (Phase 3.5 wires the real impl)
+    // MARK: - NesttyPanel — background
 
-    func applyBackground(path _: String, tint _: Double, opacity _: Double) {}
-    func clearBackground() {}
-    func setTint(_: Double) {}
+    /// Wire an image background + tint overlay. The render view's layer
+    /// goes transparent so the image layer underneath composites
+    /// through. `transparent_default_bg` config decides whether default
+    /// cells fill opaquely on top (image hidden behind text area, cursor
+    /// always visible) or stay transparent (image visible through blank
+    /// cells, cursor visibility depends on accent vs image contrast).
+    func applyBackground(path: String, tint: Double, opacity: Double) {
+        guard let image = NSImage(contentsOfFile: path) else { return }
+        backgroundView?.image = image
+        backgroundView?.alphaValue = CGFloat(opacity)
+        backgroundView?.isHidden = false
+        tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(tint)).cgColor
+        tintView?.isHidden = opacity == 0
+        renderView?.setImageBackgroundActive(true)
+        renderView?.needsDisplay = true
+    }
+
+    func clearBackground() {
+        backgroundView?.image = nil
+        backgroundView?.isHidden = true
+        tintView?.isHidden = true
+        renderView?.setImageBackgroundActive(false)
+        renderView?.needsDisplay = true
+    }
+
+    func setTint(_ alpha: Double) {
+        tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(alpha)).cgColor
+    }
 
     // MARK: - Font
 
@@ -109,6 +184,36 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
             }
         }
         return .monospacedSystemFont(ofSize: size, weight: .regular)
+    }
+}
+
+// MARK: - Focus-forwarding container
+
+/// Container view whose only job is to bounce first-responder requests
+/// to its embedded render view. The PaneManager / TabViewController
+/// codepaths target `panel.view` (the root NSView) when activating a
+/// pane; without this redirect, `keyDown` and NSTextInputClient on the
+/// render subview never fire because the container itself doesn't
+/// override either.
+@MainActor
+private final class FocusForwardingView: NSView {
+    weak var focusTarget: NSView?
+
+    override var acceptsFirstResponder: Bool {
+        focusTarget?.acceptsFirstResponder ?? false
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        // Re-entering NSWindow.makeFirstResponder inside becomeFirstResponder
+        // is fragile (the window is mid-dispatch). Accept becoming first
+        // responder here, then defer the swap to the next runloop turn
+        // so the window's responder-transition completes cleanly before
+        // we re-target. Keystrokes can't arrive between these ticks.
+        guard let target = focusTarget else { return false }
+        DispatchQueue.main.async { [weak self] in
+            _ = self?.window?.makeFirstResponder(target)
+        }
+        return true
     }
 }
 
@@ -148,16 +253,40 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// view repaints when the timer fires.
     private var snapshotCache: NesttyTermFFI.Snapshot?
 
-    init(theme: NesttyTheme, font: NSFont) {
+    /// User opt-in: when true AND an image background is active, default
+    /// (sentinel-zero) cells render without a bg fill so the image shows
+    /// through. Independent of the controller's bg state because the
+    /// flag is set at init from the live config; the
+    /// `imageBackgroundActive` runtime flag (set/cleared as the user
+    /// applies or clears the background) AND-gates the actual behavior
+    /// — no image, no transparency, regardless of the user pref.
+    private let transparentDefaultBg: Bool
+    private var imageBackgroundActive = false
+
+    init(theme: NesttyTheme, font: NSFont, transparentDefaultBg: Bool) {
         self.theme = theme
         self.font = font
         boldFont = Self.deriveBold(from: font)
         paletteCache = Self.buildPalette(theme: theme)
+        self.transparentDefaultBg = transparentDefaultBg
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = theme.background.nsColor.cgColor
         recomputeCellMetrics()
         startRefreshTimer()
+    }
+
+    /// Called by the controller when `applyBackground` / `clearBackground`
+    /// flips the layered-view state. Toggles the layer-bg clear/opaque
+    /// AND the bounds-fill skip — both are needed: layer-bg covers the
+    /// image even without per-cell draw, and the bounds fill would
+    /// re-cover it inside `draw(_:)`.
+    func setImageBackgroundActive(_ active: Bool) {
+        imageBackgroundActive = active
+        layer?.backgroundColor = active
+            ? NSColor.clear.cgColor
+            : theme.background.nsColor.cgColor
+        needsDisplay = true
     }
 
     private static func deriveBold(from regular: NSFont) -> NSFont {
@@ -295,11 +424,16 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
               let ctx = NSGraphicsContext.current?.cgContext
         else { return }
 
-        // Fill the whole bounds with theme background. Phase 3.5
-        // adds the per-cell materialize that interacts with image
-        // backgrounds; for now a single fill is correct.
-        ctx.setFillColor(theme.background.nsColor.cgColor)
-        ctx.fill(bounds)
+        // Fill the bounds with theme background unless the user opted
+        // into transparent default cells AND a background image is
+        // active. In that case the image layer underneath shows through
+        // blank cells; cells with explicit ANSI bg or reverse-video
+        // still materialize opaque in `drawRow` (Zed pattern), so
+        // reverse-video stays legible against the image.
+        if !(transparentDefaultBg && imageBackgroundActive) {
+            ctx.setFillColor(theme.background.nsColor.cgColor)
+            ctx.fill(bounds)
+        }
 
         // Cursor first (under the text), so block-style cursor
         // shows its character on top via the text loop. Hidden
@@ -390,8 +524,21 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         let flagInverse: UInt16 = 1 << 3
         let flagDim: UInt16 = 1 << 4
 
+        let transparentMode = transparentDefaultBg && imageBackgroundActive
+
         for i in 0 ..< runs.count {
             let run = runs[i]
+
+            // Provenance — was this cell's bg from the default sentinel
+            // (`run.bg_rgba == 0`)? We need to know BEFORE resolving so
+            // we can decide whether transparent mode applies. Equality
+            // check on the resolved color is not enough: an explicit
+            // ANSI bg that happens to equal theme.background should
+            // still paint (it's a real intent), and a real default cell
+            // should NOT paint in transparent mode even though its
+            // resolved color matches theme.bg.
+            let bgIsDefault = run.bg_rgba == 0
+            let isInverse = run.flags & flagInverse != 0
 
             // Resolve colors then apply inverse swap. Default-bg
             // materializes to theme.background BEFORE the swap (Zed
@@ -399,7 +546,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             // transparent bg would render invisibly without it).
             var fg = resolveColor(run.fg_rgba, defaultColor: defaultFg)
             var bg = resolveColor(run.bg_rgba, defaultColor: defaultBg)
-            if run.flags & flagInverse != 0 {
+            if isInverse {
                 swap(&fg, &bg)
             }
             // Dim → reduce fg alpha. ANSI spec is intentionally vague
@@ -414,9 +561,17 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
                                   width: cellsWide * cellWidth, height: cellHeight)
 
             // Per-cell bg fill — overrides the global bounds fill.
-            // Skip when the cell ends up as theme background AND not
-            // inverse (the bounds fill already covered it).
-            if !cgColorsApproxEqual(bg, defaultBg) {
+            //   Opaque mode: skip when the resolved bg equals theme.bg
+            //     (the bounds fill already covered it).
+            //   Transparent mode: skip only when the cell came from the
+            //     default sentinel AND is not inverse — those are the
+            //     only cells we let the image bleed through. Inverse +
+            //     default-bg is opaque theme.fg after swap and must
+            //     still paint.
+            let skipFill = transparentMode
+                ? (bgIsDefault && !isInverse)
+                : cgColorsApproxEqual(bg, defaultBg)
+            if !skipFill {
                 ctx.setFillColor(bg)
                 ctx.fill(cellRect)
             }
