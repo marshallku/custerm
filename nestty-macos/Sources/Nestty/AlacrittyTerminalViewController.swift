@@ -126,9 +126,16 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
 private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClient {
     private let theme: NesttyTheme
     private var font: NSFont
+    private var boldFont: NSFont
     private(set) var cellWidth: CGFloat = 0
     private(set) var cellHeight: CGFloat = 0
     private var ascent: CGFloat = 0
+
+    /// Cached CGColor for the 16-color ANSI palette + xterm 256
+    /// extension. Indices 0-15 from `theme.palette` (so theme changes
+    /// reflect the right color); 16-231 from the 6×6×6 cube; 232-255
+    /// from the grayscale ramp.
+    private let paletteCache: [CGColor]
 
     private weak var termHandle: NesttyTermFFI.Handle?
     /// nonisolated(unsafe) so deinit (Swift 6 nonisolated) can
@@ -144,11 +151,76 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     init(theme: NesttyTheme, font: NSFont) {
         self.theme = theme
         self.font = font
+        boldFont = Self.deriveBold(from: font)
+        paletteCache = Self.buildPalette(theme: theme)
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = theme.background.nsColor.cgColor
         recomputeCellMetrics()
         startRefreshTimer()
+    }
+
+    private static func deriveBold(from regular: NSFont) -> NSFont {
+        let mgr = NSFontManager.shared
+        if let bold = mgr.convert(regular, toHaveTrait: .boldFontMask) as NSFont? {
+            return bold
+        }
+        return regular
+    }
+
+    /// 256-color ANSI table, computed once at view init. Indices 0-15
+    /// follow theme.palette so a theme change re-derives the right
+    /// brand colors; 16-231 are the canonical xterm 6×6×6 cube;
+    /// 232-255 are the 24-step grayscale ramp.
+    private static func buildPalette(theme: NesttyTheme) -> [CGColor] {
+        var out: [CGColor] = []
+        out.reserveCapacity(256)
+        for c in theme.palette {
+            out.append(c.nsColor.cgColor)
+        }
+        // Defensive padding if a theme ships fewer than 16 palette
+        // entries — black for the missing slots so a stray index
+        // doesn't crash.
+        while out.count < 16 {
+            out.append(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        }
+        // 6×6×6 RGB cube (216 colors).
+        let cubeLevels: [CGFloat] = [0, 95, 135, 175, 215, 255].map { $0 / 255.0 }
+        for r in 0 ..< 6 {
+            for g in 0 ..< 6 {
+                for b in 0 ..< 6 {
+                    out.append(CGColor(red: cubeLevels[r], green: cubeLevels[g], blue: cubeLevels[b], alpha: 1))
+                }
+            }
+        }
+        // 24-step grayscale.
+        for i in 0 ..< 24 {
+            let v = CGFloat(8 + i * 10) / 255.0
+            out.append(CGColor(red: v, green: v, blue: v, alpha: 1))
+        }
+        return out
+    }
+
+    /// Decode the fg/bg encoding from `nestty-term::color_to_rgba`
+    /// (alpha=0 + low-byte = indexed palette, alpha>0 = direct RGBA).
+    /// `defaultColor` is the theme color used when the run is the
+    /// sentinel 0.
+    private func resolveColor(_ packed: UInt32, defaultColor: CGColor) -> CGColor {
+        if packed == 0 { return defaultColor }
+        let alpha = (packed >> 24) & 0xFF
+        if alpha == 0 {
+            // Indexed palette entry; low byte is the index.
+            let idx = Int(packed & 0xFF)
+            if idx < paletteCache.count {
+                return paletteCache[idx]
+            }
+            return defaultColor
+        }
+        let r = CGFloat((packed >> 24) & 0xFF) / 255.0
+        let g = CGFloat((packed >> 16) & 0xFF) / 255.0
+        let b = CGFloat((packed >> 8) & 0xFF) / 255.0
+        let a = CGFloat(packed & 0xFF) / 255.0
+        return CGColor(red: r, green: g, blue: b, alpha: a)
     }
 
     @available(*, unavailable)
@@ -246,12 +318,11 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         defer { ctx.restoreGState() }
 
         let snapRows = snap.rows
-        let textColor = theme.foreground.nsColor
         for row in 0 ..< snapRows {
             let runs = snap.rowRuns(row)
             let utf8 = snap.rowUtf8(row)
             guard runs.count > 0, utf8.count > 0 else { continue }
-            drawRow(row: row, runs: runs, utf8: utf8, textColor: textColor, ctx: ctx)
+            drawRow(row: row, runs: runs, utf8: utf8, ctx: ctx)
         }
     }
 
@@ -303,13 +374,52 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         row: UInt16,
         runs: UnsafeBufferPointer<NesttyRun>,
         utf8: UnsafeBufferPointer<UInt8>,
-        textColor: NSColor,
         ctx: CGContext,
     ) {
         // Baseline in flipped coords: top of row + ascent.
         let baselineY = CGFloat(row) * cellHeight + ascent
+        let defaultFg = theme.foreground.nsColor.cgColor
+        let defaultBg = theme.background.nsColor.cgColor
+
+        // Flag bits mirror nestty_term::flags (see
+        // nestty-term/src/lib.rs). Kept as Swift constants to avoid
+        // a third source of truth.
+        let flagBold: UInt16 = 1 << 0
+        let flagInverse: UInt16 = 1 << 3
+        let flagDim: UInt16 = 1 << 4
+
         for i in 0 ..< runs.count {
             let run = runs[i]
+
+            // Resolve colors then apply inverse swap. Default-bg
+            // materializes to theme.background BEFORE the swap (Zed
+            // pattern from §Phase 3 in the plan — reverse-video over
+            // transparent bg would render invisibly without it).
+            var fg = resolveColor(run.fg_rgba, defaultColor: defaultFg)
+            var bg = resolveColor(run.bg_rgba, defaultColor: defaultBg)
+            if run.flags & flagInverse != 0 {
+                swap(&fg, &bg)
+            }
+            // Dim → reduce fg alpha. ANSI spec is intentionally vague
+            // here; ~65% is the conventional value across emulators.
+            if run.flags & flagDim != 0, let dimmed = fg.copy(alpha: 0.65) {
+                fg = dimmed
+            }
+
+            let x = CGFloat(run.start_col) * cellWidth
+            let cellsWide = CGFloat(run.end_col - run.start_col)
+            let cellRect = CGRect(x: x, y: CGFloat(row) * cellHeight,
+                                  width: cellsWide * cellWidth, height: cellHeight)
+
+            // Per-cell bg fill — overrides the global bounds fill.
+            // Skip when the cell ends up as theme background AND not
+            // inverse (the bounds fill already covered it).
+            if !cgColorsApproxEqual(bg, defaultBg) {
+                ctx.setFillColor(bg)
+                ctx.fill(cellRect)
+            }
+
+            // Text. Empty/whitespace skipped to save a CTLine alloc.
             let len = Int(run.utf8_len)
             let offset = Int(run.utf8_offset)
             guard offset + len <= utf8.count else { continue }
@@ -318,16 +428,37 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
                 !str.isEmpty
             else { continue }
 
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: textColor,
+            let runFont = (run.flags & flagBold != 0) ? boldFont : font
+            var attrs: [NSAttributedString.Key: Any] = [
+                .font: runFont,
+                .foregroundColor: NSColor(cgColor: fg) ?? .white,
             ]
+            // underline_style: 0=none, others=show single (Phase 3.7
+            // will distinguish double/curly/dotted/dashed).
+            if run.underline_style != 0 {
+                attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                let ulColor = run.underline_color_rgba == 0
+                    ? fg
+                    : resolveColor(run.underline_color_rgba, defaultColor: fg)
+                attrs[.underlineColor] = NSColor(cgColor: ulColor) ?? .white
+            }
             let attr = NSAttributedString(string: str, attributes: attrs)
             let line = CTLineCreateWithAttributedString(attr)
-            let x = CGFloat(run.start_col) * cellWidth
             ctx.textPosition = CGPoint(x: x, y: baselineY)
             CTLineDraw(line, ctx)
         }
+    }
+
+    /// Cheap component-wise equality for the "is this cell's bg the
+    /// same as the bounds fill we already did" early-out. Falls back
+    /// to ObjectIdentifier when components aren't comparable (mixed
+    /// color spaces).
+    private func cgColorsApproxEqual(_ a: CGColor, _ b: CGColor) -> Bool {
+        guard let ac = a.components, let bc = b.components, ac.count == bc.count else { return false }
+        for (x, y) in zip(ac, bc) where abs(x - y) > 0.001 {
+            return false
+        }
+        return true
     }
 
     // MARK: - Keyboard

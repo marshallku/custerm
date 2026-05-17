@@ -381,17 +381,55 @@ fn cell_flags_to_ffi(f: CellFlags) -> u16 {
     out
 }
 
-/// `Color::Named(Foreground|Background)` → sentinel 0 so the renderer
-/// can decide whether to materialize to theme bg or pass-through
-/// transparent (Zed pattern, Phase 3). `Color::Spec(rgb)` → direct
-/// pack. `Color::Indexed(_)` → 0 placeholder for Phase 2; the renderer
-/// will wire an ANSI palette in Phase 3.
+/// Encoding scheme for the `fg_rgba` / `bg_rgba` u32 fields, chosen
+/// so the Swift renderer can distinguish three color kinds without
+/// growing the ABI:
+///
+/// - `0x00000000` — default (renderer materializes to theme fg/bg).
+/// - `0x000000NN` (alpha byte = 0, low byte = N in 0..255) — indexed
+///   palette color. Swift resolves 0-15 from `theme.palette`, 16-231
+///   from the 6×6×6 xterm color cube, 232-255 from the 24-step
+///   grayscale ramp.
+/// - `0xRRGGBBAA` with alpha > 0 — direct RGB, decoded as-is.
+///
+/// The alpha=0 + RGB-zero collision is intentional: a true "black at
+/// alpha 0" is meaningless for terminal cells (it's just "default").
 fn color_to_rgba(color: AnsiColor) -> u32 {
     match color {
         AnsiColor::Named(NamedColor::Foreground) | AnsiColor::Named(NamedColor::Background) => 0,
+        AnsiColor::Named(named) => named_to_indexed(named),
+        AnsiColor::Indexed(idx) => idx as u32,
         AnsiColor::Spec(rgb) => ((rgb.r as u32) << 24) | ((rgb.g as u32) << 16) | ((rgb.b as u32) << 8) | 0xff,
-        _ => 0,
     }
+}
+
+/// Map `NamedColor` variants the SGR parser hands us into ANSI
+/// palette indices the Swift side already knows how to resolve. Keeps
+/// the bright/dim variants honest (bright red is index 9, not 1) so
+/// `printf '\033[91mhi'` actually renders bright.
+fn named_to_indexed(named: NamedColor) -> u32 {
+    let idx: u8 = match named {
+        NamedColor::Black => 0,
+        NamedColor::Red => 1,
+        NamedColor::Green => 2,
+        NamedColor::Yellow => 3,
+        NamedColor::Blue => 4,
+        NamedColor::Magenta => 5,
+        NamedColor::Cyan => 6,
+        NamedColor::White => 7,
+        NamedColor::BrightBlack => 8,
+        NamedColor::BrightRed => 9,
+        NamedColor::BrightGreen => 10,
+        NamedColor::BrightYellow => 11,
+        NamedColor::BrightBlue => 12,
+        NamedColor::BrightMagenta => 13,
+        NamedColor::BrightCyan => 14,
+        NamedColor::BrightWhite => 15,
+        // DimFg / Cursor / etc. aren't part of the 16-color
+        // palette; fall back to default and let the renderer pick.
+        _ => return 0,
+    };
+    idx as u32
 }
 
 /// `cell.underline_color()` returns the SPEC color directly when set
