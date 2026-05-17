@@ -21,9 +21,11 @@
 //! consume them without holding the lock.
 
 use std::ffi::{CStr, c_char};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{VoidListener, WindowSize};
@@ -31,6 +33,7 @@ use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
@@ -96,6 +99,16 @@ pub struct NesttyHandle {
     /// Reader thread that owns the PTY + parser loop. Joined in
     /// `nestty_term_destroy` after sending `Msg::Shutdown`.
     io_thread: Option<JoinHandle<(EventLoop<Pty, VoidListener>, State)>>,
+    /// Last observed hash of the cursor row's renderable content plus
+    /// cursor metadata (style/blink/show). Used by
+    /// `nestty_term_take_damage` to catch three classes of changes the
+    /// line-bounds filter would otherwise drop: (1) cursor-cell
+    /// mutation collapsing to `(line, col, col)` damage — same shape
+    /// as alacritty's unconditional `damage_cursor` hint; (2) zero-
+    /// width combining marks (alacritty's `Term::input` skips
+    /// `damage_point` on that branch); (3) DECSCUSR / `\e[?25l/h`
+    /// cursor metadata transitions that produce zero grid damage.
+    last_cursor_row_hash: AtomicU64,
 }
 
 pub struct NesttySnapshot {
@@ -168,6 +181,7 @@ pub unsafe extern "C" fn nestty_term_create(
         term,
         sender,
         io_thread: Some(io_thread),
+        last_cursor_row_hash: AtomicU64::new(0),
     }))
 }
 
@@ -242,6 +256,129 @@ pub unsafe extern "C" fn nestty_term_resize(handle: *mut NesttyHandle, cols: u16
     let _ = h.sender.send(Msg::Resize(ws));
     let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
     h.term.lock().resize(term_size);
+}
+
+/// Query whether the terminal grid has been damaged since the last
+/// call. Returns `true` if any cell changed; `false` if the grid is
+/// byte-for-byte what the renderer already drew. Always resets the
+/// internal damage state so the next call only sees what changed
+/// AFTER this one.
+///
+/// The renderer's intended loop:
+///   CADisplayLink tick → `nestty_term_take_damage` → if false, skip;
+///   if true, `nestty_term_snapshot` + redraw.
+///
+/// Cursor-only filter: `alacritty_terminal::Term::damage` unconditionally
+/// marks the current cursor cell on every call (a hint for renderers
+/// that paint a blinking cursor). That makes the raw signal "always
+/// damaged," which defeats the gate. We instead treat damage as "real"
+/// only when it covers ANY cell other than exactly the cursor's
+/// single-cell point — cursor *movement* still counts because the
+/// damage region then includes the previous cursor cell, widening
+/// beyond left==right==cursor.col.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_take_damage(handle: *mut NesttyHandle) -> bool {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return false;
+    };
+    let mut term = h.term.lock();
+    let cursor_point = term.grid().cursor.point;
+    let cursor_line = cursor_point.line.0.max(0) as usize;
+    let cursor_col = cursor_point.column.0;
+
+    // Hash the entire cursor row's renderable content. Catches both
+    // cursor-cell mutations (e.g. `\e[K` at the right edge collapses
+    // damage to `(line, col, col)` — same shape as the unconditional
+    // damage_cursor hint the line-bounds filter discards) AND
+    // combining marks pushed onto a non-cursor cell (typically
+    // `cursor.col - 1`, where the base char was just written — and
+    // alacritty's zero-width branch mutates `cell.zerowidth` without
+    // calling `damage_point`). Single-row hash cost is trivial vs
+    // the alternative full snapshot + draw on every tick.
+    let cursor_row_hash = hash_cursor_row(&term, cursor_point);
+    let prev_hash = h
+        .last_cursor_row_hash
+        .swap(cursor_row_hash, Ordering::Relaxed);
+    let cursor_row_changed = cursor_row_hash != prev_hash;
+
+    let real_damage = match term.damage() {
+        alacritty_terminal::term::TermDamage::Full => true,
+        alacritty_terminal::term::TermDamage::Partial(mut iter) => {
+            cursor_row_changed
+                || iter.any(|d| {
+                    !(d.line == cursor_line && d.left == cursor_col && d.right == cursor_col)
+                })
+        }
+    };
+    term.reset_damage();
+    real_damage
+}
+
+/// Hash every renderable field of every cell on the cursor's row
+/// PLUS the cursor's own metadata (position, style, blink, visibility).
+/// Mirrors everything `nestty_term_snapshot` exposes for that row so
+/// the gate's "byte-for-byte same" contract holds for:
+///   - cursor-cell mutations whose damage bounds collapse to
+///     `(line, col, col)` (same shape as `damage_cursor` hint);
+///   - zero-width combining marks pushed onto a non-cursor cell
+///     (alacritty's `Term::input` zero-width branch updates
+///     `cell.zerowidth` without calling `damage_point`);
+///   - DECSCUSR / show-cursor mode transitions that change the
+///     cursor's style/blink/visibility without touching the grid.
+///
+/// Caller already holds the term lock — no extra synchronization
+/// needed. Out-of-range cursor returns a fixed sentinel so the
+/// comparison is still stable.
+fn hash_cursor_row(term: &Term<VoidListener>, cursor: Point) -> u64 {
+    let line = cursor.line;
+    if line.0 < 0 || (line.0 as usize) >= term.screen_lines() {
+        return 0;
+    }
+    let cols = term.columns();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    {
+        let grid = term.grid();
+        for c in 0..cols {
+            let cell = &grid[Point::new(line, Column(c))];
+            cell.c.hash(&mut hasher);
+            cell.flags.bits().hash(&mut hasher);
+            // AnsiColor isn't Hash, so round-trip through our tagged-u32
+            // encoding (which already collapses every variant to a
+            // stable value).
+            color_to_rgba(cell.fg).hash(&mut hasher);
+            color_to_rgba(cell.bg).hash(&mut hasher);
+            if let Some(extras) = cell.zerowidth() {
+                for ch in extras {
+                    ch.hash(&mut hasher);
+                }
+            }
+            if let Some(uc) = cell.underline_color() {
+                color_to_rgba(uc).hash(&mut hasher);
+            }
+            // Hyperlink: just hash presence — the renderer treats any
+            // non-None as `hyperlink_id = 1` (placeholder until Phase 4
+            // wires real IDs).
+            u8::from(cell.hyperlink().is_some()).hash(&mut hasher);
+        }
+    }
+    // Cursor metadata. Movement is technically caught by the line-bounds
+    // filter (prev+current cursor damage widens the line bounds), but
+    // style/blink/visibility changes leave no grid damage at all — they
+    // only matter once they appear in the next snapshot.
+    cursor.line.0.hash(&mut hasher);
+    cursor.column.0.hash(&mut hasher);
+    let cs = term.cursor_style();
+    (cs.shape as u8).hash(&mut hasher);
+    cs.blinking.hash(&mut hasher);
+    term.mode()
+        .contains(TermMode::SHOW_CURSOR)
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Take a snapshot of the visible viewport. Lock duration is bounded
@@ -685,7 +822,11 @@ mod color_encoding_tests {
     #[test]
     fn underline_color_uses_same_encoding_as_fg() {
         assert_eq!(
-            color_to_rgba(AnsiColor::Spec(Rgb { r: 10, g: 20, b: 30 })),
+            color_to_rgba(AnsiColor::Spec(Rgb {
+                r: 10,
+                g: 20,
+                b: 30
+            })),
             TAG_DIRECT | (10 << 16) | (20 << 8) | 30,
         );
         assert_eq!(color_to_rgba(AnsiColor::Indexed(5)), TAG_INDEXED | 5);

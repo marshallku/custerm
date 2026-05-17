@@ -232,6 +232,8 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private let theme: NesttyTheme
     private var font: NSFont
     private var boldFont: NSFont
+    private var italicFont: NSFont
+    private var boldItalicFont: NSFont
     private(set) var cellWidth: CGFloat = 0
     private(set) var cellHeight: CGFloat = 0
     private var ascent: CGFloat = 0
@@ -243,14 +245,19 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private let paletteCache: [CGColor]
 
     private weak var termHandle: NesttyTermFFI.Handle?
-    /// nonisolated(unsafe) so deinit (Swift 6 nonisolated) can
-    /// invalidate the timer without crossing the main-actor barrier.
-    /// Same RAII pattern used by NesttyTermFFI.Handle/Snapshot.
-    private nonisolated(unsafe) var refreshTimer: Timer?
+    /// CADisplayLink fires once per display refresh (typically 60 Hz,
+    /// up to ProMotion's 120 Hz). Replaces the Timer-driven 30 Hz
+    /// poll: aligned to vsync (no tearing, no half-frame draws), and
+    /// the per-tick `takeDamage` gate means an idle terminal does
+    /// zero work between key presses or PTY output bursts.
+    ///
+    /// `nonisolated(unsafe)` so deinit (Swift 6 nonisolated) can
+    /// invalidate without crossing the main-actor barrier — same
+    /// pattern as the previous `refreshTimer`.
+    private nonisolated(unsafe) var vsyncLink: CADisplayLink?
 
-    /// Cached snapshot for the most recent paint. Phase 3.6 will
-    /// switch to damage-tracked partial repaints; for now the whole
-    /// view repaints when the timer fires.
+    /// Cached snapshot for the most recent paint. Refreshed only when
+    /// `nestty_term_take_damage` reports the grid changed.
     private var snapshotCache: NesttyTermFFI.Snapshot?
 
     /// User opt-in: when true AND an image background is active, default
@@ -263,17 +270,30 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private let transparentDefaultBg: Bool
     private var imageBackgroundActive = false
 
+    /// Cursor-blink state. Honored only when the TUI/shell actually
+    /// asks for it via DECSCUSR (`cursor.blink == 1` on the snapshot).
+    /// When idle with blink on, the display-link callback forces a
+    /// redraw every `blinkInterval` even when `takeDamage` says
+    /// nothing changed — that's 2 redraws/sec, acceptable cost.
+    private var blinkVisible = true
+    private var lastBlinkToggle = Date.distantPast
+    private let blinkInterval: TimeInterval = 0.5
+
     init(theme: NesttyTheme, font: NSFont, transparentDefaultBg: Bool) {
         self.theme = theme
         self.font = font
-        boldFont = Self.deriveBold(from: font)
+        boldFont = Self.deriveTrait(font, mask: .boldFontMask)
+        italicFont = Self.deriveTrait(font, mask: .italicFontMask)
+        boldItalicFont = Self.deriveTrait(font, mask: [.boldFontMask, .italicFontMask])
         paletteCache = Self.buildPalette(theme: theme)
         self.transparentDefaultBg = transparentDefaultBg
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = theme.background.nsColor.cgColor
         recomputeCellMetrics()
-        startRefreshTimer()
+        // CADisplayLink can't be created until the view has a window
+        // (the link binds to the display showing the view). Hooked up
+        // in `viewDidMoveToWindow`.
     }
 
     /// Called by the controller when `applyBackground` / `clearBackground`
@@ -289,10 +309,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         needsDisplay = true
     }
 
-    private static func deriveBold(from regular: NSFont) -> NSFont {
+    /// Apply font traits via NSFontManager, falling back to the regular
+    /// face if the family doesn't ship the requested variant (common
+    /// for monospace fonts that lack an italic — synthesized italics
+    /// are visually awkward, so we just don't slant).
+    private static func deriveTrait(_ regular: NSFont, mask: NSFontTraitMask) -> NSFont {
         let mgr = NSFontManager.shared
-        if let bold = mgr.convert(regular, toHaveTrait: .boldFontMask) as NSFont? {
-            return bold
+        if let variant = mgr.convert(regular, toHaveTrait: mask) as NSFont? {
+            return variant
         }
         return regular
     }
@@ -360,7 +384,46 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     }
 
     deinit {
-        refreshTimer?.invalidate()
+        vsyncLink?.invalidate()
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    /// Bind the display link once the view has a window. AppKit calls
+    /// this with `nil` window when the view is removed, so we tear
+    /// down too — no leaked link firing into a detached view. We also
+    /// observe key-window transitions so the cursor block can flip
+    /// between filled (focused) and hollow (blurred) without waiting
+    /// for unrelated terminal damage.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        let center = NotificationCenter.default
+        guard let win = window else {
+            vsyncLink?.invalidate()
+            vsyncLink = nil
+            center.removeObserver(self)
+            return
+        }
+        if vsyncLink == nil {
+            // `displayLink(target:selector:)` is NSView's vsync-link
+            // factory (macOS 14+). Property name above is `vsyncLink`
+            // to avoid shadowing the method with our stored link.
+            let link = displayLink(target: self, selector: #selector(displayLinkFired(_:)))
+            link.add(to: .current, forMode: .common)
+            vsyncLink = link
+        }
+        center.removeObserver(self)
+        center.addObserver(self, selector: #selector(windowFocusChanged(_:)),
+                           name: NSWindow.didBecomeKeyNotification, object: win)
+        center.addObserver(self, selector: #selector(windowFocusChanged(_:)),
+                           name: NSWindow.didResignKeyNotification, object: win)
+    }
+
+    @objc private func windowFocusChanged(_: Notification) {
+        // Cursor draw depends on `window?.isKeyWindow`; force the next
+        // paint to pick the new focus state up. The damage gate stays
+        // safe (no snapshot churn) — we just invalidate the cached
+        // bitmap so AppKit re-runs `draw(_:)` with the cached snapshot.
+        needsDisplay = true
     }
 
     override var isFlipped: Bool {
@@ -396,27 +459,42 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         if cellHeight <= 0 { cellHeight = 16 }
     }
 
-    private func startRefreshTimer() {
-        refreshTimer?.invalidate()
-        // ~30 Hz. CADisplayLink + damage tracking is Phase 3.6; for
-        // 3.2 a Timer is sufficient and avoids the display-link
-        // run-loop integration tax up front.
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            // Timer fires on the main runloop (scheduledTimer's
-            // default). Assume-isolated lets us call the @MainActor
-            // tick() without a hop, matching the actual thread.
-            MainActor.assumeIsolated { self?.tick() }
+    /// Display-link callback. Runs on the main runloop at vsync. Gated
+    /// on `takeDamage` so an idle terminal pays only the FFI bool
+    /// query (sub-microsecond) instead of a full snapshot + redraw.
+    /// When a TUI-driven blinking cursor is active, an additional
+    /// 2 Hz tick forces a redraw to advance the blink phase.
+    @objc private func displayLinkFired(_: CADisplayLink) {
+        guard let handle = termHandle else { return }
+        let damaged = handle.takeDamage()
+        let blinkPhaseChanged = advanceBlinkPhase()
+        guard damaged || blinkPhaseChanged else { return }
+        if damaged {
+            snapshotCache = handle.snapshot()
         }
+        needsDisplay = true
     }
 
-    private func tick() {
-        guard let handle = termHandle else { return }
-        // Take a fresh snapshot and trigger a redraw. The snapshot is
-        // a copy of the grid (Rust-side `Box`); holding it across the
-        // draw is cheap.
-        let snap = handle.snapshot()
-        snapshotCache = snap
-        needsDisplay = true
+    /// Toggle the cursor visibility once per `blinkInterval` whenever
+    /// the most recent snapshot reports `cursor.blink == 1`. Restores
+    /// the cursor to visible if a previously-blinking TUI handed back
+    /// to a steady cursor — otherwise the cursor could stick off.
+    private func advanceBlinkPhase() -> Bool {
+        let cursorBlink = snapshotCache?.cursor.blink ?? 0
+        if cursorBlink == 1 {
+            let now = Date()
+            if now.timeIntervalSince(lastBlinkToggle) >= blinkInterval {
+                blinkVisible.toggle()
+                lastBlinkToggle = now
+                return true
+            }
+            return false
+        }
+        if !blinkVisible {
+            blinkVisible = true
+            return true
+        }
+        return false
     }
 
     override func draw(_: NSRect) {
@@ -471,6 +549,11 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// do the same.
     private func drawCursor(_ cursor: NesttyCursor) {
         guard cursor.style != 0,
+              // Honor TUI-requested blink: skip the draw on the OFF
+              // phase so the cursor actually disappears between
+              // `blinkInterval` ticks. Steady cursors (`blink == 0`)
+              // ignore `blinkVisible` entirely.
+              cursor.blink == 0 || blinkVisible,
               let ctx = NSGraphicsContext.current?.cgContext
         else { return }
         let x = CGFloat(cursor.col) * cellWidth
@@ -521,8 +604,10 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // nestty-term/src/lib.rs). Kept as Swift constants to avoid
         // a third source of truth.
         let flagBold: UInt16 = 1 << 0
+        let flagItalic: UInt16 = 1 << 1
         let flagInverse: UInt16 = 1 << 3
         let flagDim: UInt16 = 1 << 4
+        let flagStrike: UInt16 = 1 << 5
 
         let transparentMode = transparentDefaultBg && imageBackgroundActive
 
@@ -585,19 +670,31 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
                 !str.isEmpty
             else { continue }
 
-            let runFont = (run.flags & flagBold != 0) ? boldFont : font
+            let isBold = run.flags & flagBold != 0
+            let isItalic = run.flags & flagItalic != 0
+            let runFont: NSFont = switch (isBold, isItalic) {
+            case (true, true): boldItalicFont
+            case (true, false): boldFont
+            case (false, true): italicFont
+            case (false, false): font
+            }
             var attrs: [NSAttributedString.Key: Any] = [
                 .font: runFont,
                 .foregroundColor: NSColor(cgColor: fg) ?? .white,
             ]
-            // underline_style: 0=none, others=show single (Phase 3.7
-            // will distinguish double/curly/dotted/dashed).
+            // underline_style: 0=none, others=show single (richer
+            // double/curly/dotted/dashed decoding will land alongside
+            // the dirty-line refinement when we extend the FFI).
             if run.underline_style != 0 {
                 attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
                 let ulColor = run.underline_color_rgba == 0
                     ? fg
                     : resolveColor(run.underline_color_rgba, defaultColor: fg)
                 attrs[.underlineColor] = NSColor(cgColor: ulColor) ?? .white
+            }
+            if run.flags & flagStrike != 0 {
+                attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+                attrs[.strikethroughColor] = NSColor(cgColor: fg) ?? .white
             }
             let attr = NSAttributedString(string: str, attributes: attrs)
             let line = CTLineCreateWithAttributedString(attr)

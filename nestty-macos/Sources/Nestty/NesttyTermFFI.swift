@@ -88,6 +88,14 @@ enum NesttyTermFFI {
             guard let ptr, let snap = nestty_term_snapshot(ptr) else { return nil }
             return Snapshot(ptr: snap)
         }
+
+        /// True if the terminal grid has any damage since the previous
+        /// call (and resets the internal damage state). False means
+        /// nothing changed — renderer can skip the snapshot + draw.
+        func takeDamage() -> Bool {
+            guard let ptr else { return false }
+            return nestty_term_take_damage(ptr)
+        }
     }
 
     /// Wraps a Rust-owned snapshot pointer. Borrowed runs/utf8 are

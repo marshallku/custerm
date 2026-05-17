@@ -11,6 +11,7 @@
 #ifndef NESTTY_TERM_H
 #define NESTTY_TERM_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -62,6 +63,11 @@ void nestty_term_destroy(NesttyHandle* handle);
 
 void nestty_term_input(NesttyHandle* handle, const uint8_t* bytes, size_t len);
 void nestty_term_resize(NesttyHandle* handle, uint16_t cols, uint16_t rows);
+
+// Returns true if the grid has any pending damage since the last call;
+// always resets internal damage state. Intended for CADisplayLink-driven
+// renderers to skip work when nothing changed.
+bool nestty_term_take_damage(NesttyHandle* handle);
 
 // --- Snapshot ---
 
