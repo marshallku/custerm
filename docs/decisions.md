@@ -425,3 +425,41 @@ The exact failure mode is undiagnosed (vte4 0.8.0 + VTE 0.84 ABI quirk vs. silen
 
 **See:** `nestty-linux/src/url_click.rs` (full implementation + 6 unit tests on `normalize_url`), `nestty-linux/src/tabs.rs::create_panel` (install site), `nestty-linux/src/main.rs` (`mod url_click;`).
 
+
+## 31. macOS terminal emulator core — migrate off SwiftTerm to alacritty_terminal + custom renderer
+
+**Problem:** SwiftTerm hit four architectural blockers we cannot fix without forking:
+
+1. **IME composition broken** — `MacTerminalView.setMarkedText`, `hasMarkedText`, `markedRange` are stubs (`// nothing`, `false`, `NSRange.empty`). Korean/Japanese users can't see what they're composing until commit. Source: `nestty-macos/.build/checkouts/SwiftTerm/Sources/SwiftTerm/Mac/MacTerminalView.swift:847,877,885`.
+
+2. **Cursor invisibility with image background** — `CaretView` is an NSView overlay; pinning `caretColor` (tried theme.accent → theme.foreground → NSColor.white) works in shell but fails against busy wallpapers in TUIs (Claude Code/Ink-based). Sibling-NSView opaque backdrop synced via 30Hz timer was attempted (`syncCaretBackdrop` poll loop, z-order managed via `addSubview(_:positioned:.below:relativeTo:)`) — stderr confirmed creation + sync, but user reported zero visible rectangle on screen (layer-compositing path we couldn't crack).
+
+3. **Reverse-video over transparent bg renders as transparent** — same class of bug WezTerm #1076 / Microsoft Terminal #7014 / Zed PR #17611 all document. Zed's fix decouples logical ANSI bg from rendered transparency via a sub-layer; SwiftTerm has no such separation.
+
+4. **No smart-cursor / cursor_text_color=background / transparent_background_colors equivalents.** SwiftTerm's render pipeline is monolithic `drawRect` over a full bounds region; per-cell custom drawing hooks don't exist.
+
+**Options considered:**
+
+- **A. Fork SwiftTerm.** Weeks per blocker + permanent rebase burden; architectural limits (NSView caret overlay, no per-cell hook) survive the fork.
+- **B. Replace with `alacritty_terminal` Rust crate + own AppKit/CoreText (Metal later) renderer.** Zed's pattern. Estimated 3-4 months for parity (codex consultation, single dev). We own all the painful surfaces (IME, cursor, transparency, future ligatures/decorations/images).
+- **C. Wait for libghostty.** `libghostty-vt` is shipping (Zig API merged May 2026, C API in progress, ~6 months to tagged version; libghostty-swift framework on the roadmap but further out). When ready, this is the lowest-effort highest-quality option — Ghostty core proven by millions of DAU, designed-from-start for embedding. But not usable today and timeline is "if ready".
+- **D. Custom from-scratch emulator.** What iTerm2/Kitty/Ghostty did. 6-12 months. Right call only if we need full control AND have time AND can't reuse a maintained core.
+
+**Decision: B (alacritty_terminal + custom renderer), via codex-validated hybrid path** — keep SwiftTerm as production renderer; build alacritty renderer behind a runtime/dev flag; migrate by vertical slices: PTY/grid → plain text render → cursor → selection → IME → scrollback → colors/transparency → advanced features. Flip default only after parity passes.
+
+**Why not E (wait for libghostty):** even at the optimistic 6-month timeline, libghostty-swift framework is later than libghostty-vt. We'd be back to "wait or build a renderer ourselves" anyway, just with a different emulator core (which is the smaller half of the work). The renderer is what we're really committing to build. If libghostty-swift ships in time and is better than alacritty_terminal, the renderer survives and the emulator backend is a thin swap.
+
+**Why not D (from-scratch emulator):** Alacritty's terminal core is mature, spec-compliant, and battle-tested in production at scale. Reinventing the VT parser + grid + scrollback is months of work for negative differentiation. Risk: Alacritty maintainers explicitly state `alacritty_terminal` is "not for external use" (alacritty/alacritty#2132) — Zed accepts that risk and effectively maintains their integration; we will too, pinning specific versions and being prepared to fork the crate if upstream diverges.
+
+**Short-term SwiftTerm stopgaps that stay in the tree until migration:**
+
+- `NesttyTerminalView.cursorStyleChanged` bar→block clamp when `nativeBackgroundColor == .clear` (so 2px bar/underline cursors don't become invisible against image)
+- `applyCaretColors` pins `caretColor = theme.accent`, `caretTextColor = theme.background` (avoids `NSColor.selectedControlColor` ghost-gray-on-blur)
+- `Keybindings.matches` + `CommandPalette.matchesCommandPaletteShortcut` use `keyCode` rather than `charactersIgnoringModifiers` (IME-immune key matching; commit `04e622c`)
+
+**Known limitations documented for users of the SwiftTerm phase:**
+
+- Cursor may be invisible when image background is active + a TUI with busy color palette is running (Claude Code with bright wallpaper). Workaround: increase `[background] tint`, lower `opacity`, or temporarily clear the background.
+- Korean/Japanese IME composition does not show preedit text in-cell during composition. The final character commits correctly. Workaround: compose in another app and paste, or rely on muscle memory.
+
+**See:** `docs/macos-renderer-migration-plan.md` for the phased plan, FFI design, and slice-by-slice scope.

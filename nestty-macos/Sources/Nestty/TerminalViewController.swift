@@ -24,6 +24,10 @@ class NesttyTerminalView: LocalProcessTerminalView {
     private var exitMonitor: (any DispatchSourceProcess)?
     /// Strongly retained so SwiftTerm's `weak terminalDelegate` doesn't drop our proxy.
     private var delegateProxy: NesttyTerminalDelegate?
+    /// Last DECSCUSR style requested by the running program. Tracked so we
+    /// can restore the program's intent when a background image is turned
+    /// off (and the clamp below stops kicking in).
+    private var pendingCursorStyle: CursorStyle = .blinkBlock
 
     /// Replace SwiftTerm's self-as-delegate with our policy proxy. Must be called once,
     /// after `super.init`, before any PTY frame can fire `clipboardCopy`.
@@ -31,6 +35,44 @@ class NesttyTerminalView: LocalProcessTerminalView {
         let proxy = NesttyTerminalDelegate(host: self, policy: policy)
         delegateProxy = proxy
         terminalDelegate = proxy
+    }
+
+    /// Clamp DECSCUSR bar/underline → block when a background image is
+    /// active. Reason: SwiftTerm draws bar/underline cursors as a 2-pixel
+    /// rectangle (`Apple/CaretView.swift::drawCursor`), which is reliably
+    /// invisible against arbitrary image content — confirmed by injecting
+    /// `\033[6 q` with image background and watching the cursor vanish.
+    /// vim and the shell prompt use the default block style and stay
+    /// visible, which matches the user's report ("vim에선 보이는데 Claude
+    /// Code에선 안 보임"). Ink-based TUIs (Claude Code) emit bar style for
+    /// their input prompt, hitting this code path.
+    ///
+    /// Trade-off: while image background is on, programs lose the ability
+    /// to signal insert mode via bar cursor. Block cursor is forced for
+    /// visibility — opting into image background opts into this clamp.
+    /// When image is cleared, `applyClampedCursorStyle()` is called from
+    /// `clearBackground` to restore the program's last requested style.
+    override func cursorStyleChanged(source: Terminal, newStyle: CursorStyle) {
+        pendingCursorStyle = newStyle
+        super.cursorStyleChanged(source: source, newStyle: clampedCursorStyle(newStyle))
+    }
+
+    private func clampedCursorStyle(_ style: CursorStyle) -> CursorStyle {
+        guard nativeBackgroundColor == .clear else { return style }
+        switch style {
+        case .blinkBar, .steadyBar, .blinkUnderline, .steadyUnderline:
+            return .steadyBlock
+        case .blinkBlock, .steadyBlock:
+            return style
+        }
+    }
+
+    /// Re-apply the cursor style with the current background state. Called
+    /// from `applyBackground` / `clearBackground` so a bar cursor already
+    /// in flight when image bg toggles gets re-clamped (or unclamped) on
+    /// the spot instead of waiting for the next DECSCUSR from the TUI.
+    func applyClampedCursorStyle() {
+        terminal.setCursorStyle(clampedCursorStyle(pendingCursorStyle))
     }
 
     func setOSC52Policy(_ policy: OSC52Policy) {
@@ -277,6 +319,13 @@ class TerminalViewController: NSViewController, NesttyPanel {
         terminalView?.layer?.isOpaque = false
         terminalView?.layer?.backgroundColor = NSColor.clear.cgColor
         terminalView?.nativeBackgroundColor = .clear
+        if let tv = terminalView {
+            applyCaretColors(tv: tv, theme: theme)
+        }
+        // Apply the bar→block clamp now that nativeBackgroundColor flipped
+        // to .clear; otherwise an already-active bar cursor stays invisible
+        // until the next DECSCUSR from the TUI.
+        terminalView?.applyClampedCursorStyle()
         terminalView?.needsDisplay = true
     }
 
@@ -287,6 +336,12 @@ class TerminalViewController: NSViewController, NesttyPanel {
         terminalView?.layer?.isOpaque = false // keep layer-backed, just restore color
         terminalView?.layer?.backgroundColor = theme.background.nsColor.cgColor
         terminalView?.nativeBackgroundColor = theme.background.nsColor
+        if let tv = terminalView {
+            applyCaretColors(tv: tv, theme: theme)
+        }
+        // Restore the program's last requested cursor style — clamp drops
+        // out once nativeBackgroundColor is no longer .clear.
+        terminalView?.applyClampedCursorStyle()
         terminalView?.needsDisplay = true
     }
 
@@ -308,10 +363,15 @@ class TerminalViewController: NSViewController, NesttyPanel {
         let bgColor: NSColor = (backgroundView?.image != nil) ? .clear : newTheme.background.nsColor
         tv.nativeBackgroundColor = bgColor
         tv.nativeForegroundColor = newTheme.foreground.nsColor
+        applyCaretColors(tv: tv, theme: newTheme)
         let ansiColors = newTheme.palette.map { c in
             SwiftTerm.Color(red: UInt16(c.r) * 257, green: UInt16(c.g) * 257, blue: UInt16(c.b) * 257)
         }
         tv.installColors(ansiColors)
+        // applyTheme may flip nativeBackgroundColor between .clear and the
+        // theme color (per the bgColor branch above) — re-apply the cursor
+        // style clamp so the bar→block flip stays in sync.
+        tv.applyClampedCursorStyle()
         tv.needsDisplay = true
         // Update the stored theme so clearBackground() uses the new color.
         theme = newTheme
@@ -337,11 +397,28 @@ class TerminalViewController: NSViewController, NesttyPanel {
     private func configureColors(_ tv: LocalProcessTerminalView) {
         tv.nativeBackgroundColor = theme.background.nsColor
         tv.nativeForegroundColor = theme.foreground.nsColor
+        applyCaretColors(tv: tv, theme: theme)
 
         let ansiColors = theme.palette.map { c in
             SwiftTerm.Color(red: UInt16(c.r) * 257, green: UInt16(c.g) * 257, blue: UInt16(c.b) * 257)
         }
         tv.installColors(ansiColors)
+    }
+
+    /// Pin caret colors away from SwiftTerm's adaptive default
+    /// (`NSColor.selectedControlColor` ghosts to translucent gray on
+    /// window-blur — useless against any background). Stays on
+    /// `theme.accent` regardless of background state.
+    ///
+    /// **Known limitation (documented in docs/decisions.md #30):** a
+    /// single static caret color cannot guarantee contrast against an
+    /// arbitrary background image. The opaque-backdrop fix needed to
+    /// solve this properly requires per-cell rendering hooks SwiftTerm
+    /// does not expose, so this is deferred to the alacritty_terminal
+    /// renderer migration (see `docs/macos-renderer-migration-plan.md`).
+    private func applyCaretColors(tv: LocalProcessTerminalView, theme: NesttyTheme) {
+        tv.caretColor = theme.accent.nsColor
+        tv.caretTextColor = theme.background.nsColor
     }
 
     private func configureFont(_ tv: LocalProcessTerminalView, size: CGFloat, family: String? = nil) {
