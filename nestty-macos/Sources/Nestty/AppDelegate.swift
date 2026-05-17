@@ -46,6 +46,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Remove once Tier 2.4 (TriggerEngine via FFI) replaces it with real
         // engine startup.
         NesttyFFI.runSmokeTest()
+        // Phase 1 (renderer migration) — sibling staticlib smoke. Proves
+        // libnestty_term.a links alongside libnestty_ffi.a and the
+        // handle/snapshot ABI round-trips. Real PTY + grid lands in Phase 2.
+        NesttyTermFFI.runSmokeTest()
 
         // PR 7 — wire the registry's completion fan-out bus BEFORE anything
         // registers an action handler. This way the very first dispatch

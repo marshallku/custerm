@@ -40,17 +40,29 @@ let package = Package(
             path: "Sources/CNesttyFFI",
             publicHeadersPath: "include",
         ),
+        // Sibling C module for the renderer-migration Rust staticlib
+        // (`libnestty_term.a` — see nestty-term/ + docs/macos-renderer-migration-plan.md
+        // Phase 1). Same dummy.c trick as CNesttyFFI. Both staticlibs
+        // get linked into Nestty.app; the Phase 0 spike proved no
+        // symbol collision.
+        .target(
+            name: "CNesttyTerm",
+            path: "Sources/CNesttyTerm",
+            publicHeadersPath: "include",
+        ),
         .executableTarget(
             name: "Nestty",
             dependencies: [
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
                 .product(name: "TOMLKit", package: "TOMLKit"),
                 "CNesttyFFI",
+                "CNesttyTerm",
             ],
             path: "Sources/Nestty",
             linkerSettings: [
                 .unsafeFlags(["-L../target/release"]),
                 .linkedLibrary("nestty_ffi"),
+                .linkedLibrary("nestty_term"),
             ],
         ),
     ],

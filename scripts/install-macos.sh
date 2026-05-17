@@ -102,8 +102,8 @@ fi
 #    archive at $REPO_ROOT/target/release/libnestty_ffi.a via the
 #    -L../target/release flag baked into Package.swift.
 if $DO_BUILD; then
-    echo "==> cargo build --release -p nestty-ffi (Rust staticlib for Swift FFI)"
-    (cd "$REPO_ROOT" && cargo build --release -p nestty-ffi)
+    echo "==> cargo build --release -p nestty-ffi -p nestty-term (Rust staticlibs for Swift FFI)"
+    (cd "$REPO_ROOT" && cargo build --release -p nestty-ffi -p nestty-term)
 
     echo "==> swift build -c release (nestty-macos)"
     (cd "$REPO_ROOT/nestty-macos" && swift build -c release)

@@ -1814,8 +1814,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "nestty-term-spike"
-version = "0.0.1"
+name = "nestty-term"
+version = "0.1.0"
 
 [[package]]
 name = "nix"

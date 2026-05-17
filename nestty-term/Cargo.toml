@@ -1,0 +1,19 @@
+[package]
+name = "nestty-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust terminal emulator core + C-ABI bridge for nestty-macos. Phase 1 ships a stubbed surface; alacritty_terminal lands in Phase 2 (see docs/macos-renderer-migration-plan.md)."
+repository.workspace = true
+
+[lib]
+name = "nestty_term"
+# staticlib so libnestty_term.a embeds into Nestty.app at link time
+# alongside the existing libnestty_ffi.a — proven not to collide by
+# the Phase 0 spike.
+crate-type = ["staticlib"]
+
+[dependencies]
+# Phase 2 will add `alacritty_terminal`. Kept dependency-free for
+# Phase 1 so the scaffold lands without dragging in a large
+# transitive tree that would complicate review.
