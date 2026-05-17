@@ -41,6 +41,11 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
     private var tintView: NSView?
     private var shellStarted = false
 
+    /// Focus target for `panel.focusTarget` — callers like PaneManager
+    /// that activate a pane (`makeFirstResponder`) need the renderView,
+    /// not the layout container.
+    var focusTarget: NSView { renderView ?? view }
+
     init(config: NesttyConfig, theme: NesttyTheme, cwd: String? = nil, initialInput: String? = nil) {
         self.config = config
         self.theme = theme
@@ -55,17 +60,23 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
     }
 
     /// Layered view hierarchy mirroring `TerminalViewController`:
-    ///   container (focus-forwarding NSView)
+    ///   container (plain NSView)
     ///   ├─ backgroundView (NSImageView, hidden until image set)
     ///   ├─ tintView (NSView with dark overlay layer)
     ///   └─ renderView (AlacrittyRenderView, transparent layer when image active)
     ///
-    /// External focus calls target `panel.view` (the container); the
-    /// container forwards becomeFirstResponder to the render view so
-    /// keystrokes still reach `keyDown` / NSTextInputClient.
+    /// Focus contract: external callers that target `panel.view` (the
+    /// container) get a silent no-op because the container's default
+    /// `acceptsFirstResponder` is false. The render view becomes
+    /// first responder via `startIfNeeded`'s explicit
+    /// `makeFirstResponder(render)` call, via user mouse clicks (the
+    /// `mouseDown` override re-asserts focus), and via the
+    /// activate-on-tab-switch path going through PaneManager. This
+    /// mirrors what SwiftTerm's `TerminalViewController` does — the
+    /// container is just a layout host, not a focus participant.
     override func loadView() {
         let frame = NSRect(x: 0, y: 0, width: 1200, height: 800)
-        let container = FocusForwardingView(frame: frame)
+        let container = NSView(frame: frame)
         container.wantsLayer = true
 
         let bg = NSImageView(frame: container.bounds)
@@ -92,7 +103,6 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
         render.autoresizingMask = [.width, .height]
         container.addSubview(render)
         renderView = render
-        container.focusTarget = render
 
         view = container
 
@@ -184,36 +194,6 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
             }
         }
         return .monospacedSystemFont(ofSize: size, weight: .regular)
-    }
-}
-
-// MARK: - Focus-forwarding container
-
-/// Container view whose only job is to bounce first-responder requests
-/// to its embedded render view. The PaneManager / TabViewController
-/// codepaths target `panel.view` (the root NSView) when activating a
-/// pane; without this redirect, `keyDown` and NSTextInputClient on the
-/// render subview never fire because the container itself doesn't
-/// override either.
-@MainActor
-private final class FocusForwardingView: NSView {
-    weak var focusTarget: NSView?
-
-    override var acceptsFirstResponder: Bool {
-        focusTarget?.acceptsFirstResponder ?? false
-    }
-
-    override func becomeFirstResponder() -> Bool {
-        // Re-entering NSWindow.makeFirstResponder inside becomeFirstResponder
-        // is fragile (the window is mid-dispatch). Accept becoming first
-        // responder here, then defer the swap to the next runloop turn
-        // so the window's responder-transition completes cleanly before
-        // we re-target. Keystrokes can't arrive between these ticks.
-        guard let target = focusTarget else { return false }
-        DispatchQueue.main.async { [weak self] in
-            _ = self?.window?.makeFirstResponder(target)
-        }
-        return true
     }
 }
 
@@ -538,6 +518,55 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             guard runs.count > 0, utf8.count > 0 else { continue }
             drawRow(row: row, runs: runs, utf8: utf8, ctx: ctx)
         }
+
+        // Selection highlight last so it tints OVER the text instead
+        // of getting covered by per-cell bg fills. theme.surface2 at
+        // ~0.4 alpha keeps the underlying text legible while clearly
+        // marking the range.
+        paintSelection(snap.selection, ctx: ctx)
+    }
+
+    /// Paint a translucent `theme.surface2` overlay across the cells
+    /// covered by the active selection. `end_row` / `end_col` are
+    /// inclusive per alacritty's `SelectionRange` convention — paint
+    /// `end_col - start_col + 1` cells on the end-row.
+    private func paintSelection(_ sel: NesttySelectionRange, ctx: CGContext) {
+        guard sel.present == 1, cellWidth > 0, cellHeight > 0 else { return }
+        let color = theme.surface2.nsColor.withAlphaComponent(0.45).cgColor
+        ctx.setFillColor(color)
+
+        let startRow = Int(sel.start_row)
+        let endRow = Int(sel.end_row)
+        let startCol = Int(sel.start_col)
+        let endCol = Int(sel.end_col)
+        let cols = max(1, Int(bounds.width / cellWidth))
+        let lastCol = cols - 1
+
+        for row in startRow ... endRow {
+            // Single-row selection: only the start_col..=end_col span.
+            // Multi-row: start_row covers start_col..=lastCol, end_row
+            // covers 0..=end_col, intermediate rows cover the full width.
+            let firstCol: Int
+            let finalCol: Int
+            if startRow == endRow {
+                firstCol = startCol
+                finalCol = endCol
+            } else if row == startRow {
+                firstCol = startCol
+                finalCol = lastCol
+            } else if row == endRow {
+                firstCol = 0
+                finalCol = endCol
+            } else {
+                firstCol = 0
+                finalCol = lastCol
+            }
+            guard firstCol <= finalCol else { continue }
+            let x = CGFloat(firstCol) * cellWidth
+            let w = CGFloat(finalCol - firstCol + 1) * cellWidth
+            let y = CGFloat(row) * cellHeight
+            ctx.fill(CGRect(x: x, y: y, width: w, height: cellHeight))
+        }
     }
 
     /// Cursor render. Style 0 = hidden (skip). Block (1) fills the
@@ -713,6 +742,120 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             return false
         }
         return true
+    }
+
+    // MARK: - Mouse selection
+
+    /// Convert a window-coord mouse event into a grid (row, col, side)
+    /// triple, clamping out-of-bounds drag positions so the FFI sees
+    /// a valid `UInt16`. AppKit fires mouseDragged with coordinates
+    /// outside the view bounds when the user drags past the edge —
+    /// that's normal and should clamp to the nearest visible cell.
+    private func gridLocation(for event: NSEvent) -> (row: UInt16, col: UInt16, side: NesttyTermFFI.Handle.CellSide)? {
+        guard cellWidth > 0, cellHeight > 0 else { return nil }
+        let local = convert(event.locationInWindow, from: nil)
+        let maxCol = max(0, Int(bounds.width / cellWidth) - 1)
+        let maxRow = max(0, Int(bounds.height / cellHeight) - 1)
+        let col = min(maxCol, max(0, Int(local.x / cellWidth)))
+        let row = min(maxRow, max(0, Int(local.y / cellHeight)))
+        let xInCell = max(0, local.x - CGFloat(col) * cellWidth)
+        let side: NesttyTermFFI.Handle.CellSide = xInCell < cellWidth / 2 ? .left : .right
+        return (UInt16(clamping: row), UInt16(clamping: col), side)
+    }
+
+    /// 1-click → simple drag selection, 2 → semantic (word), 3+ →
+    /// lines. Matches the iTerm2 / Terminal.app convention.
+    private func selectionKind(for event: NSEvent) -> NesttyTermFFI.Handle.SelectionKind {
+        switch event.clickCount {
+        case 2: .word
+        case let n where n >= 3: .line
+        default: .simple
+        }
+    }
+
+    /// When a TUI has any mouse-reporting mode on (`vim` with
+    /// `set mouse=a`, `less`, `htop`, …), plain drag goes to the TUI
+    /// — Shift held overrides so the user can still grab text. The
+    /// renderer doesn't *forward* mouse events to the PTY yet
+    /// (deferred to a future phase), so plain drag in mouse-mode
+    /// apps is a no-op until forwarding lands.
+    private func shouldHandleAsSelection(_ event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.shift) { return true }
+        return !(termHandle?.mouseModeActive ?? false)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // Always take first responder on click, even if we're going to
+        // bail out for mouse-mode TUI handling. An unfocused alacritty
+        // pane needs to become focusable on click regardless of whether
+        // the click also starts a selection — otherwise the subsequent
+        // Cmd+C / keyboard interaction has no responder target.
+        window?.makeFirstResponder(self)
+        guard shouldHandleAsSelection(event) else {
+            super.mouseDown(with: event)
+            return
+        }
+        guard let (row, col, side) = gridLocation(for: event), let h = termHandle else {
+            super.mouseDown(with: event)
+            return
+        }
+        h.selectionStart(row: row, col: col, side: side, kind: selectionKind(for: event))
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard shouldHandleAsSelection(event) else {
+            super.mouseDragged(with: event)
+            return
+        }
+        guard let (row, col, side) = gridLocation(for: event), let h = termHandle else {
+            return
+        }
+        h.selectionUpdate(row: row, col: col, side: side)
+        needsDisplay = true
+    }
+
+    // MARK: - Clipboard / Edit responder actions
+
+    /// Standard responder action; fires for Cmd+C via the Edit menu
+    /// key equivalent (which AppKit dispatches through the responder
+    /// chain BEFORE keyDown ever runs). No selection → no-op so the
+    /// chain continues to the next handler (matches Terminal.app).
+    /// Not `override`-marked because NSResponder's cut/copy/paste are
+    /// informal actions in Swift's bridging — they exist as Objective-C
+    /// methods but aren't declared as overridable on NSView in Swift.
+    /// `@objc` is enough to put them on the responder chain.
+    @objc func copy(_: Any?) {
+        guard let text = termHandle?.selectionString(), !text.isEmpty else { return }
+        let pb = NSPasteboard.general
+        pb.declareTypes([.string], owner: nil)
+        pb.setString(text, forType: .string)
+    }
+
+    @objc func paste(_: Any?) {
+        guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
+        sendPaste(text)
+    }
+
+    @objc override func selectAll(_: Any?) {
+        termHandle?.selectionAll()
+        needsDisplay = true
+    }
+
+    /// Cmd+V dispatch. Wraps the pasted bytes in bracketed-paste
+    /// markers (`\e[200~ … \e[201~`) when the program enabled
+    /// `\e[?2004h` — that's how zsh, vim's `set paste`, and modern
+    /// shells distinguish pasted bytes from typed bytes.
+    private func sendPaste(_ text: String) {
+        guard let h = termHandle else { return }
+        let bytes = Array(text.utf8)
+        if h.bracketedPasteActive {
+            h.input([0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E]) // ESC [ 2 0 0 ~
+            h.input(bytes)
+            h.input([0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E]) // ESC [ 2 0 1 ~
+        } else {
+            h.input(bytes)
+        }
     }
 
     // MARK: - Keyboard

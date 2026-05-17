@@ -96,6 +96,67 @@ enum NesttyTermFFI {
             guard let ptr else { return false }
             return nestty_term_take_damage(ptr)
         }
+
+        // MARK: - Selection
+
+        enum SelectionKind: UInt8 {
+            case simple = 0 // NESTTY_SELECTION_SIMPLE
+            case word = 1 // NESTTY_SELECTION_SEMANTIC
+            case line = 2 // NESTTY_SELECTION_LINES
+        }
+
+        enum CellSide: UInt8 {
+            case left = 0 // NESTTY_SIDE_LEFT
+            case right = 1 // NESTTY_SIDE_RIGHT
+        }
+
+        func selectionStart(row: UInt16, col: UInt16, side: CellSide, kind: SelectionKind) {
+            guard let ptr else { return }
+            nestty_term_selection_start(ptr, row, col, side.rawValue, kind.rawValue)
+        }
+
+        func selectionUpdate(row: UInt16, col: UInt16, side: CellSide) {
+            guard let ptr else { return }
+            nestty_term_selection_update(ptr, row, col, side.rawValue)
+        }
+
+        func selectionClear() {
+            guard let ptr else { return }
+            nestty_term_selection_clear(ptr)
+        }
+
+        func selectionAll() {
+            guard let ptr else { return }
+            nestty_term_selection_all(ptr)
+        }
+
+        /// Returns the current selection as a Swift string (or nil if
+        /// nothing selected). Lifetime of the underlying Rust buffer
+        /// is bounded by this call — we copy the bytes into a Swift
+        /// String and free the buffer before returning.
+        func selectionString() -> String? {
+            guard let ptr else { return nil }
+            guard let sPtr = nestty_term_selection_string(ptr) else { return nil }
+            defer { nestty_string_destroy(sPtr) }
+            var len = 0
+            guard let bytes = nestty_string_bytes(sPtr, &len), len > 0 else { return nil }
+            let buf = UnsafeBufferPointer(start: bytes, count: len)
+            return String(bytes: buf, encoding: .utf8)
+        }
+
+        /// True if any of alacritty's mouse-reporting modes is on
+        /// (vim's `set mouse=a`, less, htop, etc.). Renderer uses this
+        /// to leave mouse drag alone unless the user holds Shift.
+        var mouseModeActive: Bool {
+            guard let ptr else { return false }
+            return nestty_term_mouse_mode_active(ptr)
+        }
+
+        /// True when the terminal has `\e[?2004h` bracketed paste on.
+        var bracketedPasteActive: Bool {
+            guard let ptr else { return false }
+            return nestty_term_bracketed_paste_active(ptr)
+        }
     }
 
     /// Wraps a Rust-owned snapshot pointer. Borrowed runs/utf8 are
@@ -148,6 +209,17 @@ enum NesttyTermFFI {
             }
             var out = NesttyCursor(row: 0, col: 0, style: 0, blink: 0, reserved: 0)
             nestty_snapshot_cursor(ptr, &out)
+            return out
+        }
+
+        var selection: NesttySelectionRange {
+            let empty = NesttySelectionRange(
+                start_row: 0, start_col: 0, end_row: 0, end_col: 0,
+                is_block: 0, present: 0, reserved: 0,
+            )
+            guard let ptr else { return empty }
+            var out = empty
+            nestty_snapshot_selection(ptr, &out)
             return out
         }
     }

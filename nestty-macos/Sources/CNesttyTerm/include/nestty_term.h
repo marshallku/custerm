@@ -17,6 +17,7 @@
 
 typedef struct NesttyHandle NesttyHandle;
 typedef struct NesttySnapshot NesttySnapshot;
+typedef struct NesttyString NesttyString;
 
 typedef struct {
     uint16_t start_col;        // inclusive
@@ -55,6 +56,28 @@ typedef struct {
     uint16_t reserved;
 } NesttyCursor;
 
+// Active selection bounds. end_row / end_col are INCLUSIVE
+// (alacritty's SelectionRange convention). Meaningful only when
+// `present == 1`. `is_block == 1` flags block selection (deferred).
+typedef struct {
+    uint16_t start_row;
+    uint16_t start_col;
+    uint16_t end_row;
+    uint16_t end_col;
+    uint8_t  is_block;
+    uint8_t  present;
+    uint16_t reserved;
+} NesttySelectionRange;
+
+// Selection-start kind discriminator for nestty_term_selection_start.
+#define NESTTY_SELECTION_SIMPLE   0
+#define NESTTY_SELECTION_SEMANTIC 1
+#define NESTTY_SELECTION_LINES    2
+
+// Side discriminator (which side of the cell the click landed on).
+#define NESTTY_SIDE_LEFT  0
+#define NESTTY_SIDE_RIGHT 1
+
 // --- Terminal lifecycle ---
 
 NesttyHandle* nestty_term_create(uint16_t cols, uint16_t rows,
@@ -87,6 +110,28 @@ const uint8_t* nestty_snapshot_row_utf8(const NesttySnapshot* snap, uint16_t row
                                          size_t* out_len);
 
 void nestty_snapshot_cursor(const NesttySnapshot* snap, NesttyCursor* out);
+void nestty_snapshot_selection(const NesttySnapshot* snap, NesttySelectionRange* out);
+
+// --- Selection control ---
+
+// Begin a new selection at (row, col, side) with the given kind
+// (NESTTY_SELECTION_*). Replaces any existing selection.
+void nestty_term_selection_start(NesttyHandle* handle, uint16_t row, uint16_t col,
+                                  uint8_t side, uint8_t kind);
+void nestty_term_selection_update(NesttyHandle* handle, uint16_t row, uint16_t col, uint8_t side);
+void nestty_term_selection_clear(NesttyHandle* handle);
+void nestty_term_selection_all(NesttyHandle* handle);
+
+// Heap-allocated UTF-8 copy of the current selection. NULL when
+// nothing selected. Caller frees with nestty_string_destroy exactly
+// once.
+NesttyString* nestty_term_selection_string(NesttyHandle* handle);
+const uint8_t* nestty_string_bytes(const NesttyString* s, size_t* out_len);
+void nestty_string_destroy(NesttyString* s);
+
+// Renderer policy queries.
+bool nestty_term_mouse_mode_active(NesttyHandle* handle);
+bool nestty_term_bracketed_paste_active(NesttyHandle* handle);
 
 // Static string, no free required.
 const char* nestty_term_version(void);

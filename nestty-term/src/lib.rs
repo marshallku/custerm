@@ -39,6 +39,8 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
+use alacritty_terminal::index::Side;
 
 /// Mirrors §D3 of the migration plan. `#[repr(C)]` so the layout is
 /// stable across the FFI boundary. Per-cell allocation is avoided by
@@ -83,6 +85,37 @@ pub struct NesttyCursor {
     pub _reserved: u16,
 }
 
+/// Active selection bounds reported by `nestty_snapshot_selection`.
+/// Both end_row and end_col are INCLUSIVE — alacritty's
+/// `SelectionRange` is inclusive on both ends, and the Swift renderer
+/// needs to honor that when painting the highlight (otherwise the
+/// last selected cell goes unhighlighted, visible on any single-line
+/// drag or word selection).
+///
+/// When `present == 0`, the other fields are meaningless. `is_block`
+/// is 1 for `SelectionType::Block` selections (deferred for v1 — only
+/// Simple / Semantic / Lines wired today), 0 otherwise.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct NesttySelectionRange {
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    pub end_col: u16,
+    pub is_block: u8,
+    pub present: u8,
+    pub _reserved: u16,
+}
+
+/// Opaque heap-allocated UTF-8 byte buffer. Returned by FFI methods
+/// that hand the caller a copy of terminal content (selection,
+/// scrollback). Free with `nestty_string_destroy` exactly once.
+/// Pairing the destroy function with the type avoids the "ptr+len
+/// without capacity" UB trap of raw `Vec<u8>` round-tripping.
+pub struct NesttyString {
+    data: Box<[u8]>,
+}
+
 struct Row {
     utf8: Vec<u8>,
     runs: Vec<NesttyRun>,
@@ -108,13 +141,14 @@ pub struct NesttyHandle {
     /// width combining marks (alacritty's `Term::input` skips
     /// `damage_point` on that branch); (3) DECSCUSR / `\e[?25l/h`
     /// cursor metadata transitions that produce zero grid damage.
-    last_cursor_row_hash: AtomicU64,
+    last_redraw_state_hash: AtomicU64,
 }
 
 pub struct NesttySnapshot {
     cols: u16,
     rows: Vec<Row>,
     cursor: NesttyCursor,
+    selection: NesttySelectionRange,
 }
 
 /// Create a terminal handle: spawn a PTY running the requested shell
@@ -181,7 +215,7 @@ pub unsafe extern "C" fn nestty_term_create(
         term,
         sender,
         io_thread: Some(io_thread),
-        last_cursor_row_hash: AtomicU64::new(0),
+        last_redraw_state_hash: AtomicU64::new(0),
     }))
 }
 
@@ -291,25 +325,27 @@ pub unsafe extern "C" fn nestty_term_take_damage(handle: *mut NesttyHandle) -> b
     let cursor_line = cursor_point.line.0.max(0) as usize;
     let cursor_col = cursor_point.column.0;
 
-    // Hash the entire cursor row's renderable content. Catches both
-    // cursor-cell mutations (e.g. `\e[K` at the right edge collapses
-    // damage to `(line, col, col)` — same shape as the unconditional
-    // damage_cursor hint the line-bounds filter discards) AND
-    // combining marks pushed onto a non-cursor cell (typically
-    // `cursor.col - 1`, where the base char was just written — and
-    // alacritty's zero-width branch mutates `cell.zerowidth` without
-    // calling `damage_point`). Single-row hash cost is trivial vs
-    // the alternative full snapshot + draw on every tick.
-    let cursor_row_hash = hash_cursor_row(&term, cursor_point);
+    // Hash everything `nestty_term_snapshot` will expose for the
+    // current cursor row + the cursor + active selection bounds.
+    // Catches (1) cursor-cell mutations whose damage bounds collapse
+    // to `(line, col, col)` (same shape as the unconditional
+    // `damage_cursor` hint the line-bounds filter discards),
+    // (2) combining marks pushed onto a non-cursor cell (alacritty's
+    // `Term::input` zero-width branch updates `cell.zerowidth`
+    // without calling `damage_point`), (3) DECSCUSR / `\e[?25l/h`
+    // transitions that change cursor metadata without grid damage,
+    // and (4) selection start/extend/clear that doesn't touch any
+    // cell content.
+    let state_hash = hash_redraw_state(&term, cursor_point);
     let prev_hash = h
-        .last_cursor_row_hash
-        .swap(cursor_row_hash, Ordering::Relaxed);
-    let cursor_row_changed = cursor_row_hash != prev_hash;
+        .last_redraw_state_hash
+        .swap(state_hash, Ordering::Relaxed);
+    let state_changed = state_hash != prev_hash;
 
     let real_damage = match term.damage() {
         alacritty_terminal::term::TermDamage::Full => true,
         alacritty_terminal::term::TermDamage::Partial(mut iter) => {
-            cursor_row_changed
+            state_changed
                 || iter.any(|d| {
                     !(d.line == cursor_line && d.left == cursor_col && d.right == cursor_col)
                 })
@@ -319,22 +355,18 @@ pub unsafe extern "C" fn nestty_term_take_damage(handle: *mut NesttyHandle) -> b
     real_damage
 }
 
-/// Hash every renderable field of every cell on the cursor's row
-/// PLUS the cursor's own metadata (position, style, blink, visibility).
-/// Mirrors everything `nestty_term_snapshot` exposes for that row so
-/// the gate's "byte-for-byte same" contract holds for:
-///   - cursor-cell mutations whose damage bounds collapse to
-///     `(line, col, col)` (same shape as `damage_cursor` hint);
-///   - zero-width combining marks pushed onto a non-cursor cell
-///     (alacritty's `Term::input` zero-width branch updates
-///     `cell.zerowidth` without calling `damage_point`);
-///   - DECSCUSR / show-cursor mode transitions that change the
-///     cursor's style/blink/visibility without touching the grid.
+/// Hash every renderable field the snapshot path will expose: cursor
+/// row contents, cursor metadata (pos/style/blink/visibility), and
+/// active selection bounds. Used by `nestty_term_take_damage` to
+/// catch grid-invisible state transitions (DECSCUSR, selection
+/// start/extend/clear) and the cursor-row content cases the line-
+/// bounds filter would otherwise collapse with the unconditional
+/// `damage_cursor` hint.
 ///
 /// Caller already holds the term lock — no extra synchronization
 /// needed. Out-of-range cursor returns a fixed sentinel so the
 /// comparison is still stable.
-fn hash_cursor_row(term: &Term<VoidListener>, cursor: Point) -> u64 {
+fn hash_redraw_state(term: &Term<VoidListener>, cursor: Point) -> u64 {
     let line = cursor.line;
     if line.0 < 0 || (line.0 as usize) >= term.screen_lines() {
         return 0;
@@ -378,6 +410,17 @@ fn hash_cursor_row(term: &Term<VoidListener>, cursor: Point) -> u64 {
     term.mode()
         .contains(TermMode::SHOW_CURSOR)
         .hash(&mut hasher);
+    // Selection bounds — start/extend/clear don't necessarily damage
+    // any cell content, but the highlight overlay needs to redraw.
+    let sel = selection_range_for_ffi(term);
+    sel.present.hash(&mut hasher);
+    if sel.present == 1 {
+        sel.start_row.hash(&mut hasher);
+        sel.start_col.hash(&mut hasher);
+        sel.end_row.hash(&mut hasher);
+        sel.end_col.hash(&mut hasher);
+        sel.is_block.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -434,13 +477,38 @@ pub unsafe extern "C" fn nestty_term_snapshot(handle: *mut NesttyHandle) -> *mut
         _reserved: 0,
     };
 
+    let selection = selection_range_for_ffi(&term);
+
     drop(term);
 
     Box::into_raw(Box::new(NesttySnapshot {
         cols,
         rows: snapshot_rows,
         cursor,
+        selection,
     }))
+}
+
+/// Project `term.selection` (if any) into the FFI-friendly inclusive-
+/// bounds struct the renderer paints from. Returns the default
+/// (present=0) when there's no selection or it doesn't resolve to a
+/// range (e.g. empty drag, viewport scrolled past the selection).
+fn selection_range_for_ffi(term: &Term<VoidListener>) -> NesttySelectionRange {
+    let Some(sel) = term.selection.as_ref() else {
+        return NesttySelectionRange::default();
+    };
+    let Some(range): Option<SelectionRange> = sel.to_range(term) else {
+        return NesttySelectionRange::default();
+    };
+    NesttySelectionRange {
+        start_row: range.start.line.0.max(0) as u16,
+        start_col: range.start.column.0 as u16,
+        end_row: range.end.line.0.max(0) as u16,
+        end_col: range.end.column.0 as u16,
+        is_block: u8::from(range.is_block),
+        present: 1,
+        _reserved: 0,
+    }
 }
 
 /// Walk a single display line into a `Row`. Groups consecutive cells
@@ -726,6 +794,251 @@ pub unsafe extern "C" fn nestty_snapshot_cursor(
         return;
     };
     unsafe { *out = s.cursor };
+}
+
+/// Fill `*out` with the snapshot's active selection bounds. Renderer
+/// checks `out.present` to decide whether to paint a highlight.
+///
+/// # Safety
+///
+/// `out` must point to writable storage for one `NesttySelectionRange`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_snapshot_selection(
+    snap: *const NesttySnapshot,
+    out: *mut NesttySelectionRange,
+) {
+    if out.is_null() {
+        return;
+    }
+    let Some(s) = (unsafe { snap.as_ref() }) else {
+        return;
+    };
+    unsafe { *out = s.selection };
+}
+
+// ---------- Selection control ----------
+
+/// Selection kind discriminator for `nestty_term_selection_start`.
+/// Kept as named constants so Swift / future C consumers can mirror
+/// the contract; the SIMPLE variant is consumed via the match's
+/// fallback arm.
+#[allow(dead_code)]
+const SELECTION_SIMPLE: u8 = 0;
+const SELECTION_SEMANTIC: u8 = 1;
+const SELECTION_LINES: u8 = 2;
+
+/// Side discriminator: 0 = Left of cell, 1 = Right. Mirrors
+/// alacritty's `Side` enum so the renderer can compute it from the
+/// pixel offset within the cell (left half → Left, right half → Right)
+/// without bringing the enum across FFI.
+const SIDE_LEFT: u8 = 0;
+
+fn parse_side(side: u8) -> Side {
+    if side == SIDE_LEFT { Side::Left } else { Side::Right }
+}
+
+fn selection_point(term: &Term<VoidListener>, row: u16, col: u16) -> Point {
+    // Clamp into the visible viewport. `selection.update()` tolerates
+    // out-of-range points but the resulting highlight looks odd; let
+    // the snapshot-time `to_range` clip it cleanly instead.
+    let line = Line(row as i32);
+    let cols = term.columns();
+    let column = Column((col as usize).min(cols.saturating_sub(1)));
+    Point::new(line, column)
+}
+
+/// Start a new selection at (`row`, `col`). Replaces any existing
+/// selection. `kind` is `SELECTION_SIMPLE` / `SEMANTIC` / `LINES`;
+/// anything else falls back to simple.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_selection_start(
+    handle: *mut NesttyHandle,
+    row: u16,
+    col: u16,
+    side: u8,
+    kind: u8,
+) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
+    let mut term = h.term.lock();
+    let point = selection_point(&term, row, col);
+    let ty = match kind {
+        SELECTION_SEMANTIC => SelectionType::Semantic,
+        SELECTION_LINES => SelectionType::Lines,
+        _ => SelectionType::Simple,
+    };
+    term.selection = Some(Selection::new(ty, point, parse_side(side)));
+}
+
+/// Extend the current selection to `(row, col, side)`. No-op if there
+/// isn't a selection in progress.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_selection_update(
+    handle: *mut NesttyHandle,
+    row: u16,
+    col: u16,
+    side: u8,
+) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
+    let mut term = h.term.lock();
+    let point = selection_point(&term, row, col);
+    if let Some(sel) = term.selection.as_mut() {
+        sel.update(point, parse_side(side));
+    }
+}
+
+/// Clear the active selection.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_selection_clear(handle: *mut NesttyHandle) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
+    h.term.lock().selection = None;
+}
+
+/// Select the entire visible viewport (Cmd+A). Uses a Simple
+/// selection from (0, 0) to (last_line, last_col).
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_selection_all(handle: *mut NesttyHandle) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
+    let mut term = h.term.lock();
+    let last_line = Line(term.screen_lines().saturating_sub(1) as i32);
+    let last_col = Column(term.columns().saturating_sub(1));
+    let start = Point::new(Line(0), Column(0));
+    let end = Point::new(last_line, last_col);
+    let mut sel = Selection::new(SelectionType::Simple, start, Side::Left);
+    sel.update(end, Side::Right);
+    term.selection = Some(sel);
+}
+
+/// Heap-allocated UTF-8 buffer of the current selection. Returns NULL
+/// when nothing is selected. Caller must free with
+/// `nestty_string_destroy` exactly once.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_selection_string(
+    handle: *mut NesttyHandle,
+) -> *mut NesttyString {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    let term = h.term.lock();
+    let Some(s) = term.selection_to_string() else {
+        return ptr::null_mut();
+    };
+    if s.is_empty() {
+        return ptr::null_mut();
+    }
+    Box::into_raw(Box::new(NesttyString {
+        data: s.into_bytes().into_boxed_slice(),
+    }))
+}
+
+/// Borrowed pointer to the string's bytes (NOT NUL-terminated).
+/// `*out_len` receives the byte length. Both are valid until
+/// `nestty_string_destroy`.
+///
+/// # Safety
+///
+/// `out_len` must point to writable storage for one `usize`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_string_bytes(
+    s: *const NesttyString,
+    out_len: *mut usize,
+) -> *const u8 {
+    if out_len.is_null() {
+        return ptr::null();
+    }
+    let Some(s) = (unsafe { s.as_ref() }) else {
+        unsafe { *out_len = 0 };
+        return ptr::null();
+    };
+    unsafe { *out_len = s.data.len() };
+    s.data.as_ptr()
+}
+
+/// Free a `NesttyString`. NULL-safe.
+///
+/// # Safety
+///
+/// Must be called exactly once per pointer returned by an FFI method
+/// that hands out `*mut NesttyString`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_string_destroy(s: *mut NesttyString) {
+    if s.is_null() {
+        return;
+    }
+    let _ = unsafe { Box::from_raw(s) };
+}
+
+/// True if any of alacritty's mouse-reporting modes is active. Used
+/// by the renderer to defer to TUI mouse handlers (vim, less, htop,
+/// tmux) instead of consuming the drag for selection — the renderer
+/// only takes mouse events when this returns false OR the user holds
+/// Shift to explicitly override.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_mouse_mode_active(handle: *mut NesttyHandle) -> bool {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return false;
+    };
+    let term = h.term.lock();
+    use alacritty_terminal::term::TermMode as M;
+    term.mode()
+        .intersects(M::MOUSE_REPORT_CLICK | M::MOUSE_DRAG | M::MOUSE_MOTION)
+}
+
+/// True if the terminal has bracketed paste mode enabled (`\e[?2004h`).
+/// Renderer wraps Cmd+V'd text in `\e[200~ … \e[201~` when this is
+/// true so paste-aware programs (zsh, neovim with `set paste`, etc.)
+/// can distinguish pasted bytes from typed bytes.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_bracketed_paste_active(handle: *mut NesttyHandle) -> bool {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return false;
+    };
+    h.term
+        .lock()
+        .mode()
+        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
 }
 
 #[unsafe(no_mangle)]

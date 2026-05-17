@@ -178,6 +178,12 @@ class TerminalViewController: NSViewController, NesttyPanel {
     /// extension) can reach the SwiftTerm `Terminal` for buffer reads. Setter
     /// stays private because TerminalViewController owns the view's lifecycle.
     private(set) var terminalView: NesttyTerminalView?
+
+    /// Focus target for `panel.focusTarget` — SwiftTerm's `TerminalView`
+    /// (wrapped here as `NesttyTerminalView`) is the actual keyboard
+    /// receiver; the controller's `view` is just a layout container
+    /// with background + tint subviews.
+    var focusTarget: NSView { terminalView ?? view }
     private var backgroundView: NSImageView?
     private var tintView: NSView?
     private var currentFontSize: CGFloat

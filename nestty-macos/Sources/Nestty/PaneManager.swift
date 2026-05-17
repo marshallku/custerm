@@ -150,7 +150,13 @@ final class PaneManager {
 
         setActive(newTermVC)
         newTermVC.startIfNeeded()
-        newTermVC.view.window?.makeFirstResponder(newTermVC.view)
+        // Target the panel's `focusTarget` (the inner keyboard view)
+        // rather than `view` — alacritty panes wrap the render view in
+        // a layout container that doesn't accept first-responder, so
+        // targeting `view` silently fails. SwiftTerm panes' container
+        // also doesn't accept; `focusTarget` returns the SwiftTerm
+        // `TerminalView` for both backends.
+        newTermVC.view.window?.makeFirstResponder(newTermVC.focusTarget)
     }
 
     /// Factory: pick the terminal renderer based on `[renderer] backend`.
@@ -182,7 +188,7 @@ final class PaneManager {
 
         setActive(webVC)
         webVC.startIfNeeded()
-        webVC.view.window?.makeFirstResponder(webVC.view)
+        webVC.view.window?.makeFirstResponder(webVC.focusTarget)
     }
 
     /// Tier 4.1 — split with a pre-built plugin panel. Caller assembles the
@@ -198,7 +204,7 @@ final class PaneManager {
 
         setActive(panel)
         panel.startIfNeeded()
-        panel.view.window?.makeFirstResponder(panel.view)
+        panel.view.window?.makeFirstResponder(panel.focusTarget)
     }
 
     func closeActive() {
@@ -217,7 +223,7 @@ final class PaneManager {
 
         let next = root.allLeaves().first!
         setActive(next)
-        next.view.window?.makeFirstResponder(next.view)
+        next.view.window?.makeFirstResponder(next.focusTarget)
     }
 
     func setActive(_ panel: any NesttyPanel) {
@@ -253,7 +259,7 @@ final class PaneManager {
         let nextIdx = ((idx + direction) % count + count) % count
         let next = leaves[nextIdx]
         setActive(next)
-        next.view.window?.makeFirstResponder(next.view)
+        next.view.window?.makeFirstResponder(next.focusTarget)
     }
 
     func allTerminals() -> [TerminalViewController] {

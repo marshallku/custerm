@@ -10,6 +10,14 @@ protocol NesttyPanel: AnyObject {
     /// The root NSView managed by this panel (from NSViewController).
     var view: NSView { get }
 
+    /// The view that should receive keyboard focus. For panels that
+    /// wrap their input-handling view in a layout container, this is
+    /// the inner view (e.g. the SwiftTerm `TerminalView` or the
+    /// alacritty `AlacrittyRenderView`). External callers use this
+    /// instead of `view` when calling `makeFirstResponder`, so the
+    /// container being unfocusable doesn't break activation.
+    var focusTarget: NSView { get }
+
     /// Title shown in the tab bar.
     var currentTitle: String { get }
 
@@ -23,4 +31,13 @@ protocol NesttyPanel: AnyObject {
 
     /// NSViewController lifecycle (satisfied automatically by subclasses).
     func removeFromParent()
+}
+
+extension NesttyPanel {
+    /// Default conformance: panels that don't have a separate focus
+    /// target (e.g. WebViewController, or terminal panels where the
+    /// root view IS the input-handling view) just hand back `view`.
+    /// Override on panels whose root view is a layout container that
+    /// shouldn't itself receive keyboard focus.
+    var focusTarget: NSView { view }
 }

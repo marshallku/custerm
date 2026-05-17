@@ -95,9 +95,11 @@ final class TabViewController: NSViewController {
         tabBar.onRenameTab = { [weak self] index, title in
             guard let self else { return }
             renameTab(at: index, title: title)
-            // Restore focus to the active pane after the tab bar field resigns
-            if let activeView = activePaneManager?.activePane.view {
-                view.window?.makeFirstResponder(activeView)
+            // Restore focus to the active pane's keyboard view after
+            // the tab bar field resigns. `panel.focusTarget` returns
+            // the inner input view rather than the layout container.
+            if let activePanel = activePaneManager?.activePane {
+                view.window?.makeFirstResponder(activePanel.focusTarget)
             }
         }
         tabBar.onNewPanel = { [weak self] type, mode in
@@ -327,7 +329,7 @@ final class TabViewController: NSViewController {
 
         view.layoutSubtreeIfNeeded()
         manager.allPanels().forEach { $0.startIfNeeded() }
-        manager.activePane.view.window?.makeFirstResponder(manager.activePane.view)
+        manager.activePane.view.window?.makeFirstResponder(manager.activePane.focusTarget)
 
         refreshTabBar()
     }
