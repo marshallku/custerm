@@ -256,3 +256,13 @@ Also added `("background", "image")` as an alias for `("background", "path")` to
 **Fix:** Wrap the `WKWebView` in an `NSView` container with an `NSStackView` toolbar above it. Toolbar buttons use SF Symbols (`chevron.left`, `chevron.right`, `arrow.clockwise`, `wrench.and.screwdriver`) and call existing `goBack` / `goForward` / `reload` / `toggleDevTools`. URL `NSTextField` fires its action on Enter and routes through `navigate(to:)`, which already handles the `https://` prefixing.
 
 Back/forward enabled state and URL field text sync via KVO on `WKWebView.canGoBack` / `canGoForward` / `url` — `WKWebView` is KVO-compliant for these. The URL sync skips updates while the field's editor is the first responder so it doesn't clobber what the user is typing. On a blank tab (no `startURL`), `viewDidAppear` focuses the URL field so the user can type immediately.
+
+### macOS: TCC re-prompts for Accessibility/Input Monitoring on every rebuild
+
+**Cause:** `swift build` emits an ad-hoc, linker-signed binary (`codesign -dv` shows `adhoc,linker-signed`, `TeamIdentifier=not set`, `Internal requirements=none`). Every rebuild produces a fresh cdhash, and TCC keys its grants on the binary's *designated requirement* — which collapses to cdhash when there's no real signature. macOS therefore sees each build as a different app and re-prompts for every previously-granted permission.
+
+**Fix:** `scripts/codesign-dev.sh` creates a self-signed `Nestty Dev` code-signing cert in the user's login keychain (once, via `openssl req` + `security import`) and re-signs the bundle with that identity on every build. Both `scripts/install-macos.sh` and `nestty-macos/run.sh` call it automatically.
+
+After the first rebuild the Keychain Access dialog asks once for permission to use the new key — click **Always Allow**. From then on TCC binds grants to the cert identity, so permissions persist across rebuilds. To start over (wipe the cert), delete the `Nestty Dev` entry under *login* in Keychain Access; the next build regenerates it.
+
+The cert is self-signed and not trusted by Gatekeeper — that's intentional. TCC doesn't require trust, only signature validity. Apple Developer ID would be overkill for local dev.
