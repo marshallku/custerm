@@ -130,7 +130,17 @@ struct Subscriber {
 pub struct EventBus {
     subscribers: Mutex<Vec<Subscriber>>,
     default_buffer: usize,
+    /// Bounded ring buffer of recent events. Powers the `event.history`
+    /// socket action ("what just happened?" — useful for catching up
+    /// AFK without keeping a live subscription open). Mutex is separate
+    /// from `subscribers` so a publishing thread that has the
+    /// subscribers lock isn't blocked by a history reader, and vice
+    /// versa.
+    history: Mutex<std::collections::VecDeque<Event>>,
+    history_cap: usize,
 }
+
+const DEFAULT_HISTORY_CAP: usize = 500;
 
 impl EventBus {
     pub fn new() -> Self {
@@ -138,9 +148,17 @@ impl EventBus {
     }
 
     pub fn with_default_buffer(default_buffer: usize) -> Self {
+        Self::with_capacities(default_buffer, DEFAULT_HISTORY_CAP)
+    }
+
+    pub fn with_capacities(default_buffer: usize, history_cap: usize) -> Self {
         Self {
             subscribers: Mutex::new(Vec::new()),
             default_buffer,
+            history: Mutex::new(std::collections::VecDeque::with_capacity(
+                history_cap.max(1),
+            )),
+            history_cap: history_cap.max(1),
         }
     }
 
@@ -182,6 +200,16 @@ impl EventBus {
     }
 
     pub fn publish(&self, event: Event) {
+        // Push to history BEFORE distributing — a subscriber callback
+        // could re-publish synchronously and we want the source event
+        // recorded first.
+        {
+            let mut h = self.history.lock().unwrap();
+            if h.len() >= self.history_cap {
+                h.pop_front();
+            }
+            h.push_back(event.clone());
+        }
         let mut subs = self.subscribers.lock().unwrap();
         subs.retain(|sub| {
             if !pattern_matches(&sub.pattern, &event.kind) {
@@ -204,6 +232,24 @@ impl EventBus {
 
     pub fn subscriber_count(&self) -> usize {
         self.subscribers.lock().unwrap().len()
+    }
+
+    /// Recent events in arrival order (oldest first). `since_ms`
+    /// filters to events with `timestamp_ms >= since_ms`; `kind_glob`
+    /// filters by event-kind glob (same matcher as `subscribe`).
+    /// Returns a snapshot — callers don't see live updates after this
+    /// call.
+    pub fn history(&self, since_ms: Option<u64>, kind_glob: Option<&str>) -> Vec<Event> {
+        let h = self.history.lock().unwrap();
+        h.iter()
+            .filter(|e| since_ms.is_none_or(|cutoff| e.timestamp_ms >= cutoff))
+            .filter(|e| kind_glob.is_none_or(|g| pattern_matches(g, &e.kind)))
+            .cloned()
+            .collect()
+    }
+
+    pub fn history_capacity(&self) -> usize {
+        self.history_cap
     }
 }
 
@@ -428,5 +474,66 @@ mod tests {
         bus.publish_bridged(Event::new("x", "y", json!({})), 7);
         let got = rx.try_recv().expect("event delivered");
         assert_eq!(got.bridge_id, Some(7));
+    }
+
+    #[test]
+    fn history_records_recent_in_arrival_order() {
+        let bus = EventBus::new();
+        bus.publish(mk("a"));
+        bus.publish(mk("b"));
+        bus.publish(mk("c"));
+        let h = bus.history(None, None);
+        let kinds: Vec<&str> = h.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn history_drops_oldest_when_capacity_exceeded() {
+        let bus = EventBus::with_capacities(DEFAULT_SUBSCRIBER_BUFFER, 2);
+        bus.publish(mk("a"));
+        bus.publish(mk("b"));
+        bus.publish(mk("c"));
+        let h = bus.history(None, None);
+        let kinds: Vec<&str> = h.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn history_filters_by_since_ms() {
+        let bus = EventBus::new();
+        bus.publish(mk("a"));
+        let after_a = bus
+            .history(None, None)
+            .first()
+            .map(|e| e.timestamp_ms)
+            .unwrap();
+        // Sleep enough that b's timestamp_ms is strictly greater than a's.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        bus.publish(mk("b"));
+        let after_a_filtered = bus.history(Some(after_a + 1), None);
+        assert_eq!(after_a_filtered.len(), 1);
+        assert_eq!(after_a_filtered[0].kind, "b");
+    }
+
+    #[test]
+    fn history_filters_by_kind_glob() {
+        let bus = EventBus::new();
+        bus.publish(mk("jira.assigned"));
+        bus.publish(mk("slack.dm"));
+        bus.publish(mk("jira.commented"));
+        let jira_only = bus.history(None, Some("jira.*"));
+        let kinds: Vec<&str> = jira_only.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["jira.assigned", "jira.commented"]);
+    }
+
+    #[test]
+    fn history_min_capacity_clamped_to_one() {
+        let bus = EventBus::with_capacities(DEFAULT_SUBSCRIBER_BUFFER, 0);
+        assert_eq!(bus.history_capacity(), 1);
+        bus.publish(mk("a"));
+        bus.publish(mk("b"));
+        let h = bus.history(None, None);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].kind, "b");
     }
 }

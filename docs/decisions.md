@@ -585,3 +585,27 @@ Both are documented v2 work. The fallback behavior is "next launch has a smaller
 **Test coverage:** the dispatch + clap surface compiles, but the only meaningful unit-testable logic is the pure render helpers (`adf_first_paragraph`, `format_event_when`). 5 tests across the two helpers cover the path-not-found cases, all-day events, and same-day range compaction. Renderer output formatting itself is verified by hand with `--json` diff (no snapshot tests yet; not worth the ceremony for ~210 LOC modules).
 
 **See:** `nestty-cli/src/plugin_cmds/jira.rs`, `slack.rs`, `calendar.rs`; wired through `nestty-cli/src/commands.rs` (enum + `unreachable!` arms in `method`/`params`) and `nestty-cli/src/main.rs` (dispatch interception before generic path).
+
+
+## 35. EventBus ring buffer + nestctl recent (Phase 19.X)
+
+**Problem:** `nestctl event subscribe` exists for live tailing, but "what happened in the last hour while I was AFK?" had no answer. Subscribing live then bombarding triggers retrospectively is the wrong shape; a bounded server-side history is the right primitive. Phase 19.X tracked this as a precondition for the `nestctl recent` subcommand.
+
+**Decision:** Add a bounded `VecDeque<Event>` to `EventBus` (default cap 500), expose `bus.history(since_ms, kind_glob)` for in-process readers, and project it through a new `event.history` socket action that takes `{since_ms?, kind?}`.
+
+- **Separate mutex** for the history buffer vs. the subscribers list. The publishing thread acquires `history` briefly to push, then `subscribers` to fan out — a `history()` reader contending the history mutex can't block fan-out, and a slow subscriber can't block history pushes.
+- **Push BEFORE distributing.** A subscriber callback that synchronously re-publishes (e.g. registry completion-event fan-out) shouldn't end up with its derived events recorded before the source event. Push the incoming event first, then iterate subscribers.
+- **`register_silent` for the action.** `event.history`'s own `.completed` event would otherwise land in the very buffer it just read, inflating every subsequent call's result by one and confusing the "since this timestamp" filter on the next tick.
+- **Wire shape (codex C1 round 1):** `{type, data, source, timestamp_ms}` — matches `event.subscribe`'s `Event` shape in `nestty-core/src/protocol.rs` (`type` not `kind`, `data` not `payload`) plus an extra `timestamp_ms` so catch-up consumers can render a per-event clock. Initial implementation used `{kind, payload, …}` which would have forced consumers to translate; caught at review.
+- **`since_ms` / `kind` strict-typed (codex I1 round 1):** invalid types (number where string expected, etc.) return `invalid_params` instead of silently disabling the filter, matching `event.subscribe`'s reject-on-bad-`patterns` posture.
+- **UTF-8 safe CLI truncation (codex C2 round 1):** the human renderer's payload preview truncates by char count, not byte count, so a Korean/Japanese/emoji payload whose 120th byte lands inside a multibyte sequence doesn't panic. Regression test in `payload_preview_does_not_panic_on_multibyte_boundary`.
+
+**CLI:** `nestctl recent [--since 2h] [--kind jira.*]`. Duration parser accepts `Nh|Nm|Ns|Nd` and bare integer seconds; `--kind` is the same glob `event.subscribe` accepts (`*`, `prefix.*`, exact match). Default human render is `HH:MM:SS  <kind>  <key=val key=val …>` with string values quoted + 40-char truncated; full payload available via `--json`.
+
+**Capacity choice (500):** Most workflow flows are minute-scale, so 500 covers ≥ an hour of typical bus traffic comfortably. Plugin-heavy bursts (e.g. a Jira poll cycle adding 50 events in 30 s) still fit comfortably. The cap is `EventBus::with_capacities`-configurable for future tuning but currently hardcoded — env-var configurability is a v2 polish if real workloads need it.
+
+**Posture:** No persistence across nestty restart. The history is a debugging / catch-up affordance, not a durable audit log — pairing it with the existing `~/.cache/nestty/event-log.jsonl` ingest path would conflict on retention policy (the cache is bounded by disk, the ring is bounded by count). v1 keeps both surfaces separate.
+
+**Test coverage:** 6 EventBus tests (`history_records_recent_in_arrival_order`, `history_drops_oldest_when_capacity_exceeded`, `history_filters_by_since_ms`, `history_filters_by_kind_glob`, `history_min_capacity_clamped_to_one`, plus the existing pattern tests carry into the glob path). 5 CLI tests cover `parse_duration_seconds` (units + garbage) and `payload_preview` (flat object, long-string truncation, non-object fallback).
+
+**See:** `nestty-core/src/event_bus.rs` (`history` field + `history()` method + `with_capacities` constructor), `nestty-linux/src/window.rs` (silent `event.history` registration), `nestty-cli/src/plugin_cmds/recent.rs` (CLI + duration parser + payload renderer).

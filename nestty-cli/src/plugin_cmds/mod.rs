@@ -20,6 +20,7 @@ pub mod calendar;
 pub mod context;
 pub mod git;
 pub mod jira;
+pub mod recent;
 pub mod slack;
 pub mod todo;
 

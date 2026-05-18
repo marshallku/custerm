@@ -12,7 +12,7 @@ use gtk4::{Application, ApplicationWindow, gdk, gio, glib};
 use serde_json::json;
 use webkit6::prelude::WebViewExt;
 
-use nestty_core::action_registry::{ActionRegistry, internal_error};
+use nestty_core::action_registry::{ActionRegistry, internal_error, invalid_params};
 use nestty_core::config::NesttyConfig;
 use nestty_core::context::ContextService;
 use nestty_core::event_bus::{Event as BusEvent, EventBus as CoreEventBus, EventReceiver};
@@ -153,6 +153,60 @@ impl NesttyWindow {
             actions.register_silent("context.snapshot", move |_| {
                 serde_json::to_value(ctx.snapshot())
                     .map_err(|e| internal_error(format!("snapshot serialization failed: {e}")))
+            });
+        }
+        {
+            // `event.history` — recent bus events snapshot. Callers
+            // pass optional `since_ms` (epoch millis cutoff) and
+            // `kind` (event-kind glob, same matcher as
+            // `event.subscribe`). The bus owns the ring buffer
+            // (default cap 500); this action just projects + filters.
+            // Registered silent because its own `.completed` event on
+            // the bus would otherwise inflate every history call's
+            // result on the next call.
+            let bus = event_bus.clone();
+            actions.register_silent("event.history", move |params| {
+                // Reject malformed types loudly instead of treating
+                // them as absent — `event.subscribe` also rejects
+                // bad `patterns`, so the surface stays consistent.
+                if let Some(v) = params.get("since_ms")
+                    && !v.is_null()
+                    && v.as_u64().is_none()
+                {
+                    return Err(invalid_params(
+                        "event.history `since_ms` must be a non-negative integer",
+                    ));
+                }
+                if let Some(v) = params.get("kind")
+                    && !v.is_null()
+                    && v.as_str().is_none()
+                {
+                    return Err(invalid_params("event.history `kind` must be a string glob"));
+                }
+                let since_ms = params.get("since_ms").and_then(|v| v.as_u64());
+                let kind = params
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let events = bus.history(since_ms, kind.as_deref());
+                let arr: Vec<serde_json::Value> = events
+                    .into_iter()
+                    .map(|e| {
+                        // Wire shape matches `event.subscribe`'s
+                        // `{type, data, source}` (see `Event` in
+                        // `nestty-core/src/protocol.rs`) with an added
+                        // `timestamp_ms` so the catch-up consumer can
+                        // render a per-event clock. Older `event.
+                        // subscribe` consumers ignore the extra field.
+                        json!({
+                            "type": e.kind,
+                            "data": e.payload,
+                            "source": e.source,
+                            "timestamp_ms": e.timestamp_ms,
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "events": arr }))
             });
         }
 

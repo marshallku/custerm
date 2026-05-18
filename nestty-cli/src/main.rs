@@ -72,6 +72,9 @@ fn main() {
     if let Command::Calendar(cmd) = &cli.command {
         std::process::exit(plugin_cmds::calendar::dispatch(cmd, &socket_path, cli.json));
     }
+    if let Command::Recent(args) = &cli.command {
+        std::process::exit(plugin_cmds::recent::dispatch(args, &socket_path, cli.json));
+    }
     // Phase 19.2 context aggregator. Bypass to the new dispatcher
     // unless the user is explicitly asking for the raw legacy shape
     // (`--json` without `--full`) — that path stays on the generic

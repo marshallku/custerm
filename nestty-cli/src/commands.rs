@@ -5,6 +5,7 @@ use crate::plugin_cmds::bookmark::BookmarkCommand;
 use crate::plugin_cmds::calendar::CalendarCommand;
 use crate::plugin_cmds::git::GitCommand;
 use crate::plugin_cmds::jira::JiraCommand;
+use crate::plugin_cmds::recent::RecentArgs;
 use crate::plugin_cmds::slack::SlackCommand;
 use crate::plugin_cmds::todo::TodoCommand;
 
@@ -104,6 +105,9 @@ pub enum Command {
     /// `event` / `auth-status`)
     #[command(subcommand)]
     Calendar(CalendarCommand),
+
+    /// Recent bus events ("what happened?" — wraps `event.history`).
+    Recent(RecentArgs),
 
     /// Status bar management
     #[command(subcommand)]
@@ -568,6 +572,9 @@ impl Cli {
             Command::Calendar(_) => {
                 unreachable!("calendar commands are dispatched via plugin_cmds::calendar")
             }
+            Command::Recent(_) => {
+                unreachable!("recent commands are dispatched via plugin_cmds::recent")
+            }
             Command::Call { method, .. } => method.clone(),
         }
     }
@@ -689,6 +696,9 @@ impl Cli {
             }
             Command::Calendar(_) => {
                 unreachable!("calendar commands are dispatched via plugin_cmds::calendar")
+            }
+            Command::Recent(_) => {
+                unreachable!("recent commands are dispatched via plugin_cmds::recent")
             }
             Command::Call { params, .. } => {
                 serde_json::from_str(params).unwrap_or_else(|_| json!({}))
