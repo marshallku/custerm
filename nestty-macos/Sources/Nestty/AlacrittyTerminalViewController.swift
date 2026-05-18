@@ -280,6 +280,13 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private var lastBlinkToggle = Date.distantPast
     private let blinkInterval: TimeInterval = 0.5
 
+    /// Trackpad pixel deltas accumulate here between `scrollWheel`
+    /// events so a slow swipe (each tick fractional sub-cell) still
+    /// eventually produces a whole-cell scroll. Mouse-wheel devices
+    /// (`hasPreciseScrollingDeltas == false`) bypass this accumulator
+    /// — their per-notch delta is already line-count-shaped.
+    private var accumulatedScrollDelta: CGFloat = 0
+
     /// IME composition state. While the user is composing (Korean
     /// 2-Set, Japanese kana → kanji, Pinyin, …) the system delivers
     /// `setMarkedText` with the in-progress string; nothing flows to
@@ -990,6 +997,49 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         needsDisplay = true
     }
 
+    // MARK: - Scrolling
+
+    /// Mouse wheel / trackpad scroll. Maps NSEvent's `scrollingDeltaY`
+    /// into an integer line count and tells alacritty's grid to shift
+    /// `display_offset`. Positive deltaY ("natural" scroll: fingers
+    /// down on trackpad, or wheel back on a mouse) brings older content
+    /// into view; the FFI's `scrollLines(positive)` does the same.
+    override func scrollWheel(with event: NSEvent) {
+        guard let h = termHandle, cellHeight > 0 else {
+            super.scrollWheel(with: event)
+            return
+        }
+        let dy = event.scrollingDeltaY
+        let lines: Int
+        if event.hasPreciseScrollingDeltas {
+            // Trackpad — fractional pixel deltas. Accumulate so slow
+            // swipes don't round to zero on every tick.
+            accumulatedScrollDelta += dy
+            let whole = (accumulatedScrollDelta / cellHeight).rounded(.towardZero)
+            lines = Int(whole)
+            accumulatedScrollDelta -= whole * cellHeight
+        } else {
+            // Mouse wheel — `scrollingDeltaY` is roughly line-count
+            // shaped already (≈ 1 per notch on most devices). No
+            // accumulator needed; rounding toward zero matches the
+            // direction of partial deltas.
+            lines = Int(dy.rounded(.towardZero))
+        }
+        if lines != 0 {
+            h.scrollLines(Int32(lines))
+            needsDisplay = true
+        }
+    }
+
+    /// Bring the view back to the live bottom. Called before sending
+    /// user input to the PTY (typing) — convention is that any input
+    /// dismisses the scrolled-back view so the user sees what they
+    /// just typed land. PTY-side output (which arrives without a key
+    /// press) leaves the scrolled state alone.
+    private func scrollToBottomOnInput() {
+        termHandle?.scrollToBottom()
+    }
+
     // MARK: - Clipboard / Edit responder actions
 
     /// Standard responder action; fires for Cmd+C via the Edit menu
@@ -1023,6 +1073,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// shells distinguish pasted bytes from typed bytes.
     private func sendPaste(_ text: String) {
         guard let h = termHandle else { return }
+        scrollToBottomOnInput()
         let bytes = Array(text.utf8)
         if h.bracketedPasteActive {
             h.input([0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E]) // ESC [ 2 0 0 ~
@@ -1048,15 +1099,62 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// chain (menu shortcuts, clipboard) by calling super.
     override func keyDown(with event: NSEvent) {
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Scroll navigation: Cmd+Up/Down (line), Cmd+Home/End (top/
+        // bottom), Shift+PageUp/PageDown (page). These DON'T forward
+        // to the PTY — they're host-side viewport controls.
+        if handleScrollKey(event, mods: mods) {
+            return
+        }
         if mods.contains(.command) {
             super.keyDown(with: event)
             return
         }
         if mods == .control, let bytes = controlBytes(for: event) {
+            // User typed → jump back to bottom so the keypress lands
+            // visibly. Matches Terminal.app / iTerm2 behavior.
+            scrollToBottomOnInput()
             termHandle?.input(bytes)
             return
         }
         interpretKeyEvents([event])
+    }
+
+    /// macOS virtual key codes for the keys we own as scroll shortcuts.
+    /// Using `keyCode` instead of `characters` so IME-active keystrokes
+    /// (Korean Caps-Lock toggle, Japanese Eisu mode, …) don't shadow
+    /// the shortcuts when no character is delivered.
+    private enum KeyCode {
+        static let up: UInt16 = 126
+        static let down: UInt16 = 125
+        static let home: UInt16 = 115
+        static let end: UInt16 = 119
+        static let pageUp: UInt16 = 116
+        static let pageDown: UInt16 = 121
+    }
+
+    /// Intercept Cmd / Shift-modified scroll keys before they reach
+    /// the PTY. Returns true when the key was consumed as a scroll
+    /// gesture; caller short-circuits in that case.
+    private func handleScrollKey(_ event: NSEvent, mods: NSEvent.ModifierFlags) -> Bool {
+        guard let h = termHandle else { return false }
+        let kc = event.keyCode
+        if mods.contains(.command) {
+            switch kc {
+            case KeyCode.up: h.scrollLines(1); needsDisplay = true; return true
+            case KeyCode.down: h.scrollLines(-1); needsDisplay = true; return true
+            case KeyCode.home: h.scrollToTop(); needsDisplay = true; return true
+            case KeyCode.end: h.scrollToBottom(); needsDisplay = true; return true
+            default: break
+            }
+        }
+        if mods.contains(.shift) {
+            switch kc {
+            case KeyCode.pageUp: h.scrollPageUp(); needsDisplay = true; return true
+            case KeyCode.pageDown: h.scrollPageDown(); needsDisplay = true; return true
+            default: break
+            }
+        }
+        return false
     }
 
     /// Map Ctrl+letter / Ctrl+@ / Ctrl+[ / Ctrl+\ / Ctrl+] / Ctrl+^
@@ -1104,11 +1202,13 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             needsDisplay = true
         }
         guard !text.isEmpty else { return }
+        scrollToBottomOnInput()
         termHandle?.input(Array(text.utf8))
     }
 
     override func doCommand(by selector: Selector) {
         if let bytes = commandBytes(for: selector) {
+            scrollToBottomOnInput()
             termHandle?.input(bytes)
         }
         // Unmapped selectors fall on the floor — better than calling

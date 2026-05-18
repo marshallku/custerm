@@ -158,6 +158,34 @@ enum NesttyTermFFI {
             return nestty_term_bracketed_paste_active(ptr)
         }
 
+        /// Scroll the visible viewport. `lines` is positive to scroll
+        /// older content into view (toward the top of history) and
+        /// negative to scroll back toward the live bottom.
+        func scrollLines(_ lines: Int32) {
+            guard let ptr else { return }
+            nestty_term_scroll(ptr, UInt8(NESTTY_SCROLL_DELTA), lines)
+        }
+
+        func scrollPageUp() {
+            guard let ptr else { return }
+            nestty_term_scroll(ptr, UInt8(NESTTY_SCROLL_PAGE_UP), 0)
+        }
+
+        func scrollPageDown() {
+            guard let ptr else { return }
+            nestty_term_scroll(ptr, UInt8(NESTTY_SCROLL_PAGE_DOWN), 0)
+        }
+
+        func scrollToTop() {
+            guard let ptr else { return }
+            nestty_term_scroll(ptr, UInt8(NESTTY_SCROLL_TOP), 0)
+        }
+
+        func scrollToBottom() {
+            guard let ptr else { return }
+            nestty_term_scroll(ptr, UInt8(NESTTY_SCROLL_BOTTOM), 0)
+        }
+
         /// Take the latest pending OSC 52 clipboard write request as a
         /// Swift string, or nil if nothing is pending. The renderer
         /// gates the actual NSPasteboard write on the user's policy.

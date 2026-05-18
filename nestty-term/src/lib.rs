@@ -474,6 +474,13 @@ fn hash_redraw_state(term: &Term<NesttyListener>, cursor: Point) -> u64 {
         sel.end_col.hash(&mut hasher);
         sel.is_block.hash(&mut hasher);
     }
+    // Scrollback offset: scrolling into history doesn't damage the
+    // live grid (alacritty's damage tracking only fires on writes to
+    // the live region) but changes what the viewport DISPLAYS, so
+    // every row visible to the user is different. Including the
+    // offset here forces a redraw on scroll without needing alacritty
+    // to surface a "display_offset changed" event.
+    term.grid().display_offset().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -505,9 +512,16 @@ pub unsafe extern "C" fn nestty_term_snapshot(handle: *mut NesttyHandle) -> *mut
     let mut hyperlink_index_by_key: std::collections::HashMap<(String, String), u32> =
         std::collections::HashMap::new();
 
+    // Viewport mapping: when the user has scrolled into history,
+    // `display_offset > 0` and viewport row 0 maps to live line
+    // `-display_offset`. alacritty's `Grid: Index<Line>` walks into
+    // scrollback for negative line values directly, so the snapshot
+    // ends up describing whatever the user is currently looking at.
+    let display_offset = grid.display_offset() as i32;
+
     let mut snapshot_rows = Vec::with_capacity(rows_count as usize);
     for line_idx in 0..rows_count as i32 {
-        let line = Line(line_idx);
+        let line = Line(line_idx - display_offset);
         let row = walk_row(
             grid,
             line,
@@ -537,10 +551,19 @@ pub unsafe extern "C" fn nestty_term_snapshot(handle: *mut NesttyHandle) -> *mut
             CursorShape::Underline => 3,
         }
     };
+    // Cursor row needs the same display_offset mapping as the snapshot
+    // rows. When the user has scrolled into history, the cursor may
+    // sit outside the visible viewport — clamp the displayed style to
+    // `0` (hidden) for those cases so we don't draw a stray block on
+    // top of scrollback content. Position is still emitted (renderer
+    // can clip however it likes); `style = 0` is the canonical
+    // "don't draw" signal.
+    let cursor_viewport_row = cursor_point.line.0 + display_offset;
+    let cursor_visible = cursor_viewport_row >= 0 && (cursor_viewport_row as u16) < rows_count;
     let cursor = NesttyCursor {
-        row: cursor_point.line.0.max(0) as u16,
+        row: cursor_viewport_row.max(0) as u16,
         col: cursor_point.column.0 as u16,
-        style,
+        style: if cursor_visible { style } else { 0 },
         blink: if cs.blinking { 1 } else { 0 },
         _reserved: 0,
     };
@@ -569,11 +592,46 @@ fn selection_range_for_ffi(term: &Term<NesttyListener>) -> NesttySelectionRange 
     let Some(range): Option<SelectionRange> = sel.to_range(term) else {
         return NesttySelectionRange::default();
     };
+    // Map absolute line coordinates → viewport rows by adding
+    // display_offset (same mapping as the snapshot row walk + cursor).
+    let display_offset = term.grid().display_offset() as i32;
+    let last_row = term.screen_lines().saturating_sub(1) as i32;
+    let last_col = term.columns().saturating_sub(1) as u16;
+    let start_view = range.start.line.0 + display_offset;
+    let end_view = range.end.line.0 + display_offset;
+
+    // Intersection with the visible viewport. If the entire selection
+    // sits above or below the visible rows, hide the overlay (the
+    // selection still exists logically — Cmd+C will still grab it,
+    // because `selection_to_string` operates on the absolute range —
+    // we just don't paint a misleading row-0 sliver).
+    if end_view < 0 || start_view > last_row {
+        return NesttySelectionRange::default();
+    }
+
+    // Clip the off-viewport endpoint columns: when the selection
+    // extends BEFORE row 0, the visible start logically begins at
+    // column 0 of row 0 (the "before viewport" portion is invisible).
+    // Likewise when it extends past `last_row`, the visible end is the
+    // last column of `last_row`. Without this, a multi-line selection
+    // scrolled partway out would paint with the off-screen endpoint's
+    // column index, producing wrong clip widths on the boundary row.
+    let (start_row, start_col) = if start_view < 0 {
+        (0u16, 0u16)
+    } else {
+        (start_view as u16, range.start.column.0 as u16)
+    };
+    let (end_row, end_col) = if end_view > last_row {
+        (last_row as u16, last_col)
+    } else {
+        (end_view as u16, range.end.column.0 as u16)
+    };
+
     NesttySelectionRange {
-        start_row: range.start.line.0.max(0) as u16,
-        start_col: range.start.column.0 as u16,
-        end_row: range.end.line.0.max(0) as u16,
-        end_col: range.end.column.0 as u16,
+        start_row,
+        start_col,
+        end_row,
+        end_col,
         is_block: u8::from(range.is_block),
         present: 1,
         _reserved: 0,
@@ -925,10 +983,14 @@ fn parse_side(side: u8) -> Side {
 }
 
 fn selection_point(term: &Term<NesttyListener>, row: u16, col: u16) -> Point {
-    // Clamp into the visible viewport. `selection.update()` tolerates
-    // out-of-range points but the resulting highlight looks odd; let
-    // the snapshot-time `to_range` clip it cleanly instead.
-    let line = Line(row as i32);
+    // Renderer passes viewport-relative row coordinates (row 0 = top
+    // of what's currently visible, regardless of scrollback). Convert
+    // to alacritty's absolute Line by subtracting display_offset —
+    // when scrolled back, viewport row 0 sits at Line(-display_offset).
+    // Without this, drag/click on scrolled-back content selects the
+    // live grid at the same row instead of what the user sees.
+    let display_offset = term.grid().display_offset() as i32;
+    let line = Line(row as i32 - display_offset);
     let cols = term.columns();
     let column = Column((col as usize).min(cols.saturating_sub(1)));
     Point::new(line, column)
@@ -1014,10 +1076,19 @@ pub unsafe extern "C" fn nestty_term_selection_all(handle: *mut NesttyHandle) {
         return;
     };
     let mut term = h.term.lock();
-    let last_line = Line(term.screen_lines().saturating_sub(1) as i32);
+    // Select the currently-visible viewport — which, when the user is
+    // scrolled into history, means scrollback lines. Top of viewport is
+    // `Line(-display_offset)`; bottom is that plus `screen_lines - 1`.
+    // (Selecting ALL of scrollback regardless of scroll position is a
+    // different feature; matching iTerm2 / Terminal.app's Cmd+A: only
+    // what the user can see.)
+    let display_offset = term.grid().display_offset() as i32;
+    let screen_lines = term.screen_lines() as i32;
+    let top = Line(-display_offset);
+    let bottom = Line(screen_lines - 1 - display_offset);
     let last_col = Column(term.columns().saturating_sub(1));
-    let start = Point::new(Line(0), Column(0));
-    let end = Point::new(last_line, last_col);
+    let start = Point::new(top, Column(0));
+    let end = Point::new(bottom, last_col);
     let mut sel = Selection::new(SelectionType::Simple, start, Side::Left);
     sel.update(end, Side::Right);
     term.selection = Some(sel);
@@ -1126,6 +1197,41 @@ pub unsafe extern "C" fn nestty_term_bracketed_paste_active(handle: *mut NesttyH
         .lock()
         .mode()
         .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+}
+
+/// Scroll-direction discriminator for `nestty_term_scroll`. Mirrors
+/// `alacritty_terminal::grid::Scroll` so the renderer doesn't have to
+/// bring the enum across the FFI.
+#[allow(dead_code)]
+const SCROLL_DELTA: u8 = 0;
+const SCROLL_PAGE_UP: u8 = 1;
+const SCROLL_PAGE_DOWN: u8 = 2;
+const SCROLL_TOP: u8 = 3;
+const SCROLL_BOTTOM: u8 = 4;
+
+/// Scroll the visible viewport. `kind` is one of `SCROLL_*`; `delta`
+/// is only used for `SCROLL_DELTA` (lines; positive = older content
+/// scrolls into view, negative = newer). Page / Top / Bottom ignore
+/// `delta`.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_scroll(handle: *mut NesttyHandle, kind: u8, delta: i32) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
+    use alacritty_terminal::grid::Scroll;
+    let scroll = match kind {
+        SCROLL_PAGE_UP => Scroll::PageUp,
+        SCROLL_PAGE_DOWN => Scroll::PageDown,
+        SCROLL_TOP => Scroll::Top,
+        SCROLL_BOTTOM => Scroll::Bottom,
+        _ => Scroll::Delta(delta),
+    };
+    h.term.lock().scroll_display(scroll);
 }
 
 /// Take the most-recent pending OSC 52 clipboard-store request (the

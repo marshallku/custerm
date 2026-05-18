@@ -139,6 +139,16 @@ bool nestty_term_bracketed_paste_active(NesttyHandle* handle);
 // the user's [security] osc52 policy.
 NesttyString* nestty_term_take_clipboard_request(NesttyHandle* handle);
 
+// Scrollback navigation. `kind` selects the variant; `delta` is only
+// consulted for NESTTY_SCROLL_DELTA (positive = older content scrolls
+// in; negative = newer).
+#define NESTTY_SCROLL_DELTA     0
+#define NESTTY_SCROLL_PAGE_UP   1
+#define NESTTY_SCROLL_PAGE_DOWN 2
+#define NESTTY_SCROLL_TOP       3
+#define NESTTY_SCROLL_BOTTOM    4
+void nestty_term_scroll(NesttyHandle* handle, uint8_t kind, int32_t delta);
+
 // OSC 8 hyperlink URI lookup. `hyperlink_id` is the run's 1-based
 // index from the snapshot; 0 means "no hyperlink". URI bytes are
 // borrowed from snapshot storage — copy before destroy.
