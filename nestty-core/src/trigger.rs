@@ -121,8 +121,15 @@ struct PreflightAwait {
     trigger_name: String,
     action: String,
     await_event_kind: String,
-    payload_match: Map<String, Value>,
-    original_payload: Value,
+    /// Un-interpolated `payload_match` template. We can't interpolate yet
+    /// because `{action_result.<x>}` tokens need the `.completed` event's
+    /// payload, which arrives at promotion time, not registration.
+    payload_match_template: Map<String, Value>,
+    original_event: Event,
+    /// Dispatch context captured at register time. `{context.active_panel}`
+    /// / `{context.active_cwd}` tokens resolve at promotion using THIS
+    /// snapshot, not whatever the active panel is by then.
+    original_context: Option<Context>,
     deadline: Instant,
     on_timeout: TimeoutPolicy,
 }
@@ -130,12 +137,17 @@ struct PreflightAwait {
 struct PendingAwait {
     trigger_name: String,
     await_event_kind: String,
-    /// Already interpolated against the original event at registration time;
-    /// per-incoming-event match is pure JSON-value equality.
+    /// Fully interpolated at promotion using the original event AND the
+    /// action's return payload (carried by the `.completed` event). Match
+    /// against the incoming awaited event is pure JSON equality.
     payload_match: Map<String, Value>,
     /// Carried forward so the synthesized `<trigger_name>.awaited` event keeps
     /// `{event.<orig>}` interpolation working downstream.
     original_payload: Value,
+    /// `.completed` event payload. Propagated to the synthesized awaited
+    /// event under `action_result:` so downstream chains can read
+    /// `{event.action_result.<field>}`.
+    action_result: Option<Value>,
     deadline: Instant,
     on_timeout: TimeoutPolicy,
 }
@@ -290,8 +302,10 @@ impl TriggerEngine {
         fired
     }
 
-    /// Interpolates `payload_match` against the originating event NOW so
-    /// per-incoming-event comparison is pure JSON-value equality.
+    /// Stores the un-interpolated `payload_match` template; interpolation
+    /// happens at promotion (`try_promote_or_drop_preflight`) so that
+    /// `{action_result.<x>}` tokens can resolve against the `.completed`
+    /// event's payload, not just the originating event.
     fn register_preflight_await(
         &self,
         trigger: &Trigger,
@@ -299,19 +313,13 @@ impl TriggerEngine {
         event: &Event,
         context: Option<&Context>,
     ) {
-        let mut interpolated_match = Map::new();
-        for (k, v) in &aw.payload_match {
-            // Typed interpolation: a single-token string like `"{event.count}"`
-            // resolves to the raw JSON value so number→string coercion can't
-            // break payload-match equality.
-            interpolated_match.insert(k.clone(), interpolate_value_typed(v, event, context));
-        }
         let preflight = PreflightAwait {
             trigger_name: trigger.name.clone(),
             action: trigger.action.clone(),
             await_event_kind: aw.event_kind.clone(),
-            payload_match: interpolated_match,
-            original_payload: event.payload.clone(),
+            payload_match_template: aw.payload_match.clone(),
+            original_event: event.clone(),
+            original_context: context.cloned(),
             deadline: Instant::now() + Duration::from_secs(aw.timeout_seconds),
             on_timeout: aw.on_timeout,
         };
@@ -352,11 +360,30 @@ impl TriggerEngine {
         // combined. If `.completed` arrived just before the deadline,
         // the pending gets less time to match the awaited event; that's
         // the user's contract for total wait.
+        //
+        // Interpolation runs HERE (not at register time) so the
+        // `payload_match` template can resolve `{action_result.<x>}`
+        // against the just-arrived `.completed` event's payload, in
+        // addition to the original event's `{event.<x>}`.
+        let action_result = event.payload.clone();
+        let mut interpolated_match = Map::new();
+        for (k, v) in &removed.payload_match_template {
+            interpolated_match.insert(
+                k.clone(),
+                interpolate_value_typed(
+                    v,
+                    &removed.original_event,
+                    removed.original_context.as_ref(),
+                    Some(&action_result),
+                ),
+            );
+        }
         self.pending_awaits.write().unwrap().push(PendingAwait {
             trigger_name: removed.trigger_name,
             await_event_kind: removed.await_event_kind,
-            payload_match: removed.payload_match,
-            original_payload: removed.original_payload,
+            payload_match: interpolated_match,
+            original_payload: removed.original_event.payload,
+            action_result: Some(action_result),
             deadline: removed.deadline,
             on_timeout: removed.on_timeout,
         });
@@ -391,7 +418,11 @@ impl TriggerEngine {
             }
             if let Some(idx) = matched_idx {
                 let p = pending.remove(idx);
-                let synthesized = build_awaited_payload(&p.original_payload, &event.payload);
+                let synthesized = build_awaited_payload(
+                    &p.original_payload,
+                    &event.payload,
+                    p.action_result.as_ref(),
+                );
                 // Don't publish under the lock — a subscriber calling back
                 // into the engine would deadlock against this write lock.
                 to_emit = Some((awaited_kind_for(&p.trigger_name), synthesized));
@@ -417,7 +448,10 @@ impl TriggerEngine {
                     return true;
                 }
                 if matches!(p.on_timeout, TimeoutPolicy::FireWithDefault) {
-                    let synthesized = build_awaited_payload(&p.original_payload, &Value::Null);
+                    // Preflight timeout: action never completed, so no
+                    // action_result is available — pass None.
+                    let synthesized =
+                        build_awaited_payload(&p.original_event.payload, &Value::Null, None);
                     to_emit.push((awaited_kind_for(&p.trigger_name), synthesized));
                 }
                 false
@@ -430,7 +464,11 @@ impl TriggerEngine {
                     return true;
                 }
                 if matches!(p.on_timeout, TimeoutPolicy::FireWithDefault) {
-                    let synthesized = build_awaited_payload(&p.original_payload, &Value::Null);
+                    let synthesized = build_awaited_payload(
+                        &p.original_payload,
+                        &Value::Null,
+                        p.action_result.as_ref(),
+                    );
                     to_emit.push((awaited_kind_for(&p.trigger_name), synthesized));
                 }
                 false
@@ -458,14 +496,33 @@ fn awaited_kind_for(trigger_name: &str) -> String {
     format!("{trigger_name}.awaited")
 }
 
-/// Original event payload at top level, awaited payload nested under `await:`,
-/// so downstream interpolation reads `{event.<orig>}` and `{event.await.<x>}`.
-fn build_awaited_payload(original: &Value, awaited: &Value) -> Value {
+/// Original event payload at top level, awaited payload nested under
+/// `await:`, action's return payload nested under `action_result:`.
+/// Downstream interpolation reads `{event.<orig>}`, `{event.await.<x>}`,
+/// and `{event.action_result.<x>}`.
+fn build_awaited_payload(
+    original: &Value,
+    awaited: &Value,
+    action_result: Option<&Value>,
+) -> Value {
     let mut obj = match original {
         Value::Object(m) => m.clone(),
         _ => Map::new(),
     };
     obj.insert("await".to_string(), awaited.clone());
+    match action_result {
+        Some(ar) => {
+            obj.insert("action_result".to_string(), ar.clone());
+        }
+        None => {
+            // The cloned original payload may already carry an
+            // `action_result` from an upstream chain. Drop it so a
+            // chain whose current action never completed can't leak
+            // the previous action's result to downstream
+            // `{event.action_result.*}` readers.
+            obj.remove("action_result");
+        }
+    }
     Value::Object(obj)
 }
 
@@ -518,17 +575,29 @@ fn pattern_covers(broader: &str, narrower: &str) -> bool {
 }
 
 fn interpolate_value(template: &Value, event: &Event, context: Option<&Context>) -> Value {
+    interpolate_value_with(template, event, context, None)
+}
+
+fn interpolate_value_with(
+    template: &Value,
+    event: &Event,
+    context: Option<&Context>,
+    action_result: Option<&Value>,
+) -> Value {
     match template {
-        Value::String(s) => Value::String(interpolate_string(s, event, context)),
+        Value::String(s) => Value::String(interpolate_string(s, event, context, action_result)),
         Value::Array(arr) => Value::Array(
             arr.iter()
-                .map(|v| interpolate_value(v, event, context))
+                .map(|v| interpolate_value_with(v, event, context, action_result))
                 .collect(),
         ),
         Value::Object(obj) => {
             let mut out = Map::new();
             for (k, v) in obj {
-                out.insert(k.clone(), interpolate_value(v, event, context));
+                out.insert(
+                    k.clone(),
+                    interpolate_value_with(v, event, context, action_result),
+                );
             }
             Value::Object(out)
         }
@@ -540,25 +609,33 @@ fn interpolate_value(template: &Value, event: &Event, context: Option<&Context>)
 /// a string that is exactly `{<token>}` resolves to the raw JSON `Value`
 /// (so `count = "{event.count}"` matches `Value::Number(42)`, not
 /// `Value::String("42")`). Mixed templates still string-coerce.
-fn interpolate_value_typed(template: &Value, event: &Event, context: Option<&Context>) -> Value {
+fn interpolate_value_typed(
+    template: &Value,
+    event: &Event,
+    context: Option<&Context>,
+    action_result: Option<&Value>,
+) -> Value {
     match template {
         Value::String(s) => {
             if let Some(token) = single_token(s)
-                && let Some(value) = resolve_token_value(token, event, context)
+                && let Some(value) = resolve_token_value(token, event, context, action_result)
             {
                 return value;
             }
-            Value::String(interpolate_string(s, event, context))
+            Value::String(interpolate_string(s, event, context, action_result))
         }
         Value::Array(arr) => Value::Array(
             arr.iter()
-                .map(|v| interpolate_value_typed(v, event, context))
+                .map(|v| interpolate_value_typed(v, event, context, action_result))
                 .collect(),
         ),
         Value::Object(obj) => {
             let mut out = Map::new();
             for (k, v) in obj {
-                out.insert(k.clone(), interpolate_value_typed(v, event, context));
+                out.insert(
+                    k.clone(),
+                    interpolate_value_typed(v, event, context, action_result),
+                );
             }
             Value::Object(out)
         }
@@ -574,12 +651,23 @@ fn single_token(s: &str) -> Option<&str> {
     Some(inner)
 }
 
-fn resolve_token_value(token: &str, event: &Event, context: Option<&Context>) -> Option<Value> {
+fn resolve_token_value(
+    token: &str,
+    event: &Event,
+    context: Option<&Context>,
+    action_result: Option<&Value>,
+) -> Option<Value> {
     if let Some(field) = token.strip_prefix("event.") {
         if let Some(v) = resolve_dot_path(&event.payload, field) {
             return Some(v.clone());
         }
         return event_top_level_value(field, event);
+    }
+    if let Some(field) = token.strip_prefix("action_result.")
+        && let Some(ar) = action_result
+        && let Some(v) = resolve_dot_path(ar, field)
+    {
+        return Some(v.clone());
     }
     let _ = context;
     None
@@ -598,7 +686,12 @@ fn event_top_level_value(field: &str, event: &Event) -> Option<Value> {
     }
 }
 
-fn interpolate_string(s: &str, event: &Event, context: Option<&Context>) -> String {
+fn interpolate_string(
+    s: &str,
+    event: &Event,
+    context: Option<&Context>,
+    action_result: Option<&Value>,
+) -> String {
     let mut result = String::new();
     let mut rest = s;
     while let Some(open) = rest.find('{') {
@@ -606,7 +699,7 @@ fn interpolate_string(s: &str, event: &Event, context: Option<&Context>) -> Stri
         let after_open = &rest[open + 1..];
         if let Some(close_rel) = after_open.find('}') {
             let token = &after_open[..close_rel];
-            if let Some(val) = resolve_token(token, event, context) {
+            if let Some(val) = resolve_token(token, event, context, action_result) {
                 result.push_str(&val);
             } else {
                 // Unresolvable token: keep the literal `{token}` so misconfigured
@@ -627,7 +720,12 @@ fn interpolate_string(s: &str, event: &Event, context: Option<&Context>) -> Stri
     result
 }
 
-fn resolve_token(token: &str, event: &Event, context: Option<&Context>) -> Option<String> {
+fn resolve_token(
+    token: &str,
+    event: &Event,
+    context: Option<&Context>,
+    action_result: Option<&Value>,
+) -> Option<String> {
     if let Some(field) = token.strip_prefix("event.") {
         if let Some(v) = resolve_dot_path(&event.payload, field) {
             return Some(json_scalar_to_string(v));
@@ -635,6 +733,12 @@ fn resolve_token(token: &str, event: &Event, context: Option<&Context>) -> Optio
         return event_top_level_value(field, event)
             .as_ref()
             .map(json_scalar_to_string);
+    }
+    if let Some(field) = token.strip_prefix("action_result.")
+        && let Some(ar) = action_result
+        && let Some(v) = resolve_dot_path(ar, field)
+    {
+        return Some(json_scalar_to_string(v));
     }
     if let Some(field) = token.strip_prefix("context.") {
         let ctx = context?;
@@ -931,7 +1035,7 @@ mod tests {
         let event = Event::new("k", "src", json!({}));
         let stamp = event.timestamp_ms;
         let template = json!({"ts": "{event.timestamp_ms}"});
-        let result = interpolate_value_typed(&template, &event, None);
+        let result = interpolate_value_typed(&template, &event, None, None);
         assert_eq!(result["ts"], json!(stamp));
         assert!(result["ts"].is_number(), "want Number, got {result}");
     }
@@ -2147,6 +2251,200 @@ mod tests {
         assert!(
             received.payload["await"].is_null(),
             "fire_with_default sets await to null"
+        );
+    }
+
+    #[test]
+    fn payload_match_interpolates_action_result_token() {
+        // `payload_match = { thread_ts = "{action_result.ts}" }` —
+        // resolves against the `.completed` event's payload at
+        // promotion time, then matches a subsequent awaited event
+        // whose `thread_ts` equals the captured value.
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
+        reg.register("slack_post", |_p| Ok(json!({"ts": "1700.500"})));
+        let engine = TriggerEngine::with_publish_bus(reg, bus.clone());
+
+        let mut payload_match = Map::new();
+        payload_match.insert(
+            "thread_ts".into(),
+            Value::String("{action_result.ts}".into()),
+        );
+        engine.set_triggers(vec![trig_with_await(
+            "approval",
+            "slack_post",
+            "todo.start_requested",
+            AwaitClause {
+                event_kind: "slack.reply".into(),
+                payload_match,
+                timeout_seconds: 60,
+                on_timeout: TimeoutPolicy::Abort,
+            },
+        )]);
+
+        let awaited_rx = bus.subscribe("approval.awaited");
+        let completed_rx = bus.subscribe("slack_post.completed");
+        engine.dispatch(&evt("todo.start_requested", json!({"id": "T-1"})), None);
+        let completed = completed_rx.try_recv().expect("slack_post.completed");
+        engine.dispatch(&completed, None);
+        assert_eq!(engine.pending_await_count(), 1);
+
+        // Wrong ts: no match, pending stays.
+        engine.dispatch(&evt("slack.reply", json!({"thread_ts": "9999.000"})), None);
+        assert_eq!(engine.pending_await_count(), 1);
+
+        // Correct ts: pending fires, awaited event published.
+        engine.dispatch(
+            &evt(
+                "slack.reply",
+                json!({"thread_ts": "1700.500", "text": "ok"}),
+            ),
+            None,
+        );
+        assert_eq!(engine.pending_await_count(), 0);
+        let received = match awaited_rx.recv_timeout(Duration::from_millis(50)) {
+            crate::event_bus::RecvOutcome::Event(e) => e,
+            other => panic!("expected awaited event, got {other:?}"),
+        };
+        assert_eq!(received.payload["await"]["text"], "ok");
+        assert_eq!(received.payload["action_result"]["ts"], "1700.500");
+    }
+
+    #[test]
+    fn action_result_token_missing_field_keeps_match_open() {
+        // `.completed` payload has no `ts` field — the typed
+        // interpolation returns the raw `"{action_result.ts}"`
+        // literal (fail-loud posture). The pending entry therefore
+        // never matches a real ts, which is the safer behavior than
+        // matching `null` and firing on garbage.
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
+        reg.register("slack_post", |_p| Ok(json!({})));
+        let engine = TriggerEngine::with_publish_bus(reg, bus.clone());
+
+        let mut payload_match = Map::new();
+        payload_match.insert(
+            "thread_ts".into(),
+            Value::String("{action_result.ts}".into()),
+        );
+        engine.set_triggers(vec![trig_with_await(
+            "approval",
+            "slack_post",
+            "todo.start_requested",
+            AwaitClause {
+                event_kind: "slack.reply".into(),
+                payload_match,
+                timeout_seconds: 60,
+                on_timeout: TimeoutPolicy::Abort,
+            },
+        )]);
+        let completed_rx = bus.subscribe("slack_post.completed");
+        engine.dispatch(&evt("todo.start_requested", json!({})), None);
+        let completed = completed_rx.try_recv().expect("slack_post.completed");
+        engine.dispatch(&completed, None);
+        // Real reply with any ts — still shouldn't match because the
+        // literal `{action_result.ts}` is what we're comparing against.
+        engine.dispatch(&evt("slack.reply", json!({"thread_ts": "1700.500"})), None);
+        assert_eq!(engine.pending_await_count(), 1);
+    }
+
+    #[test]
+    fn payload_match_interpolates_context_token_captured_at_register() {
+        // `{context.active_panel}` resolved at dispatch time used to
+        // work before action_result was added. The refactor now
+        // captures context at register-time so the same template
+        // still resolves at promotion — even though by then the active
+        // panel may have changed.
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
+        reg.register("noop", |_p| Ok(json!({})));
+        let engine = TriggerEngine::with_publish_bus(reg, bus.clone());
+
+        let mut payload_match = Map::new();
+        payload_match.insert(
+            "panel".into(),
+            Value::String("{context.active_panel}".into()),
+        );
+        engine.set_triggers(vec![trig_with_await(
+            "ctx",
+            "noop",
+            "todo.start_requested",
+            AwaitClause {
+                event_kind: "fake.reply".into(),
+                payload_match,
+                timeout_seconds: 60,
+                on_timeout: TimeoutPolicy::Abort,
+            },
+        )]);
+
+        let ctx = Context {
+            active_panel: Some("term-7".into()),
+            active_cwd: None,
+        };
+        let completed_rx = bus.subscribe("noop.completed");
+        engine.dispatch(&evt("todo.start_requested", json!({})), Some(&ctx));
+        let completed = completed_rx.try_recv().expect("noop.completed");
+        engine.dispatch(&completed, None);
+        assert_eq!(engine.pending_await_count(), 1);
+
+        engine.dispatch(&evt("fake.reply", json!({"panel": "term-3"})), None);
+        assert_eq!(
+            engine.pending_await_count(),
+            1,
+            "wrong panel should not match"
+        );
+        engine.dispatch(&evt("fake.reply", json!({"panel": "term-7"})), None);
+        assert_eq!(
+            engine.pending_await_count(),
+            0,
+            "captured panel should match"
+        );
+    }
+
+    #[test]
+    fn timeout_with_default_does_not_leak_upstream_action_result() {
+        // If the firing event is itself a synthesized `*.awaited` event
+        // from an upstream chain, its payload already carries an
+        // `action_result` field. Our chain's preflight then expires
+        // without its own action ever completing — the synthesized
+        // timeout event must NOT leak the upstream action_result, or
+        // downstream `{event.action_result.*}` reads the wrong action.
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
+        // Action never completes — we never publish .completed.
+        reg.register("stalled", |_p| Ok(json!({})));
+        let engine = TriggerEngine::with_publish_bus(reg, bus.clone());
+        engine.set_triggers(vec![trig_with_await(
+            "second",
+            "stalled",
+            "first.awaited",
+            AwaitClause {
+                event_kind: "never.fires".into(),
+                payload_match: Map::new(),
+                timeout_seconds: 0,
+                on_timeout: TimeoutPolicy::FireWithDefault,
+            },
+        )]);
+        let rx = bus.subscribe("second.awaited");
+        let upstream = evt(
+            "first.awaited",
+            json!({
+                "id": "T-1",
+                "action_result": {"ts": "STALE-1700.500"},
+            }),
+        );
+        engine.dispatch(&upstream, None);
+        // No .completed for `stalled`; preflight times out.
+        std::thread::sleep(Duration::from_millis(5));
+        engine.sweep_pending_awaits();
+        let received = match rx.recv_timeout(Duration::from_millis(50)) {
+            crate::event_bus::RecvOutcome::Event(e) => e,
+            other => panic!("expected timeout event, got {other:?}"),
+        };
+        assert_eq!(received.payload["id"], "T-1");
+        assert!(
+            received.payload.get("action_result").is_none(),
+            "stale upstream action_result must be cleared, got {received:?}"
         );
     }
 

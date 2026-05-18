@@ -394,7 +394,7 @@ Three sketches were on the table:
 
 **14.2 — deferred slices**:
 
-- [ ] **`action_result` interpolation in `payload_match`**. Today the await's payload_match can reference `{event.<orig>}` only. Referencing the action's return value (e.g. `payload_match = { thread_ts = "{action_result.ts}" }` for Slack threads) needs synchronous capture of the sink's result, which `LiveTriggerSink` returns as `{queued: true}` for blocking + legacy actions. Closing this needs the engine to chain through `<action>.completed` to capture the real result — a state-machine extension that's bigger than slice 1's scope.
+- [x] **`action_result` interpolation in `payload_match`** — `payload_match = { thread_ts = "{action_result.ts}" }` resolves against the `.completed` event's payload at promotion time. PreflightAwait now stores the raw template + original Event; interpolation runs once at promotion (NOT at registration), with both `event.<orig>` and `action_result.<field>` resolvable. The synthesized `<trigger>.awaited` event also carries `action_result:` so downstream chains can read `{event.action_result.<field>}`. Token-not-found stays the literal-preserving fail-loud posture. +2 unit tests. See [decisions §32](./decisions.md).
 - [ ] **Persistent pending_awaits**. Restart loses any in-flight awaits. Acceptable for typical minute-scale flows; would need a small on-disk journal for hour-scale awaits (e.g. waiting for a slow Slack approval).
 - [ ] `workflow.<name>` action namespace for hand-rolled multi-step Rust handlers when chained TOML gets cumbersome. Built into core or registered by a `nestty-plugin-workflow` (TBD).
 

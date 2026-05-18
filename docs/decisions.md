@@ -497,3 +497,37 @@ SplitSnap { Terminal { cwd } | Branch { orientation, position, first, second } }
 Both are documented v2 work. The fallback behavior is "next launch has a smaller tab set than the previous session" — acceptable for v1.
 
 **See:** `nestty-linux/src/session.rs` (schema + 5 unit tests), `nestty-linux/src/tabs.rs::snapshot_session` / `restore_session` / `restore_split`, `nestty-linux/src/terminal.rs::current_cwd` + percent-decode in `normalize_osc7_uri` (+1 test), `nestty-linux/src/window.rs` (close_request + restore-or-add at startup).
+
+
+## 32. `action_result` interpolation in `payload_match` (Phase 14.2 deferred slice 1)
+
+**Problem:** The await clause's `payload_match` could only reference the originating event's fields (`{event.<x>}`). Chaining "post to Slack → wait for a reply on the SAME thread" required the response payload's `thread_ts` to flow back into the await's match — but `LiveTriggerSink` returns `Ok({queued: true})` synchronously for blocking/legacy actions, so the real result wasn't available at register time. The 14.2 slice 1 doc explicitly deferred this.
+
+**Decision:** Move `payload_match` interpolation from register-time to promotion-time. The `.completed` event published by `ActionRegistry` already carries the action's real return payload — capture it during `try_promote_or_drop_preflight` and use it as the `action_result` namespace alongside `event.*` when interpolating.
+
+**State machine refit:**
+
+- `PreflightAwait` now stores `payload_match_template: Map<String, Value>` (the un-interpolated form) plus the full `original_event: Event` (vs. just `original_payload` before — the kind/source/timestamp fields are needed for re-interpolation).
+- `try_promote_or_drop_preflight`: on `.completed`, capture `event.payload.clone()` as `action_result`, then run `interpolate_value_typed(v, &original_event, None, Some(&action_result))` for every template entry. The fully-resolved match goes into `PendingAwait.payload_match`; the action_result is also stored on PendingAwait for the synthesized `<trigger>.awaited` event downstream.
+- `build_awaited_payload` gains a third arg (`action_result: Option<&Value>`); when present, it lands as `action_result:` on the synthesized payload, parallel to `await:`. Downstream triggers thus read `{event.action_result.<field>}` as a regular nested-payload lookup.
+
+**Interpolator extension:**
+
+- `resolve_token` / `resolve_token_value` gain an `action_result: Option<&Value>` arg; both branch on `token.strip_prefix("action_result.")` before falling back to the existing `event.` and `context.` paths.
+- `interpolate_value` / `interpolate_value_typed` / `interpolate_string` thread the param through; public callers of `interpolate_value` (e.g. `Trigger::interpolate`) go via the existing no-action-result variant, so the public API is unchanged.
+
+**Posture decisions:**
+
+- **Token-not-found preserves the literal.** If the `.completed` payload has no `ts` field, `{action_result.ts}` resolves to the literal string `"{action_result.ts}"`, the pending match against any real ts fails, and the pending stays until timeout. Better than coercing to `null` and firing on a garbage match. (+1 test `action_result_token_missing_field_keeps_match_open`.)
+- **`sweep_pending_awaits` for FireWithDefault**: preflight expiry has no action_result available (action never completed) — pass `None`. Pending expiry has one — pass `Some`. The synthesized `*.awaited` event therefore carries `action_result:` when it makes sense and omits it when it doesn't. **`None` actively removes the key** (codex review C1 round 2): if the firing event is itself an upstream `*.awaited` synthesized event, its payload already has an `action_result:` — without an explicit `remove`, that stale field would leak into the downstream timeout event's payload and `{event.action_result.*}` would read the wrong action's result.
+- **No persistence across nestty restart.** Both PreflightAwait and PendingAwait remain RAM-only. The earlier 14.2 deferred slice 2 (persistent journal) is unblocked by this change but not implemented here — minute-scale awaits are unaffected.
+- **Context captured at register, replayed at promotion (codex review C1 round 1).** Pre-refactor, `register_preflight_await` interpolated `payload_match` synchronously with the live `Context`, so `{context.active_panel}` resolved at dispatch time. Moving interpolation to promotion meant `None`-context regressed existing templates. PreflightAwait now clones `Context` at register and replays it at promotion. The semantic remains "captured at dispatch" — between dispatch and `.completed` the active panel could change, but the trigger's intent is "match the panel that fired me", not "match whatever is active at promotion".
+
+**Test additions:**
+
+- `payload_match_interpolates_action_result_token` — full happy path: post → capture `ts` from `.completed` → ignore non-matching reply → fire on matching reply, verify the synthesized event carries both `await:` and `action_result:`.
+- `action_result_token_missing_field_keeps_match_open` — fail-loud literal preservation.
+- `payload_match_interpolates_context_token_captured_at_register` — regression coverage for codex C1 round 1.
+- `timeout_with_default_does_not_leak_upstream_action_result` — regression coverage for codex C1 round 2.
+
+**See:** `nestty-core/src/trigger.rs::try_promote_or_drop_preflight` (promotion-time interpolation), `nestty-core/src/trigger.rs::build_awaited_payload` (new action_result arg), `nestty-core/src/trigger.rs::resolve_token` / `resolve_token_value` (action_result branch). The interpolator refactor preserves the no-action_result code path for `Trigger::interpolate` so action `params` interpolation is unaffected — only the awaited-event pathway sees action_result.
