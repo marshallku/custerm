@@ -1167,6 +1167,16 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             return
         }
         if mods.contains(.command) {
+            // Menu key equivalents already fired in performKeyEquivalent
+            // before keyDown, so anything left here is a Cmd combo with
+            // no menu binding. Map the readline-style line-edit ones
+            // (Cmd+←/→/⌫/⌦) before falling through — super.keyDown on
+            // these would just beep.
+            if let bytes = commandKeyBytes(forKeyCode: event.keyCode) {
+                scrollToBottomOnInput()
+                termHandle?.input(bytes)
+                return
+            }
             super.keyDown(with: event)
             return
         }
@@ -1187,10 +1197,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private enum KeyCode {
         static let up: UInt16 = 126
         static let down: UInt16 = 125
+        static let left: UInt16 = 123
+        static let right: UInt16 = 124
         static let home: UInt16 = 115
         static let end: UInt16 = 119
         static let pageUp: UInt16 = 116
         static let pageDown: UInt16 = 121
+        static let delete: UInt16 = 51
+        static let forwardDelete: UInt16 = 117
     }
 
     /// Intercept Cmd / Shift-modified scroll keys before they reach
@@ -1216,6 +1230,22 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             }
         }
         return false
+    }
+
+    /// Cmd+arrow / Cmd+delete line-edit shortcuts. iTerm2/Terminal.app
+    /// convention: map to the equivalent readline byte sequences so
+    /// shells (bash/zsh) and Insert-mode vim react as users expect.
+    /// Lives next to controlBytes/commandBytes for parity, but called
+    /// directly from keyDown because Cmd-modified events never reach
+    /// interpretKeyEvents (we route them to super for menu dispatch).
+    private func commandKeyBytes(forKeyCode kc: UInt16) -> [UInt8]? {
+        switch kc {
+        case KeyCode.left: [0x01] // Cmd+← → Ctrl+A (beginning-of-line)
+        case KeyCode.right: [0x05] // Cmd+→ → Ctrl+E (end-of-line)
+        case KeyCode.delete: [0x15] // Cmd+⌫ → Ctrl+U (unix-line-discard)
+        case KeyCode.forwardDelete: [0x0B] // Cmd+⌦ → Ctrl+K (kill-line)
+        default: nil
+        }
     }
 
     /// Map Ctrl+letter / Ctrl+@ / Ctrl+[ / Ctrl+\ / Ctrl+] / Ctrl+^
@@ -1300,6 +1330,30 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             [0x1B, 0x5B, 0x41]
         case #selector(NSStandardKeyBindingResponding.moveDown(_:)):
             [0x1B, 0x5B, 0x42]
+        // Option+←/→ — readline backward-word / forward-word.
+        case #selector(NSStandardKeyBindingResponding.moveWordLeft(_:)):
+            [0x1B, 0x62] // ESC b
+        case #selector(NSStandardKeyBindingResponding.moveWordRight(_:)):
+            [0x1B, 0x66] // ESC f
+        // Option+⌫/⌦ — readline backward-kill-word / kill-word.
+        // ESC+DEL is the meta-backspace sequence bash/zsh bind out of
+        // the box; raw Ctrl+W (0x17) would also delete word but ignores
+        // the readline word-boundary config.
+        case #selector(NSStandardKeyBindingResponding.deleteWordBackward(_:)):
+            [0x1B, 0x7F]
+        case #selector(NSStandardKeyBindingResponding.deleteWordForward(_:)):
+            [0x1B, 0x64] // ESC d
+        // Defensive: if a custom DefaultKeyBinding.dict or a third-party
+        // text-input plugin synthesizes these line-edit selectors, route
+        // them too. Normal flow hits commandKeyBytes() in keyDown first.
+        case #selector(NSStandardKeyBindingResponding.moveToBeginningOfLine(_:)):
+            [0x01]
+        case #selector(NSStandardKeyBindingResponding.moveToEndOfLine(_:)):
+            [0x05]
+        case #selector(NSStandardKeyBindingResponding.deleteToBeginningOfLine(_:)):
+            [0x15]
+        case #selector(NSStandardKeyBindingResponding.deleteToEndOfLine(_:)):
+            [0x0B]
         default:
             nil
         }
