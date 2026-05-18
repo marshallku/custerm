@@ -242,6 +242,31 @@ impl NesttyWindow {
             actions.clone(),
         );
 
+        // Try restoring from the previous session, else seed a single
+        // default tab. We must do this before any window-close save can
+        // overwrite a persisted session with an empty snapshot.
+        if let Some(session) = crate::session::load() {
+            tab_manager.restore_session(&window, &session);
+        } else {
+            tab_manager.add_tab(&window);
+        }
+
+        // Save the session on window close. Best-effort: any I/O error
+        // is logged but does not block exit.
+        let tm_for_save = tab_manager.clone();
+        window.connect_close_request(move |_| {
+            let session = tm_for_save.snapshot_session();
+            if session.tabs.is_empty() {
+                // The visible state has nothing terminal to restore.
+                // Leaving an older session.json on disk would surface
+                // stale tabs on next launch — delete instead.
+                crate::session::clear();
+            } else {
+                crate::session::save(&session);
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+
         // Status bar
         let statusbar = Rc::new(StatusBar::new(config, &plugins));
 

@@ -132,10 +132,10 @@ impl TabManager {
         // Keyboard shortcuts
         setup_shortcuts(&manager, window);
 
-        // First tab
-        let mgr = manager.clone();
-        let win = window.clone();
-        mgr.add_tab(&win);
+        // First-tab creation is the caller's responsibility: window.rs
+        // either restores a previous session (`restore_session`) or
+        // creates a default single tab. Doing it inside `new` would
+        // produce a phantom empty tab next to the restored ones.
 
         manager
     }
@@ -826,11 +826,13 @@ impl TabManager {
             // Hook CWD change events (OSC 7)
             let bus = self.event_bus.clone();
             let panel_id = term.id.clone();
+            let last_cwd = term.last_cwd.clone();
             term.terminal
                 .connect_current_directory_uri_changed(move |term| {
                     let cwd = term
                         .current_directory_uri()
                         .map(|u| crate::terminal::normalize_osc7_uri(u.as_str()));
+                    *last_cwd.borrow_mut() = cwd.clone();
                     broadcast(
                         &bus,
                         &Event::new(
@@ -1329,6 +1331,157 @@ impl TabManager {
         });
 
         hbox
+    }
+
+    // -- Session persistence --
+
+    /// Build a `Session` snapshot from the current tab/split tree.
+    /// WebView/Plugin panels are elided (terminal-only v1). A branch
+    /// whose only surviving subtree is a single child is collapsed.
+    pub fn snapshot_session(&self) -> crate::session::Session {
+        use crate::session::{Session, SplitOrientation, SplitSnap, TabSnap};
+
+        fn build_snap(node: &crate::split::SplitNode) -> Option<SplitSnap> {
+            match node {
+                crate::split::SplitNode::Leaf { panel } => {
+                    panel.as_terminal().map(|t| SplitSnap::Terminal {
+                        // current_cwd() falls back to /proc/<pid>/cwd
+                        // for shells that don't emit OSC 7. last_cwd
+                        // alone would miss `cd` updates in those shells.
+                        cwd: t.current_cwd(),
+                    })
+                }
+                crate::split::SplitNode::Branch {
+                    paned,
+                    first,
+                    second,
+                } => {
+                    let f = build_snap(&first.borrow());
+                    let s = build_snap(&second.borrow());
+                    match (f, s) {
+                        (Some(f), Some(s)) => Some(SplitSnap::Branch {
+                            orientation: match paned.orientation() {
+                                gtk4::Orientation::Vertical => SplitOrientation::Vertical,
+                                _ => SplitOrientation::Horizontal,
+                            },
+                            position: paned.position(),
+                            first: Box::new(f),
+                            second: Box::new(s),
+                        }),
+                        (Some(only), None) | (None, Some(only)) => Some(only),
+                        (None, None) => None,
+                    }
+                }
+            }
+        }
+
+        let tabs_borrow = self.tabs.borrow();
+        let custom_titles = self.custom_titles.borrow();
+        let active_idx = self.notebook.current_page().unwrap_or(0) as usize;
+        let mut tab_snaps: Vec<TabSnap> = Vec::new();
+        let mut current_tab: usize = 0;
+        for (idx, tab) in tabs_borrow.iter().enumerate() {
+            let root = tab.root.borrow();
+            let Some(snap) = build_snap(&root) else {
+                // All panels in this tab were non-terminal; skip.
+                continue;
+            };
+            // The notebook index counts elided tabs too; map it onto
+            // the surviving (terminal-only) tab list so restore picks
+            // the right page.
+            if idx == active_idx {
+                current_tab = tab_snaps.len();
+            } else if idx < active_idx {
+                // Active tab might be elided itself — if we cross past
+                // it without setting current_tab, the closest surviving
+                // tab before it is the next-best fallback.
+                current_tab = tab_snaps.len();
+            }
+            let title = {
+                let mut panels = Vec::new();
+                root.collect_panels(&mut panels);
+                panels
+                    .iter()
+                    .find_map(|p| custom_titles.get(p.id()).cloned())
+            };
+            tab_snaps.push(TabSnap {
+                custom_title: title,
+                root: snap,
+            });
+        }
+        let current_tab = current_tab.min(tab_snaps.len().saturating_sub(1));
+        Session {
+            version: crate::session::SESSION_VERSION,
+            tabs: tab_snaps,
+            current_tab,
+        }
+    }
+
+    /// Build tabs+splits to mirror `session`. Returns `Ok(())` on
+    /// success; on any error the caller should fall back to default
+    /// single-tab creation.
+    pub fn restore_session(
+        self: &Rc<Self>,
+        window: &gtk4::ApplicationWindow,
+        session: &crate::session::Session,
+    ) {
+        for tab_snap in &session.tabs {
+            let leftmost = crate::session::leftmost_cwd(&tab_snap.root);
+            let cwd_path = leftmost.as_ref().map(std::path::Path::new);
+            let (root_panel, tab_idx) = self.add_tab_with_cwd(window, cwd_path);
+            self.restore_split(window, tab_idx as usize, &root_panel, &tab_snap.root);
+            if let Some(title) = &tab_snap.custom_title {
+                self.rename_tab(root_panel.id(), title);
+            }
+        }
+        let clamped = session
+            .current_tab
+            .min(self.tabs.borrow().len().saturating_sub(1));
+        self.notebook.set_current_page(Some(clamped as u32));
+        // Anchor focus to the first leaf of the active tab. Restoring
+        // exact focused-pane within a split is a v2 polish.
+        if let Some(tab) = self.tabs.borrow().get(clamped) {
+            let mut panels = Vec::new();
+            tab.root.borrow().collect_panels(&mut panels);
+            if let Some(p) = panels.first() {
+                *self.focused.borrow_mut() = Some(p.clone());
+                p.grab_focus();
+            }
+        }
+    }
+
+    fn restore_split(
+        self: &Rc<Self>,
+        window: &gtk4::ApplicationWindow,
+        tab_idx: usize,
+        target: &Rc<PanelVariant>,
+        snap: &crate::session::SplitSnap,
+    ) {
+        use crate::session::SplitSnap;
+        match snap {
+            SplitSnap::Terminal { .. } => {}
+            SplitSnap::Branch {
+                orientation,
+                first,
+                second,
+                ..
+            } => {
+                let new_cwd = crate::session::leftmost_cwd(second);
+                let cwd_path = new_cwd.as_ref().map(std::path::Path::new);
+                let config = self.config.borrow().clone();
+                let new_panel = self.create_panel(&config, window, cwd_path, None);
+                let gtk_orient = match orientation {
+                    crate::session::SplitOrientation::Horizontal => gtk4::Orientation::Horizontal,
+                    crate::session::SplitOrientation::Vertical => gtk4::Orientation::Vertical,
+                };
+                {
+                    let tabs = self.tabs.borrow();
+                    tabs[tab_idx].split(target, &new_panel, gtk_orient);
+                }
+                self.restore_split(window, tab_idx, target, first);
+                self.restore_split(window, tab_idx, &new_panel, second);
+            }
+        }
     }
 }
 

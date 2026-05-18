@@ -124,7 +124,7 @@ Collapsible tab bar and renamable tabs.
 - [x] Theme system (10 built-in themes, hot-reload, all UI components themed)
 - [x] Clipboard integration (OSC 52) — macOS Tier 0.3 gates `clipboardCopy` via `[security] osc52` (default `deny`, opt-in `allow`). Linux VTE is already deny-by-default and vte4 0.8.0 exposes no toggle. Phase 7 item closed by the parity work; see line 191 + [decisions §30](./decisions.md).
 - [x] URL detection + click-to-open — Ctrl+Click opens http(s) URLs in the default browser. Two match paths: OSC 8 hyperlinks (`check_hyperlink_at`) and regex (`match_add_regex` / `check_match_at`); scheme allow-list enforces http(s) on both. `gtk4::UriLauncher` for the launch. See [decisions §30](./decisions.md) for the PCRE2 flag-set caveat (`PCRE2_MULTILINE` only + inline `(?i:)`; adding `PCRE2_CASELESS` or JIT made the live API silently return no matches under vte4 0.8.0 + VTE 0.84).
-- [ ] Session persistence / restore
+- [x] Session persistence / restore — auto-save tabs+splits+cwd on window close to `~/.local/state/nestty/session.json` (XDG state); auto-restore on next launch. WebView/Plugin panels elided in v1 (terminal-only); Paned position is not re-applied (50/50 default). See [decisions §31](./decisions.md).
 - [x] Plugin system (HTML/JS panels + shell commands via plugin.toml manifest)
 - [x] Status bar (Waybar-style bar with plugin modules, left/center/right sections)
 - [~] macOS native app (Swift/AppKit) — Phase 1 MVP complete (see below)

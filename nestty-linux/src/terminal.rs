@@ -17,17 +17,23 @@ use crate::search::SearchBar;
 /// `strip_prefix("file://")` would leave the hostname mixed in. Shared
 /// by `terminal.cwd_changed` emission and `terminal.state` for shape parity.
 pub(crate) fn normalize_osc7_uri(uri: &str) -> String {
-    if let Some(rest) = uri.strip_prefix("file://") {
+    let path = if let Some(rest) = uri.strip_prefix("file://") {
         if let Some(idx) = rest.find('/') {
-            rest[idx..].to_string()
+            &rest[idx..]
         } else {
             // Bare host with no path — fall back to whatever's left so the
             // value is at least non-empty.
-            rest.to_string()
+            rest
         }
     } else {
-        uri.to_string()
-    }
+        uri
+    };
+    // OSC 7 paths are URI-encoded ("My%20Project"). Decode so the
+    // restored cwd is a real filesystem path. Falls back to the raw
+    // string on decode failure rather than dropping the value.
+    glib::Uri::unescape_string(path, None)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path.to_string())
 }
 
 const DEFAULT_FONT_SCALE: f64 = 1.0;
@@ -41,6 +47,10 @@ pub struct TerminalPanel {
     pub terminal: Terminal,
     pub child_pid: Rc<Cell<i32>>,
     pub search_bar: SearchBar,
+    /// Last known cwd of the spawned shell. Seeded by the constructor's
+    /// `cwd` arg, then refreshed by tabs.rs's OSC 7 handler. Read at
+    /// window-close time by session persistence.
+    pub last_cwd: Rc<std::cell::RefCell<Option<String>>>,
 }
 
 impl TerminalPanel {
@@ -192,12 +202,15 @@ impl TerminalPanel {
         overlay.set_hexpand(true);
         overlay.set_vexpand(true);
 
+        let last_cwd = Rc::new(std::cell::RefCell::new(cwd_str.clone()));
+
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             overlay,
             terminal,
             child_pid,
             search_bar,
+            last_cwd,
         }
     }
 
@@ -222,27 +235,30 @@ impl TerminalPanel {
             .unwrap_or_default()
     }
 
+    /// Best-effort current cwd: OSC 7 (`current_directory_uri`) first,
+    /// then `/proc/<pid>/cwd`. Used by both `state()` (socket query)
+    /// and session persistence (window-close snapshot). Shells that
+    /// don't emit OSC 7 still produce a usable cwd through the proc
+    /// fallback as long as the child is alive.
+    pub fn current_cwd(&self) -> Option<String> {
+        if let Some(u) = self.terminal.current_directory_uri() {
+            return Some(normalize_osc7_uri(u.as_str()));
+        }
+        let pid = self.child_pid.get();
+        if pid > 0
+            && let Ok(p) = std::fs::read_link(format!("/proc/{pid}/cwd"))
+        {
+            return Some(p.to_string_lossy().to_string());
+        }
+        // Child PID gone (shell exited) — last_cwd preserves the OSC 7
+        // value or the spawn-time cwd.
+        self.last_cwd.borrow().clone()
+    }
+
     /// Get terminal state: cursor, dimensions, CWD, title
     pub fn state(&self) -> serde_json::Value {
         let (cursor_col, cursor_row) = self.terminal.cursor_position();
-        // Try VTE's OSC 7 first, then fallback to /proc/<pid>/cwd
-        let cwd = self
-            .terminal
-            .current_directory_uri()
-            .map(|u| normalize_osc7_uri(u.as_str()))
-            .or_else(|| {
-                let pid = self.child_pid.get();
-                if pid > 0 {
-                    let result = std::fs::read_link(format!("/proc/{pid}/cwd"))
-                        .ok()
-                        .map(|p| p.to_string_lossy().to_string());
-                    eprintln!("[nestty] cwd fallback: pid={pid} -> {:?}", result);
-                    result
-                } else {
-                    eprintln!("[nestty] cwd fallback: no child_pid ({})", pid);
-                    None
-                }
-            });
+        let cwd = self.current_cwd();
         serde_json::json!({
             "cols": self.terminal.column_count(),
             "rows": self.terminal.row_count(),
@@ -331,5 +347,17 @@ mod osc7_tests {
         // Edge: bare host, no path. Don't try to invent a value, just don't
         // crash — return whatever's left so the caller sees a non-empty hint.
         assert_eq!(normalize_osc7_uri("file://lonely-host"), "lonely-host");
+    }
+
+    #[test]
+    fn percent_decodes_path_segments() {
+        // VTE emits the path as URI-encoded. Without decoding, the
+        // restored cwd would not exist on disk for any path containing
+        // a space, accented character, etc.
+        assert_eq!(
+            normalize_osc7_uri("file://arch/home/me/My%20Project"),
+            "/home/me/My Project"
+        );
+        assert_eq!(normalize_osc7_uri("file:///tmp/a%2Bb"), "/tmp/a+b");
     }
 }

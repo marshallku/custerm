@@ -118,6 +118,10 @@ All built-in shortcuts use `Ctrl+Shift` — Ctrl-only keys pass through to termi
 | `Ctrl+Shift+1-9`                    | Switch to tab N                     |
 | `Ctrl+Click` (on URL)               | Open URL in default browser (OSC 8 hyperlinks + http(s) regex) |
 
+### Session Persistence
+
+On window close, the current tab/split layout and each terminal's cwd are saved to `~/.local/state/nestty/session.json` (XDG state dir). On next launch, that layout is auto-restored — same tabs, same split structure, each shell respawned in its last directory. Closing the last terminal tab clears the file so the next launch starts fresh. WebView and plugin panels are elided from v1 (terminal-only). Paned split positions reset to 50/50.
+
 ### Custom Keybindings
 
 Custom keybindings can be configured in `[keybindings]` section of `config.toml`. They are checked before built-in shortcuts, so they can override defaults. Spawned commands receive `NESTTY_SOCKET` environment variable. See [config.md](./config.md#keybindings) for details.

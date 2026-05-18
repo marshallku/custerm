@@ -463,3 +463,37 @@ The exact failure mode is undiagnosed (vte4 0.8.0 + VTE 0.84 ABI quirk vs. silen
 - Korean/Japanese IME composition does not show preedit text in-cell during composition. The final character commits correctly. Workaround: compose in another app and paste, or rely on muscle memory.
 
 **See:** `docs/macos-renderer-migration-plan.md` for the phased plan, FFI design, and slice-by-slice scope.
+
+
+## 31. Session persistence (Phase 7 closing)
+
+**Problem:** Closing nestty meant losing the current tab/split layout — no auto-restore of where the user was working. The roadmap-declared affordance was XDG-state-backed session persistence with auto-save on close and auto-restore on next launch.
+
+**Decision:** Implement Linux-only in `nestty-linux/src/session.rs` with a typed JSON schema and an explicit lifecycle wired from `window.rs`. Schema (versioned, strict — no best-effort parsing of mismatched versions):
+
+```
+Session { version: u32 = 1, tabs: Vec<TabSnap>, current_tab: usize }
+TabSnap { custom_title: Option<String>, root: SplitSnap }
+SplitSnap { Terminal { cwd } | Branch { orientation, position, first, second } }
+```
+
+**Persisted on `window.connect_close_request`.** `TabManager::snapshot_session()` walks the live SplitNode tree, building SplitSnap. WebView/Plugin panels are elided (their state — page URL, scroll, plugin-internal — is out of v1 scope); a Branch with one surviving child collapses to that child. If the snapshot has zero terminal tabs (all-elided / all-closed), `session::clear()` removes the file so a stale snapshot doesn't survive an "all tabs closed" exit. Atomic write: temp file + `rename`.
+
+**`current_tab` remap (codex C2 round 1).** The notebook's `current_page()` indexes against the original tab list including elided ones. The persisted index has to point into the surviving terminal-only list, so the snapshot loop maps the active notebook index across elisions before storing it.
+
+**Restored on startup.** `window.rs` reads `session::load()` BEFORE seeding any default tab. If `Some(session)` with non-empty tabs: `TabManager::restore_session()` rebuilds tabs and splits via the existing `add_tab_with_cwd` + `TabContent::split` primitives. Split tree restoration is a recursive walk: the new panel created at each Branch level gets the leftmost-Terminal cwd of the snap's `second` subtree (`session::leftmost_cwd`), so each sub-leaf eventually lands in its persisted cwd. `TabManager::new()` was refactored to NOT create a default tab — `window.rs` now decides between restore vs default-add explicitly, eliminating the phantom-empty-tab race (codex C1 round 0).
+
+**cwd cascade (codex C3 round 1).** Reading `last_cwd` alone misses `cd` changes in shells that don't emit OSC 7 (older bash, some POSIX shells). `TerminalPanel::current_cwd()` is a new helper consulting in order: `terminal.current_directory_uri()` (OSC 7) → `/proc/<pid>/cwd` (proc fs) → `last_cwd` (final fallback for the shell-exited edge case). Both `state()` (existing socket query) and snapshot now go through it.
+
+**URI percent-decoding fix (codex C1 round 2).** OSC 7 paths arrive URI-encoded (`file://host/home/me/My%20Project`). The prior `normalize_osc7_uri()` only stripped the host portion; the persisted cwd would contain a literal `%20`, and `spawn_async` would fail to chdir into a directory that doesn't exist on disk. Path is now decoded with `glib::Uri::unescape_string` (falls back to raw on decode failure so we never drop a value).
+
+**Split position not restored.** The snap stores `paned.position()` but restore doesn't re-apply it — uses `TabContent::split`'s default `set_paned_position_deferred` (50/50). Restoring exact pane sizes requires either reaching into the new Paned post-split or threading position through `split()`; documented v2 polish, not worth carrying in v1.
+
+**Custom tab title.** Stored on the TabSnap, not keyed by panel id (codex C5 round 0 — restored panels get new UUIDs). At restore time `rename_tab(root_panel.id(), &title)` re-applies it to the first panel of the restored tab.
+
+**WebView/Plugin elision.** v1 ships terminal-only because:
+- WebView state = page URL + scroll + cookies (security surface).
+- Plugin state = plugin-internal, requires a plugin protocol extension.
+Both are documented v2 work. The fallback behavior is "next launch has a smaller tab set than the previous session" — acceptable for v1.
+
+**See:** `nestty-linux/src/session.rs` (schema + 5 unit tests), `nestty-linux/src/tabs.rs::snapshot_session` / `restore_session` / `restore_split`, `nestty-linux/src/terminal.rs::current_cwd` + percent-decode in `normalize_osc7_uri` (+1 test), `nestty-linux/src/window.rs` (close_request + restore-or-add at startup).

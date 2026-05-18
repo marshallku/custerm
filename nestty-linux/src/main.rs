@@ -6,6 +6,7 @@ mod gui_client;
 mod panel;
 mod plugin_panel;
 mod search;
+mod session;
 mod socket;
 mod split;
 mod statusbar;
