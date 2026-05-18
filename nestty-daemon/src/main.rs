@@ -244,6 +244,47 @@ fn build_trigger_engine(
         serde_json::to_value(ctx_for_snapshot.snapshot())
             .map_err(|e| internal_error(format!("context snapshot serialize: {e}")))
     });
+    // `event.history` mirrors the GUI's registration. Both processes
+    // host their own EventBus (bridge-forwarded events land on both),
+    // so a daemon-routed `nestctl recent` returns the daemon's view
+    // and a GUI-routed call returns the GUI's; for plugin events the
+    // two are largely interchangeable. Registered silent so its own
+    // `.completed` doesn't inflate the next call's result.
+    let bus_for_history = event_bus.clone();
+    actions.register_silent("event.history", move |params| {
+        if let Some(v) = params.get("since_ms")
+            && !v.is_null()
+            && v.as_u64().is_none()
+        {
+            return Err(invalid_params(
+                "event.history `since_ms` must be a non-negative integer",
+            ));
+        }
+        if let Some(v) = params.get("kind")
+            && !v.is_null()
+            && v.as_str().is_none()
+        {
+            return Err(invalid_params("event.history `kind` must be a string glob"));
+        }
+        let since_ms = params.get("since_ms").and_then(|v| v.as_u64());
+        let kind = params
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let events = bus_for_history.history(since_ms, kind.as_deref());
+        let arr: Vec<serde_json::Value> = events
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "type": e.kind,
+                    "data": e.payload,
+                    "source": e.source,
+                    "timestamp_ms": e.timestamp_ms,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "events": arr }))
+    });
     engine
 }
 
