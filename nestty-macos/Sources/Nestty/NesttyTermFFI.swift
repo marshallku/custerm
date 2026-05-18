@@ -152,6 +152,21 @@ enum NesttyTermFFI {
             return nestty_term_mouse_mode_active(ptr)
         }
 
+        /// Encoding the TUI negotiated for forwarded mouse events. SGR
+        /// is what tmux / nvim / iTerm2 default to; LEGACY (X10) and
+        /// UTF8 are fallbacks for older programs. NONE = don't forward.
+        enum MouseEncoding: UInt8 {
+            case none = 0
+            case legacy = 1
+            case sgr = 2
+            case utf8 = 3
+        }
+
+        var mouseEncoding: MouseEncoding {
+            guard let ptr else { return .none }
+            return MouseEncoding(rawValue: nestty_term_mouse_encoding(ptr)) ?? .none
+        }
+
         /// True when the terminal has `\e[?2004h` bracketed paste on.
         var bracketedPasteActive: Bool {
             guard let ptr else { return false }

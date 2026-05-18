@@ -1167,14 +1167,69 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             // direction of partial deltas.
             lines = Int(dy.rounded(.towardZero))
         }
-        if lines != 0 {
-            h.scrollLines(Int32(lines))
-            // No needsDisplay here — the vsync displayLink will see
-            // the state-hash change on its next tick (≤16ms) and
-            // schedule the redraw with a FRESH snapshot. Marking
-            // dirty inline caused a double-render per scroll event:
-            // AppKit drew the stale snapshotCache, then vsync drew
-            // again with the post-scroll snapshot.
+        if lines == 0 { return }
+
+        // If the TUI has mouse reporting on and the user didn't hold
+        // Shift to override, forward wheel events to the PTY so the
+        // TUI's own scrollback (tmux copy mode, less, nvim with
+        // `set mouse=a`) advances. Host-side scrollback only
+        // matters when the TUI isn't capturing input.
+        let encoding = h.mouseEncoding
+        if encoding != .none, !event.modifierFlags.contains(.shift) {
+            forwardWheel(event: event, lines: lines, encoding: encoding, handle: h)
+            return
+        }
+
+        h.scrollLines(Int32(lines))
+        // No needsDisplay here — the vsync displayLink will see
+        // the state-hash change on its next tick (≤16ms) and
+        // schedule the redraw with a FRESH snapshot. Marking
+        // dirty inline caused a double-render per scroll event:
+        // AppKit drew the stale snapshotCache, then vsync drew
+        // again with the post-scroll snapshot.
+    }
+
+    /// Send `\e[<64;col;rowM` (SGR wheel-up) or `\e[<65;col;rowm`
+    /// (wheel-down) for each accumulated line, so tmux/less/nvim get
+    /// the same events they'd see from xterm. Legacy/UTF8 encodings
+    /// pad coords by 32 and cap at 223 (single-byte limit). One event
+    /// per line keeps the TUI's scroll rate matching the user's input
+    /// rate; we don't try to coalesce.
+    private func forwardWheel(
+        event: NSEvent,
+        lines: Int,
+        encoding: NesttyTermFFI.Handle.MouseEncoding,
+        handle: NesttyTermFFI.Handle,
+    ) {
+        // SGR/legacy/UTF8 all use 1-based grid coords. Anchor at the
+        // mouse position when the wheel fired (not the cursor) — that
+        // matches xterm and lets tmux pick the right pane on
+        // multi-pane layouts.
+        let local = convert(event.locationInWindow, from: nil)
+        let col = max(1, min(Int((local.x / cellWidth).rounded(.down)) + 1, Int(UInt16.max)))
+        let row = max(1, min(Int((local.y / cellHeight).rounded(.down)) + 1, Int(UInt16.max)))
+        // SGR/X10 wheel buttons: 64 = up (older content), 65 = down.
+        // `lines > 0` matches our scrollLines convention (positive =
+        // older content), which lines up with wheel-up.
+        let button = lines > 0 ? 64 : 65
+        let count = abs(lines)
+        for _ in 0 ..< count {
+            switch encoding {
+            case .sgr:
+                let s = "\u{1B}[<\(button);\(col);\(row)M"
+                handle.input(Array(s.utf8))
+            case .legacy, .utf8:
+                // Coord byte = value + 32, clamped to 255 (single-byte
+                // limit). UTF8 mode technically supports 2-byte coords
+                // for >223 but tmux/SGR consumers wouldn't be on this
+                // path anyway — we keep the encoding minimal.
+                let cb = UInt8(min(255, button + 32))
+                let cc = UInt8(min(255, col + 32))
+                let cr = UInt8(min(255, row + 32))
+                handle.input([0x1B, 0x5B, 0x4D, cb, cc, cr])
+            case .none:
+                return
+            }
         }
     }
 

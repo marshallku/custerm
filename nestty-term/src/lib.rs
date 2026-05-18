@@ -1219,6 +1219,50 @@ pub unsafe extern "C" fn nestty_term_mouse_mode_active(handle: *mut NesttyHandle
         .intersects(M::MOUSE_REPORT_CLICK | M::MOUSE_DRAG | M::MOUSE_MOTION)
 }
 
+pub const NESTTY_MOUSE_ENC_NONE: u8 = 0;
+pub const NESTTY_MOUSE_ENC_LEGACY: u8 = 1;
+pub const NESTTY_MOUSE_ENC_SGR: u8 = 2;
+pub const NESTTY_MOUSE_ENC_UTF8: u8 = 3;
+
+/// Mouse-event encoding currently negotiated by the TUI. The renderer
+/// uses this to choose the byte sequence for forwarded mouse events
+/// (scroll wheel today, click/drag in a later phase). Encodings are
+/// mutually exclusive on the term side, so this returns at most one.
+///
+///   0 = NONE (no mouse reporting active — do not forward)
+///   1 = LEGACY (X10 `\e[M<cb><cc><cr>`, coords offset by 32, max 223)
+///   2 = SGR    (`\e[<cb;cc;cr;{M|m}`, no coord cap — preferred)
+///   3 = UTF8   (`\e[M<cb><cc><cr>` with multi-byte coord support)
+///
+/// SGR is what tmux, vim, and modern programs negotiate by default
+/// alongside any reporting mode; LEGACY/UTF8 are fallbacks. The
+/// reporting-mode bit (CLICK / DRAG / MOTION) must also be on for
+/// this to return non-zero, matching `mouse_mode_active`.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_mouse_encoding(handle: *mut NesttyHandle) -> u8 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NESTTY_MOUSE_ENC_NONE;
+    };
+    let term = h.term.lock();
+    use alacritty_terminal::term::TermMode as M;
+    let mode = term.mode();
+    if !mode.intersects(M::MOUSE_REPORT_CLICK | M::MOUSE_DRAG | M::MOUSE_MOTION) {
+        return NESTTY_MOUSE_ENC_NONE;
+    }
+    if mode.contains(M::SGR_MOUSE) {
+        NESTTY_MOUSE_ENC_SGR
+    } else if mode.contains(M::UTF8_MOUSE) {
+        NESTTY_MOUSE_ENC_UTF8
+    } else {
+        NESTTY_MOUSE_ENC_LEGACY
+    }
+}
+
 /// True if the terminal has bracketed paste mode enabled (`\e[?2004h`).
 /// Renderer wraps Cmd+V'd text in `\e[200~ … \e[201~` when this is
 /// true so paste-aware programs (zsh, neovim with `set paste`, etc.)

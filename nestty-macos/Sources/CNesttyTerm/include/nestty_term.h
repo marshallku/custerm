@@ -133,6 +133,16 @@ void nestty_string_destroy(NesttyString* s);
 bool nestty_term_mouse_mode_active(NesttyHandle* handle);
 bool nestty_term_bracketed_paste_active(NesttyHandle* handle);
 
+// Mouse-event encoding negotiated by the TUI (SGR / legacy / UTF8 /
+// none). Returns 0 when no reporting mode is on; otherwise picks the
+// matching mutually-exclusive encoding bit. Use to format the bytes
+// for forwarded scroll-wheel / click / drag events.
+#define NESTTY_MOUSE_ENC_NONE   0
+#define NESTTY_MOUSE_ENC_LEGACY 1
+#define NESTTY_MOUSE_ENC_SGR    2
+#define NESTTY_MOUSE_ENC_UTF8   3
+uint8_t nestty_term_mouse_encoding(NesttyHandle* handle);
+
 // Drain the most-recent pending OSC 52 clipboard-store request.
 // Returns NULL when nothing pending. Caller frees with
 // nestty_string_destroy and gates the system clipboard write on
