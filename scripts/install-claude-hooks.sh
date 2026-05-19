@@ -81,7 +81,7 @@ process_file() {
     awk -v mode="$mode" \
         -v start_marker="$SENTINEL_START" \
         -v end_marker="$SENTINEL_END" '
-        function emit_publish(sentinel_line,    rest, kind, payload, idx, escaped_payload, last_char, marker_pos) {
+        function emit_publish(sentinel_line,    rest, kind, payload, idx, escaped_payload, last_char, marker_pos, indent) {
             # Sentinel can be at any column (e.g. inside an indented
             # case branch). `index()` finds where the marker starts;
             # we slice from there + length(marker) to capture the
@@ -91,6 +91,12 @@ process_file() {
                 print "internal: emit_publish called on non-sentinel line: " sentinel_line > "/dev/stderr"
                 exit 3
             }
+            # Preserve the sentinel leading whitespace so the
+            # emitted publish line + END marker match the surrounding
+            # block indentation (cosmetic, but bash hooks usually
+            # live inside case branches and an un-indented publish
+            # reads as broken at a glance).
+            indent = substr(sentinel_line, 1, marker_pos - 1)
             rest = substr(sentinel_line, marker_pos + length(start_marker))
             sub(/^[[:space:]]+/, "", rest)
             if (length(rest) == 0) {
@@ -132,7 +138,11 @@ process_file() {
                 gsub(/\\/, "\\\\\\\\", escaped_payload)
                 gsub(/"/, "\\\"", escaped_payload)
             }
-            printf "command -v nestctl >/dev/null && nestctl event publish %s --quiet \"%s\" &\n", kind, escaped_payload
+            # Print BOTH the publish line and the END marker with
+            # matching indent so callers do not need to echo
+            # end_marker themselves with the right whitespace.
+            printf "%scommand -v nestctl >/dev/null && nestctl event publish %s --quiet \"%s\" &\n", indent, kind, escaped_payload
+            printf "%s%s\n", indent, end_marker
         }
         function flush_pending(    i) {
             # Sentinel without matching END within LOOKAHEAD lines —
@@ -144,7 +154,6 @@ process_file() {
             print sentinel_line
             if (mode != "uninstall") {
                 emit_publish(sentinel_line)
-                print end_marker
             }
             # Buffered lines were content following the sentinel that
             # turned out NOT to be a publish block (no END within
@@ -179,7 +188,6 @@ process_file() {
                     print sentinel_line
                     if (mode != "uninstall") {
                         emit_publish(sentinel_line)
-                        print end_marker
                     }
                     have_sentinel = 0
                     buf_n = 0
@@ -202,7 +210,6 @@ process_file() {
                 print sentinel_line
                 if (mode != "uninstall") {
                     emit_publish(sentinel_line)
-                    print end_marker
                 }
                 for (i = 0; i < buf_n; i++) print buf[i]
             }
@@ -225,13 +232,53 @@ process_file() {
     # patched hook would lose its executable bit on macOS. Codex C1
     # round 2.
     if ! diff -q "$file" "$tmp" > /dev/null 2>&1; then
+        # `stat -L` follows symlinks before reading mode. Without
+        # `-L`, a file-symlink path returns the symlink mode itself
+        # (typically 0777), and the temp file would be chmodded
+        # world-writable before replacing the real target. Codex C2
+        # round 10. The double-flag-style fallback keeps macOS BSD
+        # `stat` portable.
         local mode
-        mode=$(stat -c '%a' "$file" 2>/dev/null || stat -f '%OLp' "$file" 2>/dev/null || true)
+        mode=$(stat -L -c '%a' "$file" 2>/dev/null || stat -L -f '%OLp' "$file" 2>/dev/null || true)
         if [[ -n "$mode" ]]; then
             chmod "$mode" "$tmp"
         fi
-        mv "$tmp" "$file"
-        log "patched: $file"
+        # Symlink-safe writeback. `find -L` walks through symlinked
+        # directories AND surfaces symlinked files inside them; a
+        # naked `mv "$tmp" "$file"` against a symlink would replace
+        # the link with a regular file, breaking dotfiles tools
+        # (e.g. stow) that symlink individual hook files. Resolve
+        # to the canonical target first so the write lands on the
+        # actual file the symlink points at. Codex C1 round 9-10.
+        # Canonical resolution must be ABSOLUTE — a plain `readlink`
+        # returns the symlink content verbatim, which for a
+        # relative target like `../foo` would resolve against the
+        # current process cwd instead of the symlink directory.
+        # Strategy: prefer `realpath` (POSIX-ish, on all modern
+        # systems we ship to including macOS), fall back to
+        # `readlink -f` (GNU), then bail. Both produce absolute
+        # paths.
+        local target="$file"
+        if [[ -L "$file" ]]; then
+            if command -v realpath >/dev/null 2>&1; then
+                target=$(realpath -- "$file" 2>/dev/null || true)
+            elif readlink -f -- "$file" >/dev/null 2>&1; then
+                target=$(readlink -f -- "$file" 2>/dev/null || true)
+            else
+                target=""
+            fi
+            if [[ -z "$target" ]]; then
+                log "skip: cannot canonicalize symlink $file (need realpath or readlink -f)"
+                rm -f "$tmp"
+                return 0
+            fi
+        fi
+        mv "$tmp" "$target"
+        if [[ "$file" != "$target" ]]; then
+            log "patched: $file -> $target"
+        else
+            log "patched: $file"
+        fi
     else
         rm -f "$tmp"
     fi
@@ -239,15 +286,20 @@ process_file() {
 
 # Scan a directory for *.sh files containing the sentinel and process
 # them. Skips non-directories silently (so the default scan tolerates
-# missing ~/.claude/scripts).
+# missing ~/.claude/scripts). `find -L` follows symlinks because
+# users commonly link `~/.claude/{hooks,scripts}` from their dotfiles
+# repo; without `-L`, the find returns empty against a symlinked dir.
 scan_dir() {
     local mode="$1"
     local dir="$2"
     [[ -d "$dir" ]] || return 0
-    # Use find to handle filenames with spaces; -print0 + read -d.
+    # `find -L` resolves the dir symlink itself + `*.sh` symlinks
+    # inside. `-type f` matches both regular files and symlinks to
+    # regular files because `-L` resolves the symlink before -type.
+    # Use -print0 / read -d for filenames with spaces.
     while IFS= read -r -d '' file; do
         process_file "$mode" "$file"
-    done < <(find "$dir" -maxdepth 1 -type f -name '*.sh' -print0)
+    done < <(find -L "$dir" -maxdepth 1 -type f -name '*.sh' -print0)
 }
 
 # --self-test runs a deterministic suite in a tmpdir; never touches the
@@ -467,6 +519,67 @@ EOS
         _selftest_pass "literal backslash in JSON round-trips"
     else
         _selftest_fail "test13" "expected double-backslash preserved, got: $payload_observed"
+    fi
+
+    # Test 14 (codex C1 round 9 regression): file-level symlinks
+    # are preserved — the patch lands on the target file, not on
+    # the symlink itself. Dotfiles tools (stow) commonly symlink
+    # individual hook files, and a naked `mv` would replace the
+    # link with a regular file.
+    mkdir -p "$tmp/real-hooks" "$tmp/link-hooks"
+    cat > "$tmp/real-hooks/hook.sh" <<'EOF'
+#!/bin/sh
+# NESTTY_HOOK_PUBLISH: claude.symlink_test
+EOF
+    ln -s "$tmp/real-hooks/hook.sh" "$tmp/link-hooks/hook.sh"
+    process_file install "$tmp/link-hooks/hook.sh"
+    # The symlink itself must still exist and still point at the
+    # real file (not be replaced with a regular file).
+    if [[ -L "$tmp/link-hooks/hook.sh" ]] \
+        && grep -qF 'nestctl event publish claude.symlink_test' "$tmp/real-hooks/hook.sh"; then
+        _selftest_pass "file-level symlink survives, target updated"
+    else
+        _selftest_fail "test14" "symlink replaced or target unmodified: link=$(stat -c '%F' "$tmp/link-hooks/hook.sh" 2>/dev/null) real-content=$(grep -c nestctl "$tmp/real-hooks/hook.sh")"
+    fi
+
+    # Test 15 (codex C1 round 10 regression): RELATIVE symlink with
+    # the patcher run from an unrelated cwd. Plain `readlink` returns
+    # the relative target unchanged; if `mv` interprets that
+    # relative to its own cwd, it writes to the wrong place. The
+    # canonicalization step must produce an absolute path.
+    mkdir -p "$tmp/relreal" "$tmp/rellink"
+    cat > "$tmp/relreal/hook.sh" <<'EOF'
+#!/bin/sh
+# NESTTY_HOOK_PUBLISH: claude.relative_symlink
+EOF
+    # Symlink with relative target.
+    (cd "$tmp/rellink" && ln -s ../relreal/hook.sh hook.sh)
+    # Run from a cwd that does NOT resolve the relative path.
+    (cd / && process_file install "$tmp/rellink/hook.sh")
+    if [[ -L "$tmp/rellink/hook.sh" ]] \
+        && grep -qF 'nestctl event publish claude.relative_symlink' "$tmp/relreal/hook.sh"; then
+        _selftest_pass "relative symlink canonicalized to absolute target"
+    else
+        _selftest_fail "test15" "relative symlink mishandled (link=$(stat -c '%F' "$tmp/rellink/hook.sh" 2>/dev/null) real-content=$(grep -c nestctl "$tmp/relreal/hook.sh"))"
+    fi
+
+    # Test 16 (codex C2 round 10 regression): mode is read from the
+    # symlink TARGET, not the symlink itself. A symlink is typically
+    # 0777; reading the symlink mode and copying it to the temp
+    # file would chmod the underlying target world-writable.
+    cat > "$tmp/relreal/mode.sh" <<'EOF'
+#!/bin/sh
+# NESTTY_HOOK_PUBLISH: claude.mode_via_symlink
+EOF
+    chmod 0640 "$tmp/relreal/mode.sh"
+    (cd "$tmp/rellink" && ln -sf ../relreal/mode.sh mode.sh)
+    process_file install "$tmp/rellink/mode.sh"
+    local final_mode
+    final_mode=$(stat -L -c '%a' "$tmp/rellink/mode.sh" 2>/dev/null || stat -L -f '%OLp' "$tmp/rellink/mode.sh" 2>/dev/null || echo "")
+    if [[ "$final_mode" == "640" ]]; then
+        _selftest_pass "symlink target mode preserved (not 0777)"
+    else
+        _selftest_fail "test16" "expected mode 640, got $final_mode"
     fi
 
     # Test 12 (codex C1 round 4 regression): sentinel inside an
