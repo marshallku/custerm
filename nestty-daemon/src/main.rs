@@ -42,10 +42,15 @@ const MODULE_RUN_TIMEOUT: Duration = Duration::from_secs(8);
 const ENV_E2E_ACTIONS: &str = "NESTTYD_E2E_TEST_ACTIONS";
 const ENV_POOL_WORKERS: &str = "NESTTYD_POOL_WORKERS";
 const ENV_POOL_QUEUE: &str = "NESTTYD_POOL_QUEUE";
-/// Stage A introduces the daemon-side TriggerEngine but leaves the pump
-/// dispatch OFF by default. Set to `1`/`true`/`yes` to drive `pump_all`
-/// on the 50ms tick. Until Stage B+C (atomic cut-over) the GUI's local
-/// engine remains authoritative.
+/// Daemon-side TriggerEngine dispatch. Stages B+C delivered the
+/// atomic cut-over so a registered GUI gracefully releases its own
+/// in-process engine when the daemon advertises `host_triggers=true`
+/// in the `gui.register` ack — no risk of double-dispatch on the
+/// shared trigger set. Default flipped to ON when slice 1 of the
+/// `claude` harness loop landed (decisions.md #39): with no
+/// `NESTTYD_HOST_TRIGGERS` set, the daemon dispatches; set it to
+/// `0`/`false`/`no` to disable and let the GUI engine stay
+/// authoritative (only useful for the standalone-GUI path).
 const ENV_HOST_TRIGGERS: &str = "NESTTYD_HOST_TRIGGERS";
 
 const PUMP_TICK: Duration = Duration::from_millis(50);
@@ -90,7 +95,7 @@ fn main() -> ExitCode {
     let actions =
         Arc::new(ActionRegistry::with_completion_bus(event_bus.clone())).with_pool(pool.clone());
     let plugins = discover_and_sort_plugins();
-    let host_triggers = env_flag_enabled(ENV_HOST_TRIGGERS);
+    let host_triggers = env_flag_default_on(std::env::var(ENV_HOST_TRIGGERS).ok().as_deref());
     register_builtins(&actions, &plugins, host_triggers);
     register_plugin_commands(&actions, &plugins, &socket_path);
     if env_flag_enabled(ENV_E2E_ACTIONS) {
@@ -737,6 +742,27 @@ fn env_flag_enabled(var: &str) -> bool {
     }
 }
 
+/// Mirror of `env_flag_enabled` for flags whose default is ON.
+/// `None` (env unset) = enabled; `Some("0" | "false" | "no" | "")`
+/// (case-insensitive, trimmed) = disabled; every other value is
+/// treated as enabled. We bias enable-on-garbage so a typo doesn't
+/// silently turn the feature off — opt-out has to be intentional.
+///
+/// Takes a pre-extracted optional value rather than the env var name
+/// itself so tests can exercise the parser without mutating the
+/// process-global environment (cargo runs tests in parallel; concurrent
+/// `set_var`/`remove_var` is unsound on glibc per the `env` module's
+/// safety contract — codex C1 round 1).
+fn env_flag_default_on(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | ""
+        ),
+        None => true,
+    }
+}
+
 /// `manifest.plugin.name` is the dispatch key for `plugin.<name>.<cmd>`
 /// and statusbar `_module.run`. Sort the once-discovered list so two
 /// daemons on the same machine register the same set in the same order
@@ -1097,5 +1123,32 @@ event_kind = "panel.focused"
             ),
             "silent action must not publish .completed"
         );
+    }
+
+    // ---- env_flag_default_on ----
+    // Pure parser: takes a pre-extracted `Option<&str>` (caller resolves
+    // `env::var`). No environment mutation in tests; safe under
+    // parallel cargo execution. See the function doc-comment for the
+    // codex C1 round 1 context that drove this shape.
+
+    #[test]
+    fn env_flag_default_on_when_unset() {
+        assert!(env_flag_default_on(None));
+    }
+
+    #[test]
+    fn env_flag_default_on_accepts_disable_tokens() {
+        for v in ["0", "false", "FALSE", "no", "No", " false ", ""] {
+            assert!(!env_flag_default_on(Some(v)), "value {v:?} should disable");
+        }
+    }
+
+    #[test]
+    fn env_flag_default_on_treats_garbage_as_enabled() {
+        // Bias toward enabled-on-typo so a misspelled "fasle" or
+        // "tru" doesn't silently turn off harness triggers.
+        for v in ["1", "true", "yes", "on", "tru", "fasle", "garbage"] {
+            assert!(env_flag_default_on(Some(v)), "value {v:?} should enable");
+        }
     }
 }

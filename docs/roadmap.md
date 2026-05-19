@@ -712,7 +712,8 @@ Track lives in `docs/harness-integration.md`. Sequenced 1–16. Pending the heav
 - [x] **Step 6** — Daemon-attached default; `--standalone` retained.
 - [x] **Step 8 (partial)** — `event.history` ring buffer + `nestctl recent` (decisions.md #35), `events.publish` socket surface + `nestctl event publish` (existing).
 - [x] **Step 9** — Trust boundary: `event_bus::Origin` field + `[security] { accept_external, allow_privileged }` trigger schema + `is_privileged_action(system.spawn)` engine-level gate + `nestctl event publish --quiet`. Daemon-side coverage only — bridge wire propagation, causal taint, macOS FFI, registry-marked privileged actions tracked as known gaps. See decisions.md #37.
-- [x] **Step 8 remainder (this slice)** — `notify.show` action via `Notifier` trait. Subprocess-backed (`notify-send` Linux, `osascript -e 'on run argv'` macOS). Registered `blocking_silent` on both daemon and GUI in-process registries. See decisions.md #38.
+- [x] **Step 8 remainder** — `notify.show` action via `Notifier` trait. Subprocess-backed (`notify-send` Linux, `osascript -e 'on run argv'` macOS). Registered `blocking_silent` on both daemon and GUI in-process registries. See decisions.md #38.
+- [x] **Step 10 — Option A slice 1A (this slice)** — `host_triggers` default flipped ON + `examples/triggers/claude-hooks.toml` (commit-blocked-toast + review-approved-toast, both `[triggers.security] accept_external = true`). First visible harness loop closes: hook → `nestctl event publish` → daemon trigger → `notify.show` → toast. Plugin crate + `claude.*` data-surfacing actions deferred to slice 2 / Option B. See decisions.md #39.
 
 **Outstanding (in sequencing order):**
 

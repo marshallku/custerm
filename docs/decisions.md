@@ -670,3 +670,34 @@ Both are documented v2 work. The fallback behavior is "next launch has a smaller
 **Out of scope (followups):** icon attachment, action buttons, urgency timing controls, persistent notification history. Triggers that need rich notifications can shell out via `system.spawn` (now privileged-gated, see #37). Configuring the user's notification daemon (dunst/mako settings) is also out — `nestty` is a producer, not a notification server.
 
 **See:** `nestty-core/src/notifier.rs` (trait + Linux/macOS impls + `NoopNotifier` + `platform_notifier()` factory + 9 unit tests), `nestty-daemon/src/main.rs::register_notify_show` (action handler + 7 tests in `mod tests`), `nestty-linux/src/window.rs` (GUI in-process mirror registration), `docs/harness-integration.md` § Cross-cutting needs (subprocess decision documented).
+
+
+## 39. `host_triggers` default flipped ON (harness-integration Option A slice 1A)
+
+**Problem:** With `NESTTYD_HOST_TRIGGERS=OFF` as the default, daemon-side `TriggerEngine` was idle by design — Stage A (#5b.2 in #step roadmap) shipped the engine, but waiting on cut-over evidence before flipping default. Stages B+C delivered atomic cut-over (registered GUIs release their in-process engine when daemon's `gui.register` ack carries `host_triggers=true`), so the original "wait until proven" gate has been satisfied for ~weeks of dogfooding. With trust boundary (#37) + `notify.show` (#38) in place, the missing piece for the first visible harness loop was: a `nestctl event publish claude.commit_blocked` call must actually fire a configured trigger end-to-end. With `host_triggers=OFF`, the daemon dispatched zero triggers — every harness publish went to the bus, sat in the ring buffer, and was ignored.
+
+**Decision:** Flip `NESTTYD_HOST_TRIGGERS` default from OFF to ON, with deliberate opt-out semantics. Concretely:
+
+- `env unset` → ON.
+- `env in {"0", "false", "no", ""}` (case-insensitive, trimmed) → OFF.
+- `env = any other value` (including `"on"`, `"yes"`, `"true"`, garbage like `"fasle"`) → ON.
+
+The garbage-bias-enabled rule is deliberate: a typo like `NESTTYD_HOST_TRIGGERS=fasle` silently turning off harness flow would be a confusing failure mode. The disable list is small and intentional; opting out has to be unambiguous.
+
+- **Pure parser, not env-mutating tests.** Codex C1 round 1 caught: the first version threaded the env var name into `env_flag_default_on(var: &str)` and tested by mutating process env via `set_var/remove_var`. Cargo runs tests in parallel; `std::env::set_var` is unsound under concurrent access per the std module's safety contract (glibc internals lack a write lock around `environ`). Refactored to `env_flag_default_on(value: Option<&str>) -> bool` — pure, no env reads in the function body. Caller resolves `std::env::var(ENV_HOST_TRIGGERS).ok().as_deref()` once at startup. Tests pass `None` / `Some("0")` / `Some("fasle")` directly. No env mutation anywhere.
+- **Hot reload doesn't re-consult the flag.** Codex round 2 verified: `spawn_config_watcher` receives an already-built `engine` and `pump_state`; it operates on those instances without re-reading `NESTTYD_HOST_TRIGGERS`. So the flag is a startup-only decision — toggling the env mid-flight requires a daemon restart, by design (and matches every other env-driven setting).
+- **`examples/triggers/claude-hooks.toml`** ships alongside the flip. Two trigger blocks: `claude-commit-blocked-toast` (fires on the hook-published external event, displays a warn-level `notify.show`) and `claude-review-approved-toast`. Both carry `[triggers.security] accept_external = true` — the schema path `Trigger.security` parses from the nested table (verified by #37's `security_block_parses_when_present` test). Comments in the file document the hook-script copy-paste lines users add to their own `~/.claude/scripts/*.sh`. NOT auto-applied to user dotfiles.
+
+**Plugin actions (`claude.last_handoff`, `claude.list_dirty`) deferred to slice 2.** Codex round 1 pushed back hard: the first visible harness loop (external event → toast) does NOT need the plugin crate. The trust boundary + notify.show + a trigger example covers the whole path. The plugin actions are data-surfacing for a future monitor panel (Option B), not on the critical path for slice 1. Slicing here keeps the diff small and reviewable.
+
+**Live verification:** Daemon log line `trigger engine: 8 configured | 11 bus pattern(s) | dispatch=ON` (was `dispatch=OFF` before the flip with the same config + same 8 trigger count, just 0 bus patterns because PumpState wasn't constructed). End-to-end: with user-config trigger installed, `nestctl event publish claude.commit_blocked --quiet '{"reason":"test"}'` fires the trigger and the configured `notify.show` action surfaces a desktop toast.
+
+**Out of scope (for slice 1A; tracked in slice 2 backlog):**
+- `plugins/claude/` Rust crate + `claude.last_handoff` + `claude.list_dirty` actions.
+- More trigger examples (`session-stopped-todo`, etc.).
+- Hook script auto-patching (intentional: dotfiles are user territory).
+- macOS install script — Linux path validated; macOS daemon-host path is part of step 7 (systemd unit + launchd plist).
+
+**Test coverage:** 3 unit tests on the pure parser (unset enables, disable-token list, garbage enables). Existing tests for hot reload + trigger dispatch unchanged.
+
+**See:** `nestty-daemon/src/main.rs` (`env_flag_default_on` parser + call-site swap + 3 unit tests in `mod tests`), `examples/triggers/claude-hooks.toml` (trigger blocks + hook-script copy-paste guide), `docs/harness-integration.md` § Sequencing step 10 (Option A slice 1A marked done).

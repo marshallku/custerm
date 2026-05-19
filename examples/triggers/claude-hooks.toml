@@ -1,0 +1,67 @@
+# Claude Code harness hook → desktop toast triggers.
+#
+# Wires `nestctl event publish claude.<event>` calls made from your
+# `~/.claude/scripts/*.sh` hooks to a `notify.show` toast on the
+# desktop. Demonstrates the documented Option A flow from
+# `docs/harness-integration.md`.
+#
+# How to use:
+#
+# 1. Copy the `[[triggers]]` blocks below into your
+#    `~/.config/nestty/config.toml`. The `[triggers.security]`
+#    table is REQUIRED — without `accept_external = true` these
+#    triggers ignore socket-published events by default (see
+#    decisions.md #37 trust boundary).
+#
+# 2. Patch your hook scripts to publish events. Examples below;
+#    none of these need any change to nestty itself, just one line
+#    appended per hook. `--quiet` makes the publish silent when
+#    nesttyd isn't running, so hooks never break the host command.
+#
+#    `~/.claude/scripts/pre-commit-gate.sh` — on commit refusal:
+#
+#        if [ "$BLOCKED" = "1" ]; then
+#            command -v nestctl >/dev/null && nestctl event publish \
+#                claude.commit_blocked --quiet \
+#                "{\"reason\": \"$REASON\", \"repo\": \"$REPO\"}" &
+#            exit 1
+#        fi
+#
+#    `~/.claude/scripts/codex-review.sh` — on APPROVED verdict:
+#
+#        if [ "$VERDICT" = "APPROVED" ]; then
+#            command -v nestctl >/dev/null && nestctl event publish \
+#                claude.review_approved --quiet \
+#                "{\"session\": \"$SESSION_ID\"}" &
+#        fi
+#
+# 3. Restart nesttyd (or wait for the 2s config-watcher to pick up
+#    your edited config.toml — daemon reloads triggers in-place).
+#
+# 4. Verify: `nestctl event publish claude.commit_blocked --quiet \
+#    '{"reason": "test", "repo": "demo"}'` should pop a toast.
+
+
+# Hook event:   pre-commit-gate.sh on commit refusal
+# External:     yes (socket-published from user hook script)
+# Privileged:   no (notify.show is not in the privileged set)
+[[triggers]]
+name = "claude-commit-blocked-toast"
+action = "notify.show"
+params = { title = "Commit blocked", body = "{event.reason}", level = "warn" }
+[triggers.when]
+event_kind = "claude.commit_blocked"
+[triggers.security]
+accept_external = true
+
+
+# Hook event:   codex-review.sh on VERDICT: APPROVED
+# Useful in the absence of a panel — confirms cross-review is done.
+[[triggers]]
+name = "claude-review-approved-toast"
+action = "notify.show"
+params = { title = "Codex review approved", body = "session {event.session}", level = "info" }
+[triggers.when]
+event_kind = "claude.review_approved"
+[triggers.security]
+accept_external = true
