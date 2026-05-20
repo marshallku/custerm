@@ -30,6 +30,17 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
     let panelID: String = UUID().uuidString
     private(set) var currentTitle: String = "Terminal (alacritty)"
 
+    /// Set by `PaneManager.assignEventBus` after the EventBus is created.
+    /// Used to publish `terminal.output` on keyboard / paste input —
+    /// mirror of `nestty-linux/src/tabs.rs` `connect_commit` hook.
+    /// `nil` ⇒ events are silently dropped (test panels, panels created
+    /// before the bus is attached). The setter forwards to the render
+    /// view (which is the actual input first-responder, where the
+    /// keyboard / paste call sites live).
+    weak var eventBus: EventBus? {
+        didSet { renderView?.eventBus = eventBus }
+    }
+
     private let config: NesttyConfig
     private var theme: NesttyTheme
     private let initialCwd: String?
@@ -105,6 +116,14 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
         render.frame = container.bounds
         render.autoresizingMask = [.width, .height]
         container.addSubview(render)
+        // Bind the panel identity before the render view starts handling
+        // input — `terminal.output` events emitted via `sendInput` need
+        // to carry the right panel_id from the very first keystroke.
+        // `eventBus` is propagated later (PaneManager.assignEventBus
+        // runs after all panels are constructed); the didSet on the VC
+        // forwards subsequent assignments.
+        render.panelID = panelID
+        render.eventBus = eventBus
         renderView = render
 
         view = container
@@ -277,6 +296,18 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// Cached snapshot for the most recent paint. Refreshed only when
     /// `nestty_term_take_damage` reports the grid changed.
     private var snapshotCache: NesttyTermFFI.Snapshot?
+
+    /// Panel identity stamped into every `terminal.output` event so
+    /// consumers (AI agents, trigger conditions) can filter per pane.
+    /// Set by the controlling VC right after this view is constructed;
+    /// stays empty for test-only `AlacrittyRenderView` instances.
+    var panelID: String = ""
+
+    /// Bus reference for publishing `terminal.output` on keyboard /
+    /// paste input. Mirror of the VC-level property; the VC's setter
+    /// forwards subsequent assignments so PaneManager's late wiring
+    /// reaches the render view too.
+    weak var eventBus: EventBus?
 
     /// User opt-in: when true AND an image background is active, default
     /// (sentinel-zero) cells render without a bg fill so the image shows
@@ -1273,10 +1304,15 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// markers (`\e[200~ … \e[201~`) when the program enabled
     /// `\e[?2004h` — that's how zsh, vim's `set paste`, and modern
     /// shells distinguish pasted bytes from typed bytes.
+    ///
+    /// The `terminal.output` event carries the user-visible paste text
+    /// (without the bracketed wrapper), matching how VTE's `commit`
+    /// signal hides its own bracketed wrapper from listeners on Linux.
     private func sendPaste(_ text: String) {
         guard let h = termHandle else { return }
         scrollToBottomOnInput()
         let bytes = Array(text.utf8)
+        publishTerminalOutput(bytes)
         if h.bracketedPasteActive {
             h.input([0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E]) // ESC [ 2 0 0 ~
             h.input(bytes)
@@ -1284,6 +1320,39 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         } else {
             h.input(bytes)
         }
+    }
+
+    // MARK: - PTY input dispatch
+
+    /// Centralized PTY-input dispatch for keyboard paths (typed text,
+    /// IME commits, control combos, command-key shortcuts, special
+    /// keys like arrows / enter / delete). Writes to the PTY AND
+    /// publishes `terminal.output` so trigger consumers (AI agents,
+    /// shell-watchers) can observe what the user typed. Matches Linux
+    /// `nestty-linux/src/tabs.rs`'s VTE `connect_commit` hook —
+    /// keyboard / paste only; mouse-mode wheel forwarding intentionally
+    /// stays on the raw `termHandle.input` path because VTE excludes
+    /// mouse from `commit`. The "output" naming follows the terminal-
+    /// widget perspective: bytes going OUT of the widget to the PTY.
+    private func sendInput(_ bytes: [UInt8]) {
+        termHandle?.input(bytes)
+        publishTerminalOutput(bytes)
+    }
+
+    /// Broadcast a `terminal.output` event with the input bytes
+    /// decoded as utf8. ASCII text, IME-committed unicode, and escape
+    /// sequences for special keys all decode fine; truly binary input
+    /// (rare for keyboard-driven paths) is dropped silently rather
+    /// than emitting a weird placeholder.
+    private func publishTerminalOutput(_ bytes: [UInt8]) {
+        guard let bus = eventBus, !bytes.isEmpty,
+              let text = String(bytes: bytes, encoding: .utf8),
+              !text.isEmpty
+        else { return }
+        bus.broadcast(event: "terminal.output", data: [
+            "panel_id": panelID,
+            "text": text,
+        ])
     }
 
     // MARK: - Keyboard
@@ -1315,7 +1384,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             // these would just beep.
             if let bytes = commandKeyBytes(forKeyCode: event.keyCode) {
                 scrollToBottomOnInput()
-                termHandle?.input(bytes)
+                sendInput(bytes)
                 return
             }
             super.keyDown(with: event)
@@ -1325,7 +1394,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             // User typed → jump back to bottom so the keypress lands
             // visibly. Matches Terminal.app / iTerm2 behavior.
             scrollToBottomOnInput()
-            termHandle?.input(bytes)
+            sendInput(bytes)
             return
         }
         interpretKeyEvents([event])
@@ -1439,13 +1508,13 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         }
         guard !text.isEmpty else { return }
         scrollToBottomOnInput()
-        termHandle?.input(Array(text.utf8))
+        sendInput(Array(text.utf8))
     }
 
     override func doCommand(by selector: Selector) {
         if let bytes = commandBytes(for: selector) {
             scrollToBottomOnInput()
-            termHandle?.input(bytes)
+            sendInput(bytes)
         }
         // Unmapped selectors fall on the floor — better than calling
         // super which would try to interpret them as text editing on

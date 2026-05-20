@@ -238,6 +238,7 @@ final class PaneManager {
 
     private func assignEventBus(to panel: any NesttyPanel) {
         if let t = panel as? TerminalViewController { t.eventBus = eventBus }
+        if let a = panel as? AlacrittyTerminalViewController { a.eventBus = eventBus }
         if let w = panel as? WebViewController { w.eventBus = eventBus }
     }
 

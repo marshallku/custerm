@@ -753,7 +753,7 @@ nestctl ──Unix socket──► SocketServer (background thread)
 ### ~~Phase 3: AI Agent & Shell Integration~~ ✅ 구현 완료
 
 `EventBus.swift`, `SocketServer.swift` 참조. SwiftTerm path에서 미구현이던 항목들은 Phase 10a (alacritty 백엔드 default flip, 커밋 `e0ddf31`) 이후로 다시 가능해짐 — wiring은 별도 백로그:
-- **`terminal.output` 이벤트** — SwiftTerm의 `feed(byteArray:)`가 extension에 선언되어 override 불가했음. alacritty path에서는 `nestty-term`이 PTY 끝단을 직접 보유하므로 FFI 콜백으로 풀 수 있음. wiring 대기: [macos-post-renderer-catchup.md §A](./macos-post-renderer-catchup.md).
+- ~~**`terminal.output` 이벤트**~~ ✅ alacritty path에서 wiring 완료. `AlacrittyTerminalViewController`의 `sendInput` 헬퍼가 모든 키보드/페이스트 경로를 감싸서 `terminal.output` 발사. Linux `connect_commit` 동일 시맨틱 (마우스 휠 포워딩은 제외 — VTE도 제외).
 - **OSC 9/777 `terminal.notification` 이벤트** — alacritty path에서는 `nestty-term`이 OSC 파싱을 직접 하므로 OSC dispatch 분기에 한 줄 추가하면 됨.
 - **Shell integration via OSC 133** — 위와 같은 이유로 alacritty path에서는 가능. 현재는 여전히 소켓 커맨드 (`terminal.shell_precmd` / `terminal.shell_preexec`)로 우회 중.
 
