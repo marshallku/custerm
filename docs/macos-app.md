@@ -752,10 +752,10 @@ nestctl ──Unix socket──► SocketServer (background thread)
 
 ### ~~Phase 3: AI Agent & Shell Integration~~ ✅ 구현 완료
 
-`EventBus.swift`, `SocketServer.swift` 참조. 단, 아래 항목은 SwiftTerm 제한으로 미구현:
-- **`terminal.output` 이벤트** — SwiftTerm의 `feed(byteArray:)`가 extension에 선언되어 외부 모듈에서 override 불가. PTY 출력 인터셉트 방법 없음.
-- **OSC 9/777 `terminal.notification` 이벤트** — SwiftTerm에 별도 delegate 없음.
-- **Shell integration via OSC 133** — 위와 동일한 이유. 대신 `terminal.shell_precmd` / `terminal.shell_preexec`를 소켓 커맨드로 구현 (쉘 스크립트에서 직접 호출).
+`EventBus.swift`, `SocketServer.swift` 참조. SwiftTerm path에서 미구현이던 항목들은 Phase 10a (alacritty 백엔드 default flip, 커밋 `e0ddf31`) 이후로 다시 가능해짐 — wiring은 별도 백로그:
+- **`terminal.output` 이벤트** — SwiftTerm의 `feed(byteArray:)`가 extension에 선언되어 override 불가했음. alacritty path에서는 `nestty-term`이 PTY 끝단을 직접 보유하므로 FFI 콜백으로 풀 수 있음. wiring 대기: [macos-post-renderer-catchup.md §A](./macos-post-renderer-catchup.md).
+- **OSC 9/777 `terminal.notification` 이벤트** — alacritty path에서는 `nestty-term`이 OSC 파싱을 직접 하므로 OSC dispatch 분기에 한 줄 추가하면 됨.
+- **Shell integration via OSC 133** — 위와 같은 이유로 alacritty path에서는 가능. 현재는 여전히 소켓 커맨드 (`terminal.shell_precmd` / `terminal.shell_preexec`)로 우회 중.
 
 ### Phase 4: Tab Bar & UX Polish
 - ~~**Tab bar toggle** — 아이콘만 보이는 collapsed 모드 (Cmd+Shift+B), `tabs.toggle_bar` 소켓~~ ✅ 구현 완료
@@ -765,11 +765,17 @@ nestctl ──Unix socket──► SocketServer (background thread)
 - ~~**Config hot-reload** — 파일 변경 감지 후 테마/설정 즉시 반영~~ ✅ 구현 완료
 
 ### Phase 5: Distribution & Ecosystem
-- Session persistence / restore
+- **Session persistence / restore** — Linux landed commit `8a1312a` (`nestty-linux/src/session.rs`, auto-save tabs/splits/cwd, auto-restore on launch). macOS 포트 대기 — 백로그: [macos-post-renderer-catchup.md §B](./macos-post-renderer-catchup.md).
 - ~~Clipboard integration (OSC 52)~~ ✅ deny-by-default 구현 (`[security] osc52`); Linux 측 VTE는 이미 deny 기본
-- URL detection + click-to-open
-- Plugin system
-- Status bar
+- ~~URL detection + click-to-open~~ ✅ OSC 8 hyperlink + 평문 URL Cmd+click (Phase 4b, 커밋 `6605b92`)
+- ~~Plugin system~~ ✅ HTML/JS 패널 (`WKScriptMessageHandlerWithReply` 브리지) + daemon-routed 플러그인 호스트 (Swift `PluginSupervisor`는 macOS daemon-migration PR 5, 커밋 `2913441`에서 삭제됨 — daemon이 supervisor 소유)
+- ~~Status bar~~ ✅ Waybar-style 3-zone + `[[modules]]` (Tier 4.2)
+
+### Phase 6: Renderer migration (SwiftTerm → alacritty_terminal) ✅ Phase 10a 까지
+[macos-renderer-migration-plan.md](./macos-renderer-migration-plan.md) 진행 완료, default backend가 `alacritty`로 flip됨. `[renderer] backend = "swiftterm"` 명시 시 fallback. Phase 10b (SwiftTerm path 완전 제거)는 dogfooding window 후.
+
+### Phase 7: Post-renderer catch-up
+[macos-post-renderer-catchup.md](./macos-post-renderer-catchup.md) — renderer polish + Linux-parity 잔여 + Phase 10b. 현재 active 백로그.
 
 ---
 

@@ -1,0 +1,81 @@
+# macOS Post-Renderer Catch-up
+
+Living doc tracking what's left after Phase 10a flipped the macOS default
+to the alacritty backend (commit `e0ddf31`, decisions.md #36). Predecessor
+plans (all considered done for their original scope):
+
+- [`macos-parity-plan.md`](./macos-parity-plan.md) — Tiers 0–4 (original Linux feature parity)
+- [`macos-daemon-migration-plan.md`](./macos-daemon-migration-plan.md) — PRs 1–8 (GUI ↔ daemon split)
+- [`macos-renderer-migration-plan.md`](./macos-renderer-migration-plan.md) — Phases 1–10a (alacritty backend, default flip)
+
+Order below is rough priority. A items unblock visible polish; B items
+close Linux feature gaps that Linux has already shipped; C is the
+single biggest cleanup; D / E are non-blocking.
+
+---
+
+## A. Renderer polish (alacritty backend)
+
+Each was either deferred during a Phase 3–10a slice or surfaced during
+dogfooding after the default flip. Severity ≈ how often the user hits it.
+
+- [ ] **`terminal.output` event** — now unblocked. SwiftTerm couldn't intercept PTY output (`feed(byteArray:)` is a non-overridable extension method); the alacritty path owns the PTY end-to-end. Wire a callback in `nestty-term` → Swift `EventBus`. Unlocks AI-agent shell-watching that the macOS roadmap Phase 3 has been blocked on.
+- [ ] **Mouse click/drag forwarding** for mouse-mode TUIs. Wheel forwarding shipped (commit `5420ef5`); click / drag / motion still no-op when the TUI has reporting on. Blocks tmux pane click-switch, vim mouse selection, less link click. Reuse `forwardWheel`'s SGR/legacy encoding; add button-press / button-release / motion event encoders.
+- [ ] **DSR (Device Status Report) response** — nvim emits `"Did not detect DSR response from terminal"` on startup because we ignore `CSI 6n` (cursor position) and `CSI 0c` (terminal attributes). Two single-digit reply handlers in `nestty-term`'s input loop.
+- [ ] **NSImage async loading** — wallpaper file open on main thread can stall during Gatekeeper / XProtect scan (Phase 3.5 known limitation surfaced during testing). Move `NSImage(contentsOfFile:)` to a background queue + progressive reveal once decode finishes.
+- [ ] **Cmd+/- zoom on alacritty path** — SwiftTerm path has font-scale via the View menu. Alacritty path needs equivalent: bump `fontSize`, recompute cell metrics, call `termHandle.resize()`, redraw. Cmd+0 resets.
+- [ ] **Block selection (Cmd+Option+drag)** — iTerm2 convention. `alacritty_terminal::selection::SelectionType::Block` is already supported; renderer never picks it. Wire modifier-flag check in `mouseDown` / `mouseDragged`.
+- [ ] **Cursor visibility polish on busy wallpapers** — pink accent block can be low-contrast against image backgrounds (Catppuccin mauve over a dark-purple wallpaper). Consider drop-shadow under the block fill, or a thin outer stroke on the focused-fill variant.
+
+---
+
+## B. Linux-parity catch-up
+
+Linux landed these; macOS hasn't ported yet.
+
+- [ ] **Session persistence** — auto-save tabs / splits / cwd, auto-restore on launch. Linux landed in commit `8a1312a` (`nestty-linux/src/session.rs`, 201 LOC). macOS needs `NSApplicationDelegate.applicationWillTerminate` hook + JSON sidecar under `~/Library/Caches/nestty/` + parallel restore path in `AppDelegate.applicationDidFinishLaunching`.
+- [ ] **GUI in-process `notify.show` registration** — daemon registers it (commit `895c85e` via `Notifier` trait + `osascript` subprocess); Swift's in-process `ActionRegistry` doesn't. `nestctl call notify.show` works only when the daemon is running. Mirror `nestty-linux/src/window.rs:218`'s `register_blocking_silent` in Swift, calling `NSUserNotification` (or `UserNotifications.UNUserNotificationCenter`).
+- [ ] **Swift `BusEvent.origin` field** — trust-boundary parity. Origin tagging shipped on the Rust side (commit `d03a01a`, decisions.md #37); Swift's `BusEvent` struct + wire deserialize don't carry it. Limits Swift-side privileged-action gating. Listed as known gap in roadmap Phase 21 step 9.
+- [ ] **`nesttyd --version` short-circuit** — daemon binds the socket before parsing argv, so a second invocation while one is running errors with `"socket already bound"` even for read-only flags. Parse `--version` / `--help` first, exit without bind.
+
+---
+
+## C. Phase 10b — remove SwiftTerm path
+
+Once the alacritty backend has accumulated enough dogfooding time without
+regressions (target: 2–4 weeks of daily use post-Phase-10a), delete the
+SwiftTerm path entirely:
+
+- `nestty-macos/Sources/Nestty/TerminalViewController.swift`
+- `SwiftTerm` package dependency in `nestty-macos/Package.swift`
+- `RendererBackend.swiftterm` enum case in `nestty-macos/Sources/Nestty/Config.swift` (and the fallback branch in `RendererBackend.parse`)
+- Backend-switching branch in `PaneManager.makeTerminalPanel`
+- The `"swiftterm"` mention in the install-macos.sh footer + any decision docs that point users at the fallback
+
+Gate before deleting: `swift build -c release` clean, `cargo test -p nestty-term --tests` green, and at least one explicit ping in this doc saying "Phase 10b unblocked".
+
+---
+
+## D. Cross-platform work that lands for macOS automatically
+
+Tracked in [`harness-integration.md`](./harness-integration.md); these are pure-Rust changes on the daemon, so the macOS daemon (auto-spawned via the LaunchAgent shipped in commit `b93bc0b`) picks them up for free.
+
+- [ ] **Step 10 Option A slice 2** — `claude` plugin: `claude.session_state` / `claude.list_dirty` / `claude.last_handoff` / `claude.list_sessions` actions. Event publish from hooks already wired by `install-claude-hooks.sh` (commit `adc7b0c`).
+- [ ] **Step 11 Option I** — cron triggers (`[[triggers]]` cron field, scheduler, missed-run policy).
+- [ ] **Steps 12–16** — life-assistant bridge, monitor panel, browser / codex adapters, `/handoff` + `/catchup` ↔ KB.
+
+---
+
+## E. Test hygiene
+
+- [ ] **`paths::tests::*` — 7 failures on macOS** with `--test-threads=1` and parallel. Env-var parallel race; pre-existing on `master`, blocks `cargo test -p nestty-core --lib` from being green on macOS CI. Either gate the env-touching tests behind `serial_test::serial` (extra dev-dep) or shell out to a subprocess per test for the env-scoped checks (no new deps).
+
+---
+
+## Notes on prioritization
+
+- **Pick A1 (`terminal.output`) first** if AI-agent flows are the next dogfooding focus — it's the single biggest unlocked feature from the renderer flip.
+- **Pick A2 (mouse click forwarding)** if tmux usage is heavy — it's the most user-visible deferred item from the wheel-forwarding commit.
+- **Pick B1 (session persistence)** if the user is restarting Nestty often (the lack of restore is felt every time).
+- **C (SwiftTerm removal)** is a code-simplification win, not a feature; wait until the dogfooding window closes.
+- **D items** are sequenced by harness-integration.md, not by this doc — track there.

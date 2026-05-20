@@ -187,11 +187,33 @@ Goal: full Linux feature parity. Phase 1 MVP complete; porting remaining Linux f
 
 **Phase 5 — Distribution & Ecosystem**
 
-- [ ] Session persistence / restore
+- [ ] Session persistence / restore — Linux landed in commit `8a1312a` (`nestty-linux/src/session.rs`, auto-save + auto-restore on launch); macOS port pending. See [macos-post-renderer-catchup.md §B](./macos-post-renderer-catchup.md).
 - [x] Clipboard integration (OSC 52) — `NesttyTerminalDelegate` proxy gates SwiftTerm's `clipboardCopy` on `[security] osc52` (default `deny`, opt-in `allow`). Closes the prior unconditional-write security regression on macOS. Linux (VTE) already deny-by-default. See [macos-parity-plan.md Tier 0.3](./macos-parity-plan.md) and [troubleshooting.md](./troubleshooting.md#macos-osc-52-clipboard-write-was-unconditional-security-regression).
 - [x] URL detection + click-to-open (OSC 8 hyperlinks via SwiftTerm `requestOpenLink`; plain-text URLs via `URLClickHelper` regex + cell-coord mapping with Cmd+click — see [macos-parity-plan.md Tier 1.5](./macos-parity-plan.md))
-- [x] Plugin system (HTML/JS panels via `WKScriptMessageHandlerWithReply` bridge + service plugins via native-Swift `PluginSupervisor`; all 9 first-party plugins build + install — see [macos-parity-plan.md Tier 4.1 / Tier 3](./macos-parity-plan.md))
+- [x] Plugin system (HTML/JS panels via `WKScriptMessageHandlerWithReply` bridge + daemon-routed plugin host; native-Swift `PluginSupervisor` was deleted in macOS daemon-migration PR 5, commit `2913441` — daemon owns the supervisor. All 10 first-party plugins build + install — see [macos-parity-plan.md Tier 4.1 / Tier 3](./macos-parity-plan.md))
 - [x] Status bar (Waybar-style 3-zone bar with plugin `[[modules]]`; `statusbar.show/hide/toggle` sockets; `top` position deferred — see [macos-parity-plan.md Tier 4.2](./macos-parity-plan.md))
+
+**Phase 6 — Renderer migration (SwiftTerm → alacritty_terminal) ✅**
+
+Replaces SwiftTerm with `alacritty_terminal` + a custom AppKit/CoreText renderer (decision #31). Default backend flipped to alacritty in commit `e0ddf31` (Phase 10a); SwiftTerm retained as `[renderer] backend = "swiftterm"` opt-in fallback until Phase 10b removal. Full slice tracking in [macos-renderer-migration-plan.md](./macos-renderer-migration-plan.md).
+
+- [x] Phase 1–2: `nestty-term` scaffold + PTY EventLoop wiring (`9f2e76c`, `3885980`)
+- [x] Phase 3: CoreText render + ANSI palette + cursor + image background + damage-gated CADisplayLink (`d1773b6` → `d504254`)
+- [x] Phase 4: mouse selection + Cmd+A/C/V + OSC 52 / 8 + plain-URL Cmd+click (`d24f86e`, `6605b92`)
+- [x] Phase 5: scrollback + mouse wheel + Cmd nav (`2dee140`)
+- [x] Phase 6: IME preedit overlay + candidate window anchor (`c5e59a5`)
+- [x] Phase 10a: theme/font hot-reload prerequisite + default backend flip (`85f1beb`, `e0ddf31`)
+- [x] Post-flip polish: Opt/Cmd line-edit shortcuts (`402ab61`), nvim cursor cursor-on-top + inverse-glyph + scroll-perf run aggregation + needsDisplay dedupe (`6b6ac42`), wheel forwarding to mouse-mode TUIs (`5420ef5`)
+- [x] CLI parity: `nestty --version` / `--config-path` / `--init-config` flags + config-path unified to `~/.config/nestty/` + `install-macos.sh` nesttyd install (`4c70817`); nesttyd LaunchAgent auto-start (`b93bc0b`)
+- [ ] Phase 10b: remove SwiftTerm path entirely (after ~2–4 weeks dogfooding window) — see [macos-post-renderer-catchup.md §C](./macos-post-renderer-catchup.md)
+
+**Phase 7 — Post-renderer catch-up** (active backlog)
+
+Tracked in [macos-post-renderer-catchup.md](./macos-post-renderer-catchup.md). Highlights:
+
+- Renderer polish (alacritty path): `terminal.output` event (now unblocked), mouse click/drag forwarding, DSR response for nvim, NSImage async, Cmd+/- zoom, block selection, cursor contrast on busy wallpapers.
+- Linux-parity catch-up: session persistence (above), GUI in-process `notify.show` registration, Swift `BusEvent.origin` field for trust-boundary parity, `nesttyd --version` short-circuit.
+- Test hygiene: `paths::tests::*` 7-failure env-var race on macOS.
 
 ### Phase WR: Hyprland WebKit freeze automatic cure ✅
 
